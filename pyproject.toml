@@ -1,9 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "mdpo-llm"
 version = "0.1.0"
-description = "Add your description here"
+description = "Process Markdown documents with LLMs using PO files for efficient translation and refinement"
 readme = "README.md"
 requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+keywords = [
+    "markdown",
+    "translation",
+    "llm",
+    "po",
+    "gettext",
+    "localization",
+    "i18n",
+    "document-processing",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: Markup :: Markdown",
+    "Topic :: Text Processing :: Linguistic",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "polib>=1.2.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/mdpo-llm"
+Documentation = "https://github.com/yourusername/mdpo-llm#readme"
+Repository = "https://github.com/yourusername/mdpo-llm.git"
+Issues = "https://github.com/yourusername/mdpo-llm/issues"

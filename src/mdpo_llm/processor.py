@@ -4,12 +4,11 @@ Main Markdown Translator orchestrator class.
 
 from pathlib import Path
 from typing import Any, Dict
-from venv import logger
+import logging
 
 import polib
-from utilities import get_yaml_header
 
-from statics.language import LanguageCode, contains_language
+from .language import LanguageCode, contains_language
 
 from .llm_interface import LLMInterface
 from .manager import POManager
@@ -52,18 +51,14 @@ class MarkdownProcessor:
         """
         po_file = None
         try:
-            # Step 0: Read source and remove YAML header if exists
+            # Step 1: Read and parse source document
             source = source_path.read_text(encoding="utf-8")
-            yaml_header = get_yaml_header(source)
-            source = source[len(yaml_header) :].strip() if yaml_header else source
-
-            # Step 1: Parse source document
             source_lines = source.splitlines(keepends=True)
             blocks = self.parser.segment_markdown(
                 [line.rstrip("\n") for line in source_lines]
             )
 
-            # Step 2: Sync with PO file:
+            # Step 2: Sync with PO file
             po_file = self.po_manager.load_or_create_po(po_path)
             self.po_manager.sync_po(po_file, blocks, self.parser.context_id)
 
@@ -234,7 +229,7 @@ class MarkdownProcessor:
                     f.cancel()
 
                 executor.shutdown(cancel_futures=True)
-                logger.info(
+                logging.info(
                     "Ctrl+C pressed — cancelling pending tasks and shutting down…"
                 )
 
@@ -251,13 +246,6 @@ class MarkdownProcessor:
     def _save_processed_document(self, processed_content: str, target_path: Path):
         """Save the processed document to the target path."""
         target_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Get yaml header if exists and append to processed content
-        if target_path.exists():
-            existing_content = target_path.read_text(encoding="utf-8")
-            yaml_header = get_yaml_header(existing_content)
-            if yaml_header:
-                processed_content = yaml_header + "\n\n" + processed_content
         target_path.write_text(processed_content, encoding="utf-8", newline="\n")
 
     def get_translation_stats(self, source_path: Path, po_path: Path) -> Dict[str, Any]:

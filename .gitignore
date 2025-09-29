@@ -11,3 +11,6 @@ wheels/
 
 # Temporary directories
 tmp/
+
+# WARP configuration
+WARP.md
