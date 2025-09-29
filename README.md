@@ -144,6 +144,29 @@ Enum for supported languages with detection capabilities.
 
 ## Examples
 
+### Validation and Quality Control
+
+```python
+class ValidatingLLM(LLMInterface):
+    def __init__(self, max_retries: int = 3):
+        self.max_retries = max_retries
+        
+    def process(self, source_text: str) -> str:
+        # Implement retry logic with validation
+        for attempt in range(self.max_retries):
+            result = self._call_llm(source_text)
+            if self._validate(source_text, result):
+                return result
+            print(f"Validation failed, retry {attempt + 1}/{self.max_retries}")
+        return result  # Return last attempt
+    
+    def _validate(self, source: str, result: str) -> bool:
+        # Check structure preservation, length ratios, etc.
+        return len(result) > len(source) * 0.5  # Example validation
+```
+
+See `examples/validation_example.py` for a complete implementation with detailed validation rules.
+
 ### Translation Workflow
 
 ```python
