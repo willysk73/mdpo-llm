@@ -1,11 +1,11 @@
 """Shared fixtures for mdpo-llm tests."""
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import polib
 import pytest
 
-from mdpo_llm.llm_interface import MockLLMInterface
 from mdpo_llm.manager import POManager
 from mdpo_llm.parser import BlockParser
 
@@ -58,9 +58,23 @@ def sample_lines():
 
 
 @pytest.fixture
-def mock_llm():
-    """MockLLMInterface instance."""
-    return MockLLMInterface()
+def mock_completion():
+    """Patch litellm.completion — returns '[TRANSLATED] {source_text}' by default."""
+
+    def _side_effect(*args, **kwargs):
+        messages = kwargs.get("messages", args[0] if args else [])
+        source_text = ""
+        for msg in reversed(messages):
+            if msg["role"] == "user":
+                source_text = msg["content"]
+                break
+        mock_response = MagicMock()
+        mock_response.choices[0].message.content = f"[TRANSLATED] {source_text}"
+        return mock_response
+
+    with patch("mdpo_llm.processor.litellm") as mock_litellm:
+        mock_litellm.completion.side_effect = _side_effect
+        yield mock_litellm
 
 
 @pytest.fixture

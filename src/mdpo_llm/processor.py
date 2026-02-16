@@ -2,20 +2,19 @@
 Main Markdown Translator orchestrator class.
 """
 
-import inspect
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 import logging
 
 logger = logging.getLogger(__name__)
 
+import litellm
 import polib
 
 from .language import contains_language
-
-from .llm_interface import LLMInterface
 from .manager import POManager
 from .parser import BlockParser
+from .prompts import Prompts
 from .reconstructor import DocumentReconstructor
 from .reference_pool import ReferencePool
 
@@ -27,45 +26,96 @@ class MarkdownProcessor:
 
     def __init__(
         self,
-        llm_interface: LLMInterface,
+        model: str,
+        target_lang: str,
         max_reference_pairs: int = 5,
-        target_lang: str | None = None,
         source_langs: List[str] | None = None,
+        system_prompt: str | None = None,
+        post_process: Callable[[str], str] | None = None,
+        **litellm_kwargs,
     ):
         """
         Initialize the processor.
 
         Args:
-            llm_interface: Custom LLM interface, if provided
+            model: Any LiteLLM model string (e.g. ``"gpt-4"``,
+                ``"anthropic/claude-sonnet-4-5-20250929"``, ``"gemini/gemini-pro"``).
+            target_lang: BCP 47 locale string (e.g. ``"ko"``).  Baked into
+                the system prompt sent to the LLM.
             max_reference_pairs: Maximum number of similar reference pairs
                 to pass as context to the LLM per entry.
-            target_lang: BCP 47 locale string (e.g. ``"ko"``).  Forwarded
-                to the LLM's ``process()`` method when it accepts a
-                ``target_lang`` keyword argument.
             source_langs: BCP 47 locale strings (e.g. ``["ko"]``).  Code
                 blocks that do not contain any of these languages are
                 skipped.  When ``None`` (default), code block skipping is
                 disabled and all code blocks are sent to the LLM.
+            system_prompt: Optional override for the default translation
+                instruction.  When ``None``, the built-in
+                ``Prompts.TRANSLATE_INSTRUCTION`` is used.
+            post_process: Optional callable applied to every LLM response
+                before it is stored.  Useful for stripping unwanted
+                wrappers, fixing formatting, etc.
+            **litellm_kwargs: Extra keyword arguments forwarded to
+                ``litellm.completion()`` (e.g. ``temperature``,
+                ``api_key``, ``api_base``).
         """
         self.parser = BlockParser()
         self.po_manager = POManager(skip_types=self.SKIP_TYPES)
         self.reconstructor = DocumentReconstructor(skip_types=self.SKIP_TYPES)
-        self.llm = llm_interface
-        self.max_reference_pairs = max_reference_pairs
+        self.model = model
         self.target_lang = target_lang
+        self.max_reference_pairs = max_reference_pairs
         self.source_langs = source_langs
+        self._system_prompt = system_prompt
+        self._post_process = post_process
+        self._litellm_kwargs = litellm_kwargs
 
-        # Detect which optional kwargs the LLM's process() accepts
-        self._llm_accepts_reference_pairs = self._check_llm_param("reference_pairs")
-        self._llm_accepts_target_lang = self._check_llm_param("target_lang")
+    def _build_messages(self, source_text: str, reference_pairs=None):
+        """Build the chat messages list for the LLM call.
 
-    def _check_llm_param(self, name: str) -> bool:
-        """Check if the LLM's process() method accepts a given parameter."""
-        try:
-            sig = inspect.signature(self.llm.process)
-            return name in sig.parameters
-        except (ValueError, TypeError):
-            return False
+        Args:
+            source_text: The source text to translate.
+            reference_pairs: Optional list of (source, translation) tuples
+                for few-shot context.
+
+        Returns:
+            List of message dicts suitable for ``litellm.completion()``.
+        """
+        instruction = self._system_prompt or Prompts.TRANSLATE_INSTRUCTION.format(
+            reason=""
+        )
+        system_content = Prompts.TRANSLATE_SYSTEM_TEMPLATE.format(
+            lang=self.target_lang,
+            instruction=instruction,
+        )
+
+        messages = [{"role": "system", "content": system_content}]
+
+        if reference_pairs:
+            for ref_src, ref_tgt in reference_pairs:
+                messages.append({"role": "user", "content": ref_src})
+                messages.append({"role": "assistant", "content": ref_tgt})
+
+        messages.append({"role": "user", "content": source_text})
+        return messages
+
+    def _call_llm(self, source_text: str, reference_pairs=None):
+        """Call the LLM via LiteLLM and return the result.
+
+        Args:
+            source_text: The source text to translate.
+            reference_pairs: Optional few-shot context pairs.
+
+        Returns:
+            The LLM response text, optionally post-processed.
+        """
+        messages = self._build_messages(source_text, reference_pairs)
+        response = litellm.completion(
+            model=self.model, messages=messages, **self._litellm_kwargs
+        )
+        result = response.choices[0].message.content
+        if self._post_process:
+            result = self._post_process(result)
+        return result
 
     def process_document(
         self, source_path: Path, target_path: Path, po_path: Path, inplace: bool = False
@@ -227,12 +277,7 @@ class MarkdownProcessor:
 
     def _process_entry(self, entry, reference_pairs=None):
         try:
-            kwargs: Dict[str, Any] = {}
-            if reference_pairs is not None and self._llm_accepts_reference_pairs:
-                kwargs["reference_pairs"] = reference_pairs
-            if self.target_lang is not None and self._llm_accepts_target_lang:
-                kwargs["target_lang"] = self.target_lang
-            processed = self.llm.process(entry.msgid, **kwargs)
+            processed = self._call_llm(entry.msgid, reference_pairs=reference_pairs)
             return (entry, processed, None)
         except Exception as e:
             return (entry, None, e)

@@ -53,43 +53,19 @@ pip install mdpo-llm
 
 ## Quick Start
 
-### 1. Implement the LLM interface
+### 1. Translate a document
 
-One method. Any provider.
-
-```python
-from mdpo_llm import LLMInterface, MdpoLLM
-
-class MyLLM(LLMInterface):
-    def process(self, source_text: str, reference_pairs=None, target_lang=None) -> str:
-        language = target_lang or "Korean"
-        messages = [
-            {"role": "system", "content": f"Translate to {language}."},
-        ]
-        # Use reference pairs as few-shot examples for consistency
-        if reference_pairs:
-            for src, tgt in reference_pairs:
-                messages.append({"role": "user", "content": src})
-                messages.append({"role": "assistant", "content": tgt})
-        messages.append({"role": "user", "content": source_text})
-
-        response = openai.chat.completions.create(
-            model="gpt-4", messages=messages,
-        )
-        return response.choices[0].message.content
-```
-
-> Both `reference_pairs` and `target_lang` are optional. If your `process()` method doesn't include either parameter, mdpo-llm detects this automatically and calls without it. Existing implementations won't break.
-
-### 2. Process a document
+No subclassing, no boilerplate. Pass a model string and go.
 
 ```python
 from pathlib import Path
+from mdpo_llm import MdpoLLM
 
 processor = MdpoLLM(
-    MyLLM(),
-    target_lang="ko",        # forwarded to LLM's process() as target_lang
-    source_langs=["ko"],     # code blocks without Korean are skipped
+    model="gpt-4",            # any LiteLLM model string
+    target_lang="ko",         # baked into the system prompt
+    source_langs=["ko"],      # code blocks without Korean are skipped
+    temperature=0.3,          # forwarded to litellm.completion()
 )
 
 result = processor.process_document(
@@ -104,7 +80,7 @@ print(f"Coverage: {result['coverage']['coverage_percentage']}%")
 
 Run it again after editing the source — only the changed paragraphs get reprocessed.
 
-### 3. Process a directory
+### 2. Process a directory
 
 ```python
 result = processor.process_directory(
@@ -121,14 +97,32 @@ print(f"{result['files_skipped']} files unchanged")
 
 The directory structure is mirrored into `target_dir` and `po_dir`. Each file gets its own PO file and its own reference pool.
 
+### 3. Use any provider
+
+LiteLLM supports 100+ providers. Just change the model string:
+
+```python
+# OpenAI
+MdpoLLM(model="gpt-4", target_lang="ko")
+
+# Anthropic
+MdpoLLM(model="anthropic/claude-sonnet-4-5-20250929", target_lang="ko")
+
+# Google
+MdpoLLM(model="gemini/gemini-pro", target_lang="ko")
+
+# Azure OpenAI
+MdpoLLM(model="azure/my-deployment", target_lang="ko", api_base="https://...")
+```
+
 ## Language Handling
 
 ### `target_lang` — tell the LLM which language to produce
 
-A BCP 47 locale string (e.g. `"ko"`, `"ja"`, `"zh-CN"`) passed through to your LLM's `process()` method. The source language is auto-detected by the LLM — you only specify the target.
+A BCP 47 locale string (e.g. `"ko"`, `"ja"`, `"zh-CN"`) baked into the system prompt. The source language is auto-detected by the LLM — you only specify the target.
 
 ```python
-processor = MdpoLLM(MyLLM(), target_lang="ja")
+processor = MdpoLLM(model="gpt-4", target_lang="ja")
 ```
 
 When `target_lang` is set, new PO files will include a `Language` header (e.g. `Language: ja`).
@@ -139,7 +133,7 @@ A list of BCP 47 locale strings. Code blocks that don't contain any of these lan
 
 ```python
 # Skip code blocks that don't contain Korean or Chinese
-processor = MdpoLLM(MyLLM(), source_langs=["ko", "zh"])
+processor = MdpoLLM(model="gpt-4", target_lang="ko", source_langs=["ko", "zh"])
 ```
 
 When `source_langs` is `None` (the default), code block skipping is disabled and all code blocks are sent to the LLM.
@@ -176,10 +170,13 @@ Constructor:
 
 ```python
 MdpoLLM(
-    llm_interface,             # your LLMInterface implementation
-    max_reference_pairs=5,     # max similar pairs passed as context
-    target_lang=None,          # BCP 47 string forwarded to LLM
+    model,                     # any LiteLLM model string (required)
+    target_lang,               # BCP 47 string, baked into system prompt (required)
+    max_reference_pairs=5,     # max similar pairs passed as few-shot context
     source_langs=None,         # list of BCP 47 strings for code block skipping
+    system_prompt=None,        # override the default translation instruction
+    post_process=None,         # Callable[[str], str] applied to every LLM response
+    **litellm_kwargs,          # temperature, api_key, api_base, etc.
 )
 ```
 
@@ -190,23 +187,16 @@ MdpoLLM(
 | `get_translation_stats(source_path, po_path)` | Return coverage and block statistics |
 | `export_report(source_path, po_path)` | Generate a detailed text report |
 
-### LLMInterface
+### Prompts
 
-Abstract base class. Implement one method:
-
-```python
-class LLMInterface(ABC):
-    @abstractmethod
-    def process(self, source_text: str) -> str: ...
-```
-
-Optionally accept `reference_pairs` and/or `target_lang`:
+The `Prompts` class exposes all built-in prompt templates used by the processor. You can reference them when building custom `system_prompt` values or validation pipelines:
 
 ```python
-def process(self, source_text: str, reference_pairs=None, target_lang=None) -> str: ...
-```
+from mdpo_llm import Prompts
 
-The processor detects these parameters via `inspect.signature` and passes them only when present — no breaking changes to existing implementations.
+# See the default translation instruction
+print(Prompts.TRANSLATE_INSTRUCTION)
+```
 
 ## Working with PO Files
 

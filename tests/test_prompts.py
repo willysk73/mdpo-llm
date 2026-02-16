@@ -7,16 +7,14 @@ class TestTranslateTemplates:
     def test_system_template_has_placeholders(self):
         tmpl = Prompts.TRANSLATE_SYSTEM_TEMPLATE
         assert "{lang}" in tmpl
-        assert "{system_prompt}" in tmpl
-        assert "{source}" in tmpl
+        assert "{instruction}" in tmpl
 
     def test_system_template_formats(self):
         result = Prompts.TRANSLATE_SYSTEM_TEMPLATE.format(
-            lang="Korean", system_prompt="Be concise", source="Hello"
+            lang="Korean", instruction="Be concise"
         )
         assert "Korean" in result
         assert "Be concise" in result
-        assert "Hello" in result
 
     def test_instruction_has_reason(self):
         assert "{reason}" in Prompts.TRANSLATE_INSTRUCTION
@@ -47,7 +45,7 @@ class TestRefineTemplates:
     def test_refine_system_has_placeholders(self):
         tmpl = Prompts.REFINE_SYSTEM_TEMPLATE
         assert "{lang}" in tmpl
-        assert "{system_prompt}" in tmpl
+        assert "{instruction}" in tmpl
 
     def test_refine_instruction_has_placeholders(self):
         tmpl = Prompts.REFINE_INSTRUCTION

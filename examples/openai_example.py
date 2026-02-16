@@ -1,73 +1,9 @@
 """
-Example implementation using OpenAI's GPT models for translation.
+Example: translate Markdown to Korean using OpenAI's GPT-4 via LiteLLM.
 """
 
-import os
 from pathlib import Path
-from mdpo_llm import LLMInterface, MdpoLLM
-
-# You'll need to install openai: pip install openai
-try:
-    import openai
-except ImportError:
-    print("Please install openai: pip install openai")
-    exit(1)
-
-
-class OpenAITranslator(LLMInterface):
-    """OpenAI-based translator implementation."""
-
-    def __init__(self, api_key: str = None, model: str = "gpt-4", target_language: str = "Korean"):
-        """Initialize OpenAI translator.
-
-        Args:
-            api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
-            model: Model to use (e.g., "gpt-4", "gpt-3.5-turbo")
-            target_language: Fallback target language label for the prompt
-        """
-        self.client = openai.OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
-        self.model = model
-        self.target_language = target_language
-
-    def process(self, source_text: str, reference_pairs=None, target_lang=None) -> str:
-        """Translate text using OpenAI.
-
-        Args:
-            source_text: The text to translate.
-            reference_pairs: Optional list of (source, translation) tuples
-                providing few-shot context from previously translated blocks.
-            target_lang: Optional BCP 47 locale string (e.g. "ko") passed
-                by the processor.  Falls back to ``self.target_language``.
-        """
-        # Use target_lang from processor if provided, else fall back
-        language = target_lang or self.target_language
-
-        try:
-            messages = [
-                {
-                    "role": "system",
-                    "content": f"You are a professional translator. Translate the following text to {language}. "
-                               f"Preserve all Markdown formatting, code blocks, and special characters exactly as they appear."
-                },
-            ]
-
-            # Add reference pairs as few-shot context
-            if reference_pairs:
-                for ref_src, ref_tgt in reference_pairs:
-                    messages.append({"role": "user", "content": ref_src})
-                    messages.append({"role": "assistant", "content": ref_tgt})
-
-            messages.append({"role": "user", "content": source_text})
-
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.3,  # Lower temperature for more consistent translations
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"Translation error: {e}")
-            raise
+from mdpo_llm import MdpoLLM
 
 
 def main():
@@ -81,7 +17,8 @@ def main():
     # Check if source file exists
     if not source_file.exists():
         print(f"Source file {source_file} not found. Creating example...")
-        source_file.write_text("""# Example Document
+        source_file.write_text("""\
+# Example Document
 
 This is a sample document for translation.
 
@@ -103,18 +40,12 @@ def hello_world():
 This document demonstrates the translation capabilities.
 """)
 
-    # Initialize translator
-    translator = OpenAITranslator(
-        api_key=os.getenv("OPENAI_API_KEY"),  # Set your API key as environment variable
-        model="gpt-3.5-turbo",  # Use gpt-4 for better quality
-        target_language="Korean"
-    )
-
-    # Create processor with language parameters
+    # Create processor — that's it. No subclassing needed.
     processor = MdpoLLM(
-        translator,
-        target_lang="ko",             # passed to LLM's process() as target_lang
-        source_langs=["ko"],           # code blocks without Korean are skipped
+        model="gpt-4",               # any LiteLLM model string
+        target_lang="ko",            # baked into the system prompt
+        source_langs=["ko"],         # code blocks without Korean are skipped
+        temperature=0.3,             # passed through to litellm.completion()
     )
 
     # Process document
@@ -123,7 +54,6 @@ This document demonstrates the translation capabilities.
         source_path=source_file,
         target_path=output_file,
         po_path=po_file,
-        inplace=False
     )
 
     # Print results
@@ -152,7 +82,6 @@ This document demonstrates the translation capabilities.
         source_path=source_file,
         target_path=output_file,
         po_path=po_file,
-        inplace=False
     )
 
     print(f"  - Newly translated: {result2['translation_stats'].get('processed', 0)} blocks")

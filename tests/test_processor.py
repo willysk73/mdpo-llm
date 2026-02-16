@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mdpo_llm.llm_interface import LLMInterface, MockLLMInterface
 from mdpo_llm.processor import MarkdownProcessor
 
 
@@ -13,8 +12,8 @@ SIMPLE_MD = "# Hello\n\nWorld paragraph.\n\n---\n\nEnd.\n"
 
 
 @pytest.fixture
-def processor():
-    return MarkdownProcessor(MockLLMInterface())
+def processor(mock_completion):
+    return MarkdownProcessor(model="test-model", target_lang="ko")
 
 
 @pytest.fixture
@@ -39,7 +38,7 @@ class TestFullWorkflow:
         result = processor.process_document(source_file, target_file, po_file)
         assert target_file.exists()
         content = target_file.read_text(encoding="utf-8")
-        assert "[MOCK PROCESSING]" in content
+        assert "[TRANSLATED]" in content
 
     def test_process_creates_po(self, processor, source_file, target_file, po_file):
         processor.process_document(source_file, target_file, po_file)
@@ -105,7 +104,7 @@ class TestInplaceMode:
 
 
 class TestCodeBlockSkipping:
-    def test_code_without_source_lang_skipped(self, tmp_path):
+    def test_code_without_source_lang_skipped(self, tmp_path, mock_completion):
         """Code blocks without source language content are skipped (msgstr=msgid)."""
         md = "# Title\n\n```python\nprint('hello')\n```\n"
         source = tmp_path / "source.md"
@@ -113,12 +112,14 @@ class TestCodeBlockSkipping:
         target = tmp_path / "target.md"
         po_path = tmp_path / "messages.po"
 
-        processor = MarkdownProcessor(MockLLMInterface(), source_langs=["ko"])
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", source_langs=["ko"]
+        )
         result = processor.process_document(source, target, po_path)
         # Code block should be skipped (no Korean)
         assert result["translation_stats"]["skipped"] >= 1
 
-    def test_code_with_source_lang_processed(self, tmp_path):
+    def test_code_with_source_lang_processed(self, tmp_path, mock_completion):
         """Code blocks with source language content should be processed."""
         md = "# Title\n\n```python\n# 한국어 주석\nprint('hello')\n```\n"
         source = tmp_path / "source.md"
@@ -126,11 +127,13 @@ class TestCodeBlockSkipping:
         target = tmp_path / "target.md"
         po_path = tmp_path / "messages.po"
 
-        processor = MarkdownProcessor(MockLLMInterface(), source_langs=["ko"])
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", source_langs=["ko"]
+        )
         result = processor.process_document(source, target, po_path)
         assert result["translation_stats"]["processed"] >= 1
 
-    def test_no_source_langs_processes_all_code(self, tmp_path):
+    def test_no_source_langs_processes_all_code(self, tmp_path, mock_completion):
         """When source_langs is None, all code blocks are sent to the LLM."""
         md = "# Title\n\n```python\nprint('hello')\n```\n"
         source = tmp_path / "source.md"
@@ -139,12 +142,12 @@ class TestCodeBlockSkipping:
         po_path = tmp_path / "messages.po"
 
         # No source_langs → code block skipping disabled
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         result = processor.process_document(source, target, po_path)
         # Code block should be processed (not skipped)
         assert result["translation_stats"]["processed"] >= 2  # heading + code
 
-    def test_multiple_source_langs(self, tmp_path):
+    def test_multiple_source_langs(self, tmp_path, mock_completion):
         """Code blocks with any of multiple source languages are processed."""
         md = "# Title\n\n```python\n# 你好世界\nprint('hello')\n```\n"
         source = tmp_path / "source.md"
@@ -152,96 +155,61 @@ class TestCodeBlockSkipping:
         target = tmp_path / "target.md"
         po_path = tmp_path / "messages.po"
 
-        processor = MarkdownProcessor(MockLLMInterface(), source_langs=["ko", "zh"])
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", source_langs=["ko", "zh"]
+        )
         result = processor.process_document(source, target, po_path)
         # Chinese detected → code block should be processed
         assert result["translation_stats"]["processed"] >= 1
 
 
 class TestTargetLangFlow:
-    def test_target_lang_forwarded_to_mock(self, tmp_path):
-        """target_lang should appear in MockLLMInterface output."""
+    def test_target_lang_in_system_message(self, tmp_path, mock_completion):
+        """target_lang should appear in the system message sent to the LLM."""
         md = "# Title\n\nParagraph.\n"
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
 
-        processor = MarkdownProcessor(MockLLMInterface(), target_lang="ko")
-        result = processor.process_document(
-            source, tmp_path / "target.md", tmp_path / "m.po"
-        )
-        content = (tmp_path / "target.md").read_text(encoding="utf-8")
-        assert "lang=ko" in content
-        assert result["translation_stats"]["processed"] >= 1
-
-    def test_no_target_lang_no_lang_tag(self, tmp_path):
-        """Without target_lang, no lang= should appear in output."""
-        md = "# Title\n\nParagraph.\n"
-        source = tmp_path / "source.md"
-        source.write_text(md, encoding="utf-8")
-
-        processor = MarkdownProcessor(MockLLMInterface())
-        processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
-        content = (tmp_path / "target.md").read_text(encoding="utf-8")
-        assert "lang=" not in content
-
-    def test_target_lang_not_sent_to_old_llm(self, tmp_path):
-        """Old-style LLM without target_lang param should not receive it."""
-
-        class OldLLM(LLMInterface):
-            def process(self, source_text: str) -> str:
-                return f"[OLD] {source_text}"
-
-        md = "# Title\n\nParagraph.\n"
-        source = tmp_path / "source.md"
-        source.write_text(md, encoding="utf-8")
-
-        processor = MarkdownProcessor(OldLLM(), target_lang="ko")
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         result = processor.process_document(
             source, tmp_path / "target.md", tmp_path / "m.po"
         )
         assert result["translation_stats"]["processed"] >= 1
-        assert result["translation_stats"]["failed"] == 0
 
-    def test_target_lang_with_reference_pairs(self, tmp_path):
-        """Both target_lang and reference_pairs forwarded when LLM accepts both."""
-        received = []
-
-        class TrackingLLM(LLMInterface):
-            def process(self, source_text: str, reference_pairs=None, target_lang=None) -> str:
-                received.append({"text": source_text, "pairs": reference_pairs, "lang": target_lang})
-                return f"[OK] {source_text}"
-
-        md = "# Title\n\nParagraph one.\n\nParagraph two.\n"
-        source = tmp_path / "source.md"
-        source.write_text(md, encoding="utf-8")
-
-        processor = MarkdownProcessor(TrackingLLM(), target_lang="ko")
-        processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
-
-        # Every call should have target_lang="ko"
-        for call in received:
-            assert call["lang"] == "ko"
+        # Verify system message contains target lang
+        call_args = mock_completion.completion.call_args_list[0]
+        messages = call_args.kwargs["messages"]
+        system_msg = messages[0]["content"]
+        assert "ko" in system_msg
 
 
 class TestLLMFailureHandling:
-    def test_partial_failure_doesnt_crash(self, tmp_path):
+    def test_partial_failure_doesnt_crash(self, tmp_path, mock_completion):
         """If LLM fails on one entry, others should still be processed."""
+        call_count = 0
 
-        class FailingLLM(LLMInterface):
-            def __init__(self):
-                self.call_count = 0
+        def _failing_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("LLM API error")
+            messages = kwargs.get("messages", [])
+            source_text = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    source_text = msg["content"]
+                    break
+            mock_response = MagicMock()
+            mock_response.choices[0].message.content = f"[TRANSLATED] {source_text}"
+            return mock_response
 
-            def process(self, source_text: str) -> str:
-                self.call_count += 1
-                if self.call_count == 1:
-                    raise RuntimeError("LLM API error")
-                return f"[OK] {source_text}"
+        mock_completion.completion.side_effect = _failing_side_effect
 
         md = "# Title\n\nPara one.\n\nPara two.\n"
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
 
-        processor = MarkdownProcessor(FailingLLM())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         result = processor.process_document(
             source, tmp_path / "target.md", tmp_path / "m.po"
         )
@@ -250,45 +218,42 @@ class TestLLMFailureHandling:
         assert stats["failed"] >= 1
         assert stats["processed"] >= 1
 
-    def test_po_saved_on_error(self, tmp_path):
+    def test_po_saved_on_error(self, tmp_path, mock_completion):
         """PO file should be saved even when processing has errors."""
-
-        class AlwaysFailLLM(LLMInterface):
-            def process(self, source_text: str) -> str:
-                raise RuntimeError("fail")
+        mock_completion.completion.side_effect = RuntimeError("fail")
 
         md = "# Title\n\nParagraph.\n"
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
         po_path = tmp_path / "messages.po"
 
-        processor = MarkdownProcessor(AlwaysFailLLM())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         processor.process_document(source, tmp_path / "target.md", po_path)
         # PO should still be saved (finally block)
         assert po_path.exists()
 
 
 class TestExtractBlockType:
-    def test_standard_msgctxt(self):
-        processor = MarkdownProcessor(MockLLMInterface())
+    def test_standard_msgctxt(self, mock_completion):
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         result = processor._extract_block_type_from_msgctxt("intro/setup::para:0")
         assert result == "para"
 
-    def test_heading_type(self):
-        processor = MarkdownProcessor(MockLLMInterface())
+    def test_heading_type(self, mock_completion):
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         result = processor._extract_block_type_from_msgctxt("title::heading:0")
         assert result == "heading"
 
-    def test_empty_msgctxt(self):
-        processor = MarkdownProcessor(MockLLMInterface())
+    def test_empty_msgctxt(self, mock_completion):
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         assert processor._extract_block_type_from_msgctxt("") == ""
 
-    def test_none_msgctxt(self):
-        processor = MarkdownProcessor(MockLLMInterface())
+    def test_none_msgctxt(self, mock_completion):
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         assert processor._extract_block_type_from_msgctxt(None) == ""
 
-    def test_no_double_colon(self):
-        processor = MarkdownProcessor(MockLLMInterface())
+    def test_no_double_colon(self, mock_completion):
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         assert processor._extract_block_type_from_msgctxt("nocolon") == ""
 
 
@@ -322,7 +287,7 @@ class TestProcessDirectory:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
-    def test_processes_all_md_files(self, tmp_path):
+    def test_processes_all_md_files(self, tmp_path, mock_completion):
         """Flat directory with multiple .md files — all should be processed."""
         src = tmp_path / "src"
         tgt = tmp_path / "tgt"
@@ -332,7 +297,7 @@ class TestProcessDirectory:
         self._make_md_file(src / "b.md", "# B\n\nBravo.\n")
         self._make_md_file(src / "c.md", "# C\n\nCharlie.\n")
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         result = processor.process_directory(src, tgt, po)
 
         assert result["files_processed"] + result["files_skipped"] == 3
@@ -343,7 +308,7 @@ class TestProcessDirectory:
         assert (tgt / "b.md").exists()
         assert (tgt / "c.md").exists()
 
-    def test_mirrors_subdirectory_structure(self, tmp_path):
+    def test_mirrors_subdirectory_structure(self, tmp_path, mock_completion):
         """Nested directories should be mirrored in target and PO dirs."""
         src = tmp_path / "src"
         tgt = tmp_path / "tgt"
@@ -352,13 +317,13 @@ class TestProcessDirectory:
         self._make_md_file(src / "top.md")
         self._make_md_file(src / "sub" / "nested.md")
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         processor.process_directory(src, tgt, po)
 
         assert (tgt / "top.md").exists()
         assert (tgt / "sub" / "nested.md").exists()
 
-    def test_po_uses_po_extension(self, tmp_path):
+    def test_po_uses_po_extension(self, tmp_path, mock_completion):
         """PO files should use .po extension, not .md."""
         src = tmp_path / "src"
         tgt = tmp_path / "tgt"
@@ -367,7 +332,7 @@ class TestProcessDirectory:
         self._make_md_file(src / "doc.md")
         self._make_md_file(src / "sub" / "page.md")
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         processor.process_directory(src, tgt, po)
 
         assert (po / "doc.po").exists()
@@ -375,7 +340,7 @@ class TestProcessDirectory:
         # No .md files in PO dir
         assert not list(po.glob("**/*.md"))
 
-    def test_custom_glob_pattern(self, tmp_path):
+    def test_custom_glob_pattern(self, tmp_path, mock_completion):
         """Non-recursive glob should only match top-level files."""
         src = tmp_path / "src"
         tgt = tmp_path / "tgt"
@@ -384,7 +349,7 @@ class TestProcessDirectory:
         self._make_md_file(src / "top.md")
         self._make_md_file(src / "sub" / "nested.md")
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         result = processor.process_directory(src, tgt, po, glob="*.md")
 
         # Only top-level file matched
@@ -393,14 +358,14 @@ class TestProcessDirectory:
         assert (tgt / "top.md").exists()
         assert not (tgt / "sub" / "nested.md").exists()
 
-    def test_empty_directory(self, tmp_path):
+    def test_empty_directory(self, tmp_path, mock_completion):
         """Empty directory returns zero counts."""
         src = tmp_path / "src"
         src.mkdir()
         tgt = tmp_path / "tgt"
         po = tmp_path / "po"
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         result = processor.process_directory(src, tgt, po)
 
         assert result["files_processed"] == 0
@@ -408,7 +373,7 @@ class TestProcessDirectory:
         assert result["files_skipped"] == 0
         assert result["results"] == []
 
-    def test_single_file_failure_continues(self, tmp_path):
+    def test_single_file_failure_continues(self, tmp_path, mock_completion):
         """One file failing should not stop processing of remaining files."""
         src = tmp_path / "src"
         tgt = tmp_path / "tgt"
@@ -420,7 +385,7 @@ class TestProcessDirectory:
         bad.parent.mkdir(parents=True, exist_ok=True)
         bad.write_text("# Bad\n\nBad content.\n", encoding="utf-8")
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
 
         original_process = processor.process_document
 
@@ -436,7 +401,7 @@ class TestProcessDirectory:
         assert result["files_processed"] + result["files_skipped"] >= 1
         assert len(result["results"]) == 2
 
-    def test_inplace_mode_forwarded(self, tmp_path):
+    def test_inplace_mode_forwarded(self, tmp_path, mock_completion):
         """The inplace flag should be forwarded to process_document."""
         src = tmp_path / "src"
         tgt = tmp_path / "tgt"
@@ -444,7 +409,7 @@ class TestProcessDirectory:
 
         self._make_md_file(src / "doc.md", "# Title\n\nSome text.\n")
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
 
         with patch.object(
             processor, "process_document", wraps=processor.process_document
@@ -454,14 +419,14 @@ class TestProcessDirectory:
             _, kwargs = mock_pd.call_args
             assert kwargs.get("inplace") is True or mock_pd.call_args[0][-1] is True
 
-    def test_return_value_structure(self, tmp_path):
+    def test_return_value_structure(self, tmp_path, mock_completion):
         """Return dict should contain all expected keys."""
         src = tmp_path / "src"
         tgt = tmp_path / "tgt"
         po = tmp_path / "po"
         src.mkdir()
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         result = processor.process_directory(src, tgt, po)
 
         assert result["source_dir"] == str(src)
@@ -472,7 +437,7 @@ class TestProcessDirectory:
         assert "files_skipped" in result
         assert "results" in result
 
-    def test_max_workers_parameter(self, tmp_path):
+    def test_max_workers_parameter(self, tmp_path, mock_completion):
         """max_workers parameter is accepted and produces correct results."""
         src = tmp_path / "src"
         tgt = tmp_path / "tgt"
@@ -481,7 +446,7 @@ class TestProcessDirectory:
         self._make_md_file(src / "a.md", "# A\n\nAlpha.\n")
         self._make_md_file(src / "b.md", "# B\n\nBravo.\n")
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         result = processor.process_directory(src, tgt, po, max_workers=2)
 
         assert result["files_processed"] + result["files_skipped"] == 2
@@ -491,71 +456,60 @@ class TestProcessDirectory:
 class TestSequentialProcessing:
     """Tests for sequential entry processing with reference context."""
 
-    def test_entries_processed_in_document_order(self, tmp_path):
+    def test_entries_processed_in_document_order(self, tmp_path, mock_completion):
         """LLM calls should happen in document order."""
-        call_order = []
-
-        class TrackingLLM(LLMInterface):
-            def process(self, source_text: str, reference_pairs=None) -> str:
-                call_order.append(source_text)
-                return f"[OK] {source_text}"
-
         md = "# First\n\nSecond paragraph.\n\nThird paragraph.\n"
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
 
-        processor = MarkdownProcessor(TrackingLLM())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
 
-        # Entries should be in document order
+        # Extract user messages from call args (last user message in each call)
+        call_order = []
+        for call in mock_completion.completion.call_args_list:
+            messages = call.kwargs["messages"]
+            # Last message is always the source text
+            call_order.append(messages[-1]["content"])
+
         assert len(call_order) >= 3
-        # First heading (includes markdown prefix), then paragraphs
         assert call_order[0] == "# First"
         assert call_order[1] == "Second paragraph."
         assert call_order[2] == "Third paragraph."
 
-    def test_reference_pairs_grow_over_run(self, tmp_path):
+    def test_reference_pairs_grow_over_run(self, tmp_path, mock_completion):
         """First entry should get no reference pairs; later entries should get some."""
-        received_pairs = []
-
-        class TrackingLLM(LLMInterface):
-            def process(self, source_text: str, reference_pairs=None) -> str:
-                received_pairs.append(reference_pairs)
-                return f"[OK] {source_text}"
-
         md = "# Title\n\nParagraph one.\n\nParagraph two.\n\nParagraph three.\n"
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
 
-        processor = MarkdownProcessor(TrackingLLM())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
 
-        # First entry has no reference pairs (pool is empty)
-        assert received_pairs[0] is None
-        # Later entries should have growing reference context
-        # At least the last entry should have pairs from earlier entries
-        non_none = [p for p in received_pairs if p is not None]
-        assert len(non_none) >= 1
+        # First call: system + user (2 messages)
+        # Later calls should have more messages due to few-shot pairs
+        call_counts = []
+        for call in mock_completion.completion.call_args_list:
+            messages = call.kwargs["messages"]
+            call_counts.append(len(messages))
 
-    def test_existing_po_seeds_pool(self, tmp_path):
+        # First call has fewest messages (no reference pairs)
+        assert call_counts[0] == 2
+        # Later calls should have more (reference pairs add messages)
+        assert any(c > 2 for c in call_counts[1:])
+
+    def test_existing_po_seeds_pool(self, tmp_path, mock_completion):
         """Second run after source edit should seed pool from existing translations."""
-        received_pairs = []
-
-        class TrackingLLM(LLMInterface):
-            def process(self, source_text: str, reference_pairs=None) -> str:
-                received_pairs.append((source_text, reference_pairs))
-                return f"[OK] {source_text}"
-
         md = "# Title\n\nOriginal paragraph.\n\nAnother paragraph.\n"
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
         po_path = tmp_path / "m.po"
 
-        processor = MarkdownProcessor(TrackingLLM())
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
         # First run — translates everything
         processor.process_document(source, tmp_path / "target.md", po_path)
 
-        received_pairs.clear()
+        mock_completion.completion.reset_mock()
 
         # Edit source — change one paragraph
         source.write_text(
@@ -565,39 +519,11 @@ class TestSequentialProcessing:
         # but the pool is seeded from existing PO translations
         processor.process_document(source, tmp_path / "target.md", po_path)
 
-        # The changed paragraph should have reference pairs from the seeded pool
-        assert len(received_pairs) >= 1
+        # The changed paragraph should have been processed
+        assert mock_completion.completion.call_count >= 1
 
-    def test_old_style_llm_backward_compat(self, tmp_path):
-        """LLM subclass without reference_pairs parameter still works."""
-
-        class OldLLM(LLMInterface):
-            def process(self, source_text: str) -> str:
-                return f"[OLD] {source_text}"
-
-        md = "# Title\n\nParagraph.\n"
-        source = tmp_path / "source.md"
-        source.write_text(md, encoding="utf-8")
-
-        processor = MarkdownProcessor(OldLLM())
-        result = processor.process_document(
-            source, tmp_path / "target.md", tmp_path / "m.po"
-        )
-        assert result["translation_stats"]["processed"] >= 1
-        assert result["translation_stats"]["failed"] == 0
-
-        target_content = (tmp_path / "target.md").read_text(encoding="utf-8")
-        assert "[OLD]" in target_content
-
-    def test_max_reference_pairs_constructor_arg(self, tmp_path):
+    def test_max_reference_pairs_constructor_arg(self, tmp_path, mock_completion):
         """max_reference_pairs should limit the number of pairs passed."""
-        received_pairs = []
-
-        class TrackingLLM(LLMInterface):
-            def process(self, source_text: str, reference_pairs=None) -> str:
-                received_pairs.append(reference_pairs)
-                return f"[OK] {source_text}"
-
         # Many paragraphs to ensure pool grows
         lines = ["# Title\n"]
         for i in range(10):
@@ -607,9 +533,14 @@ class TestSequentialProcessing:
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
 
-        processor = MarkdownProcessor(TrackingLLM(), max_reference_pairs=2)
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", max_reference_pairs=2
+        )
         processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
 
-        for pairs in received_pairs:
-            if pairs is not None:
-                assert len(pairs) <= 2
+        for call in mock_completion.completion.call_args_list:
+            messages = call.kwargs["messages"]
+            # Count user/assistant pairs (excluding system and final user)
+            pair_messages = messages[1:-1]  # exclude system and final user
+            # Each pair = 2 messages, so at most 4 pair messages for max_reference_pairs=2
+            assert len(pair_messages) <= 4

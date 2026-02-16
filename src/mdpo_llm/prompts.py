@@ -3,8 +3,7 @@ class Prompts:
         "You are an expert technical translator. Translate the following content into **{lang}**.\n"
         "Following the instruction, translate the text into **{lang}**.\n"
         "Output only the translated result. Do not include any explanations, change logs, or additional comments—only the translation.\n"
-        "Instruction:\n{system_prompt}\n\n"
-        "Source text:\n{source}"
+        "Instruction:\n{instruction}\n"
     )
     VALIDATE_HUMAN_TEMPLATE = (
         "Assess the OUTPUT against the SOURCE document.\n\n"
@@ -23,7 +22,7 @@ class Prompts:
         "3. Keep all Markdown structures (headings, code blocks, lists, links, tables, etc.) exactly as they appear.\n"
         "4. Do **not** translate, summarize, or add new information unless explicitly instructed.\n"
         "Output only the refined result. Do not include any explanations, change logs, or additional comments—only the refined text.\n\n"
-        "Instruction: {system_prompt}"
+        "Instruction: {instruction}"
     )
 
     TRANSLATE_INSTRUCTION = (
