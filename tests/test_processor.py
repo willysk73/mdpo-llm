@@ -234,6 +234,22 @@ class TestProcessDirectory:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
+    def test_po_dir_defaults_to_target_dir(self, tmp_path, mock_completion):
+        """When po_dir is omitted, PO files are placed next to target files."""
+        src = tmp_path / "src"
+        tgt = tmp_path / "tgt"
+
+        self._make_md_file(src / "doc.md", "# Hello\n\nWorld.\n")
+        self._make_md_file(src / "sub" / "page.md", "# Sub\n\nNested.\n")
+
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
+        result = processor.process_directory(src, tgt)
+
+        assert result["po_dir"] is None
+        # PO files should be next to target files
+        assert (tgt / "doc.po").exists()
+        assert (tgt / "sub" / "page.po").exists()
+
     def test_processes_all_md_files(self, tmp_path, mock_completion):
         """Flat directory with multiple .md files — all should be processed."""
         src = tmp_path / "src"

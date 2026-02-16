@@ -250,7 +250,7 @@ class MarkdownProcessor:
         self,
         source_dir: Path,
         target_dir: Path,
-        po_dir: Path,
+        po_dir: Path | None = None,
         glob: str = "**/*.md",
         inplace: bool = False,
         max_workers: int = 4,
@@ -264,7 +264,9 @@ class MarkdownProcessor:
         Args:
             source_dir: Root directory containing source markdown files
             target_dir: Root directory for processed output (mirrors source structure)
-            po_dir: Root directory for PO files (mirrors source structure)
+            po_dir: Root directory for PO files (mirrors source structure).
+                When ``None`` (default), PO files are placed next to the
+                target files with a ``.po`` extension.
             glob: Glob pattern to match markdown files
             inplace: Whether to use inplace mode for processing
             max_workers: Maximum number of files to process concurrently
@@ -276,7 +278,6 @@ class MarkdownProcessor:
 
         source_dir = Path(source_dir)
         target_dir = Path(target_dir)
-        po_dir = Path(po_dir)
 
         matched_files = sorted(source_dir.glob(glob))
 
@@ -288,7 +289,11 @@ class MarkdownProcessor:
         def _process_one(source_file: Path):
             relative_path = source_file.relative_to(source_dir)
             target_path = target_dir / relative_path
-            po_path_file = po_dir / relative_path.with_suffix(".po")
+            po_path_file = (
+                po_dir / relative_path.with_suffix(".po")
+                if po_dir is not None
+                else None
+            )
             return self.process_document(
                 source_file, target_path, po_path_file, inplace=inplace
             )
@@ -316,7 +321,7 @@ class MarkdownProcessor:
         return {
             "source_dir": str(source_dir),
             "target_dir": str(target_dir),
-            "po_dir": str(po_dir),
+            "po_dir": str(po_dir) if po_dir is not None else None,
             "files_processed": files_processed,
             "files_failed": files_failed,
             "files_skipped": files_skipped,

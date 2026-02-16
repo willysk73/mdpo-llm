@@ -85,16 +85,16 @@ Run it again after editing the source — only the changed paragraphs get reproc
 result = processor.process_directory(
     source_dir=Path("docs/"),
     target_dir=Path("docs_ko/"),
-    po_dir=Path("translations/"),
     glob="**/*.md",
     max_workers=4,  # files processed concurrently
+    # po_dir defaults to target_dir (PO files next to translated files)
 )
 
 print(f"{result['files_processed']} files processed")
 print(f"{result['files_skipped']} files unchanged")
 ```
 
-The directory structure is mirrored into `target_dir` and `po_dir`. Each file gets its own PO file and its own reference pool.
+The directory structure is mirrored into `target_dir`. Each file gets its own PO file and its own reference pool. By default, PO files are placed next to the target files; pass `po_dir` to store them separately.
 
 ### 3. Use any provider
 
@@ -214,7 +214,7 @@ MdpoLLM(
 | Method | Description |
 |--------|-------------|
 | `process_document(source_path, target_path, po_path=None, inplace=False)` | Process a single Markdown file. `po_path` defaults to `target_path` with `.po` extension. |
-| `process_directory(source_dir, target_dir, po_dir, glob, inplace, max_workers)` | Process a directory tree concurrently |
+| `process_directory(source_dir, target_dir, po_dir=None, glob, inplace, max_workers)` | Process a directory tree concurrently. `po_dir` defaults to `target_dir`. |
 | `get_translation_stats(source_path, po_path)` | Return coverage and block statistics |
 | `export_report(source_path, po_path)` | Generate a detailed text report |
 
