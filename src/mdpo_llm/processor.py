@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 import litellm
 import polib
 
-from .language import contains_language
 from .manager import POManager
 from .parser import BlockParser
 from .prompts import Prompts
@@ -29,7 +28,6 @@ class MarkdownProcessor:
         model: str,
         target_lang: str,
         max_reference_pairs: int = 5,
-        source_langs: List[str] | None = None,
         system_prompt: str | None = None,
         post_process: Callable[[str], str] | None = None,
         glossary: Dict[str, str | None] | None = None,
@@ -46,10 +44,6 @@ class MarkdownProcessor:
                 the system prompt sent to the LLM.
             max_reference_pairs: Maximum number of similar reference pairs
                 to pass as context to the LLM per entry.
-            source_langs: BCP 47 locale strings (e.g. ``["ko"]``).  Code
-                blocks that do not contain any of these languages are
-                skipped.  When ``None`` (default), code block skipping is
-                disabled and all code blocks are sent to the LLM.
             system_prompt: Optional override for the default translation
                 instruction.  When ``None``, the built-in
                 ``Prompts.TRANSLATE_INSTRUCTION`` is used.
@@ -72,7 +66,6 @@ class MarkdownProcessor:
         self.model = model
         self.target_lang = target_lang
         self.max_reference_pairs = max_reference_pairs
-        self.source_langs = source_langs
         self._system_prompt = system_prompt
         self._post_process = post_process
         self._glossary = self._resolve_glossary(glossary, glossary_path)
@@ -378,13 +371,6 @@ class MarkdownProcessor:
                 stats["skipped"] += 1
                 continue
 
-            if block_type == "code" and self.source_langs is not None:
-                if not contains_language(entry.msgid, self.source_langs):
-                    entry.msgstr = entry.msgid
-                    po_manager.mark_entry_processed(entry)
-                    stats["skipped"] += 1
-                    continue
-
             needs_translation = (not entry.msgstr) or ("fuzzy" in entry.flags)
             if not needs_translation:
                 continue
@@ -480,13 +466,6 @@ class MarkdownProcessor:
             if block_type in self.SKIP_TYPES:
                 stats["skipped"] += 1
                 continue
-
-            if block_type == "code" and self.source_langs is not None:
-                if not contains_language(entry.msgid, self.source_langs):
-                    entry.msgstr = entry.msgid
-                    self.po_manager.mark_entry_processed(entry)
-                    stats["skipped"] += 1
-                    continue
 
             needs_translation = (not entry.msgstr) or ("fuzzy" in entry.flags)
             if not needs_translation:

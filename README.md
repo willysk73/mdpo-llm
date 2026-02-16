@@ -64,7 +64,6 @@ from mdpo_llm import MdpoLLM
 processor = MdpoLLM(
     model="gpt-4",            # any LiteLLM model string
     target_lang="ko",         # baked into the system prompt
-    source_langs=["ko"],      # code blocks without Korean are skipped
     temperature=0.3,          # forwarded to litellm.completion()
 )
 
@@ -126,28 +125,6 @@ processor = MdpoLLM(model="gpt-4", target_lang="ja")
 ```
 
 When `target_lang` is set, new PO files will include a `Language` header (e.g. `Language: ja`).
-
-### `source_langs` — control code block skipping
-
-A list of BCP 47 locale strings. Code blocks that don't contain any of these languages are skipped (copied as-is). This prevents pure-English code from being sent to the LLM unnecessarily.
-
-```python
-# Skip code blocks that don't contain Korean or Chinese
-processor = MdpoLLM(model="gpt-4", target_lang="ko", source_langs=["ko", "zh"])
-```
-
-When `source_langs` is `None` (the default), code block skipping is disabled and all code blocks are sent to the LLM.
-
-### Supported locale codes
-
-| Code | Language |
-|------|----------|
-| `en` | English |
-| `zh` | Chinese |
-| `ja` | Japanese |
-| `ko` | Korean |
-
-Region subtags (e.g. `zh-CN`, `zh-TW`) are accepted — only the primary subtag is used for detection.
 
 ## Glossary
 
@@ -226,7 +203,6 @@ MdpoLLM(
     model,                     # any LiteLLM model string (required)
     target_lang,               # BCP 47 string, baked into system prompt (required)
     max_reference_pairs=5,     # max similar pairs passed as few-shot context
-    source_langs=None,         # list of BCP 47 strings for code block skipping
     system_prompt=None,        # override the default translation instruction
     post_process=None,         # Callable[[str], str] applied to every LLM response
     glossary=None,             # dict[str, str | None] — inline glossary

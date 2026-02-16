@@ -6,16 +6,12 @@ with GNU gettext PO files for efficient translation and refinement workflows.
 
 from .processor import MarkdownProcessor
 from .prompts import Prompts
-from .language import LANGUAGE_PATTERNS, contains_language, detect_languages
 from .reference_pool import ReferencePool
 
 __version__ = "0.2.0"
 __all__ = [
     "MdpoLLM",  # Main class alias
     "Prompts",
-    "LANGUAGE_PATTERNS",
-    "contains_language",
-    "detect_languages",
     "MarkdownProcessor",  # Keep for backwards compatibility
     "ReferencePool",
 ]

@@ -110,66 +110,6 @@ class TestInplaceMode:
                 assert entry.msgid == entry.msgstr
 
 
-class TestCodeBlockSkipping:
-    def test_code_without_source_lang_skipped(self, tmp_path, mock_completion):
-        """Code blocks without source language content are skipped (msgstr=msgid)."""
-        md = "# Title\n\n```python\nprint('hello')\n```\n"
-        source = tmp_path / "source.md"
-        source.write_text(md, encoding="utf-8")
-        target = tmp_path / "target.md"
-        po_path = tmp_path / "messages.po"
-
-        processor = MarkdownProcessor(
-            model="test-model", target_lang="ko", source_langs=["ko"]
-        )
-        result = processor.process_document(source, target, po_path)
-        # Code block should be skipped (no Korean)
-        assert result["translation_stats"]["skipped"] >= 1
-
-    def test_code_with_source_lang_processed(self, tmp_path, mock_completion):
-        """Code blocks with source language content should be processed."""
-        md = "# Title\n\n```python\n# 한국어 주석\nprint('hello')\n```\n"
-        source = tmp_path / "source.md"
-        source.write_text(md, encoding="utf-8")
-        target = tmp_path / "target.md"
-        po_path = tmp_path / "messages.po"
-
-        processor = MarkdownProcessor(
-            model="test-model", target_lang="ko", source_langs=["ko"]
-        )
-        result = processor.process_document(source, target, po_path)
-        assert result["translation_stats"]["processed"] >= 1
-
-    def test_no_source_langs_processes_all_code(self, tmp_path, mock_completion):
-        """When source_langs is None, all code blocks are sent to the LLM."""
-        md = "# Title\n\n```python\nprint('hello')\n```\n"
-        source = tmp_path / "source.md"
-        source.write_text(md, encoding="utf-8")
-        target = tmp_path / "target.md"
-        po_path = tmp_path / "messages.po"
-
-        # No source_langs → code block skipping disabled
-        processor = MarkdownProcessor(model="test-model", target_lang="ko")
-        result = processor.process_document(source, target, po_path)
-        # Code block should be processed (not skipped)
-        assert result["translation_stats"]["processed"] >= 2  # heading + code
-
-    def test_multiple_source_langs(self, tmp_path, mock_completion):
-        """Code blocks with any of multiple source languages are processed."""
-        md = "# Title\n\n```python\n# 你好世界\nprint('hello')\n```\n"
-        source = tmp_path / "source.md"
-        source.write_text(md, encoding="utf-8")
-        target = tmp_path / "target.md"
-        po_path = tmp_path / "messages.po"
-
-        processor = MarkdownProcessor(
-            model="test-model", target_lang="ko", source_langs=["ko", "zh"]
-        )
-        result = processor.process_document(source, target, po_path)
-        # Chinese detected → code block should be processed
-        assert result["translation_stats"]["processed"] >= 1
-
-
 class TestTargetLangFlow:
     def test_target_lang_in_system_message(self, tmp_path, mock_completion):
         """target_lang should appear in the system message sent to the LLM."""

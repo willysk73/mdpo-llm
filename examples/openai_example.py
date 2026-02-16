@@ -44,7 +44,6 @@ This document demonstrates the translation capabilities.
     processor = MdpoLLM(
         model="gpt-4",               # any LiteLLM model string
         target_lang="ko",            # baked into the system prompt
-        source_langs=["ko"],         # code blocks without Korean are skipped
         temperature=0.3,             # passed through to litellm.completion()
     )
 
