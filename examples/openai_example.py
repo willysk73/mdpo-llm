@@ -29,22 +29,34 @@ class OpenAITranslator(LLMInterface):
         self.model = model
         self.target_language = target_language
         
-    def process(self, source_text: str) -> str:
-        """Translate text using OpenAI."""
+    def process(self, source_text: str, reference_pairs=None) -> str:
+        """Translate text using OpenAI.
+
+        Args:
+            source_text: The text to translate.
+            reference_pairs: Optional list of (source, translation) tuples
+                providing few-shot context from previously translated blocks.
+        """
         try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": f"You are a professional translator. Translate the following text to {self.target_language}. "
+                               f"Preserve all Markdown formatting, code blocks, and special characters exactly as they appear."
+                },
+            ]
+
+            # Add reference pairs as few-shot context
+            if reference_pairs:
+                for ref_src, ref_tgt in reference_pairs:
+                    messages.append({"role": "user", "content": ref_src})
+                    messages.append({"role": "assistant", "content": ref_tgt})
+
+            messages.append({"role": "user", "content": source_text})
+
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": f"You are a professional translator. Translate the following text to {self.target_language}. "
-                                   f"Preserve all Markdown formatting, code blocks, and special characters exactly as they appear."
-                    },
-                    {
-                        "role": "user", 
-                        "content": source_text
-                    }
-                ],
+                messages=messages,
                 temperature=0.3,  # Lower temperature for more consistent translations
             )
             return response.choices[0].message.content

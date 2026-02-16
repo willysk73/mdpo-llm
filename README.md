@@ -10,7 +10,8 @@ Process Markdown documents with LLMs using PO files for efficient, incremental t
 
 - Incremental processing — only changed content gets sent to your LLM
 - Structure preservation — Markdown formatting survives the round-trip intact
-- Concurrent execution — process multiple blocks in parallel
+- Translation context — previously translated blocks are passed as few-shot examples for consistent tone and terminology
+- Concurrent execution — process multiple files in parallel
 - LLM agnostic — bring any provider (OpenAI, Anthropic, local models, etc.)
 - Batch processing — process entire directory trees in one call
 
@@ -94,7 +95,7 @@ The directory structure under `source_dir` is mirrored into `target_dir` and `po
 | Method | Description |
 |--------|-------------|
 | `process_document(source_path, target_path, po_path, inplace=False)` | Process a single Markdown file |
-| `process_directory(source_dir, target_dir, po_dir, glob="**/*.md", inplace=False)` | Process all matching files in a directory tree |
+| `process_directory(source_dir, target_dir, po_dir, glob="**/*.md", inplace=False, max_workers=4)` | Process all matching files in a directory tree (concurrently) |
 | `get_translation_stats(source_path, po_path)` | Return coverage and block statistics |
 | `export_report(source_path, po_path)` | Generate a detailed text report |
 
@@ -104,6 +105,13 @@ Abstract base class. Implement one method:
 
 ```python
 def process(self, source_text: str) -> str:
+    ...
+```
+
+Optionally accept `reference_pairs` for translation context — a list of `(source, translation)` tuples from previously translated blocks in the same document. The processor detects this parameter automatically via `inspect.signature` and passes it when available:
+
+```python
+def process(self, source_text: str, reference_pairs=None) -> str:
     ...
 ```
 

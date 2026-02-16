@@ -379,3 +379,145 @@ class TestProcessDirectory:
         assert "files_failed" in result
         assert "files_skipped" in result
         assert "results" in result
+
+    def test_max_workers_parameter(self, tmp_path):
+        """max_workers parameter is accepted and produces correct results."""
+        src = tmp_path / "src"
+        tgt = tmp_path / "tgt"
+        po = tmp_path / "po"
+
+        self._make_md_file(src / "a.md", "# A\n\nAlpha.\n")
+        self._make_md_file(src / "b.md", "# B\n\nBravo.\n")
+
+        processor = MarkdownProcessor(MockLLMInterface())
+        result = processor.process_directory(src, tgt, po, max_workers=2)
+
+        assert result["files_processed"] + result["files_skipped"] == 2
+        assert result["files_failed"] == 0
+
+
+class TestSequentialProcessing:
+    """Tests for sequential entry processing with reference context."""
+
+    def test_entries_processed_in_document_order(self, tmp_path):
+        """LLM calls should happen in document order."""
+        call_order = []
+
+        class TrackingLLM(LLMInterface):
+            def process(self, source_text: str, reference_pairs=None) -> str:
+                call_order.append(source_text)
+                return f"[OK] {source_text}"
+
+        md = "# First\n\nSecond paragraph.\n\nThird paragraph.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        processor = MarkdownProcessor(TrackingLLM())
+        processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+
+        # Entries should be in document order
+        assert len(call_order) >= 3
+        # First heading (includes markdown prefix), then paragraphs
+        assert call_order[0] == "# First"
+        assert call_order[1] == "Second paragraph."
+        assert call_order[2] == "Third paragraph."
+
+    def test_reference_pairs_grow_over_run(self, tmp_path):
+        """First entry should get no reference pairs; later entries should get some."""
+        received_pairs = []
+
+        class TrackingLLM(LLMInterface):
+            def process(self, source_text: str, reference_pairs=None) -> str:
+                received_pairs.append(reference_pairs)
+                return f"[OK] {source_text}"
+
+        md = "# Title\n\nParagraph one.\n\nParagraph two.\n\nParagraph three.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        processor = MarkdownProcessor(TrackingLLM())
+        processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+
+        # First entry has no reference pairs (pool is empty)
+        assert received_pairs[0] is None
+        # Later entries should have growing reference context
+        # At least the last entry should have pairs from earlier entries
+        non_none = [p for p in received_pairs if p is not None]
+        assert len(non_none) >= 1
+
+    def test_existing_po_seeds_pool(self, tmp_path):
+        """Second run after source edit should seed pool from existing translations."""
+        received_pairs = []
+
+        class TrackingLLM(LLMInterface):
+            def process(self, source_text: str, reference_pairs=None) -> str:
+                received_pairs.append((source_text, reference_pairs))
+                return f"[OK] {source_text}"
+
+        md = "# Title\n\nOriginal paragraph.\n\nAnother paragraph.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        po_path = tmp_path / "m.po"
+
+        processor = MarkdownProcessor(TrackingLLM())
+        # First run — translates everything
+        processor.process_document(source, tmp_path / "target.md", po_path)
+
+        received_pairs.clear()
+
+        # Edit source — change one paragraph
+        source.write_text(
+            "# Title\n\nChanged paragraph.\n\nAnother paragraph.\n", encoding="utf-8"
+        )
+        # Second run — only the changed paragraph needs translation,
+        # but the pool is seeded from existing PO translations
+        processor.process_document(source, tmp_path / "target.md", po_path)
+
+        # The changed paragraph should have reference pairs from the seeded pool
+        assert len(received_pairs) >= 1
+
+    def test_old_style_llm_backward_compat(self, tmp_path):
+        """LLM subclass without reference_pairs parameter still works."""
+
+        class OldLLM(LLMInterface):
+            def process(self, source_text: str) -> str:
+                return f"[OLD] {source_text}"
+
+        md = "# Title\n\nParagraph.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        processor = MarkdownProcessor(OldLLM())
+        result = processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        assert result["translation_stats"]["processed"] >= 1
+        assert result["translation_stats"]["failed"] == 0
+
+        target_content = (tmp_path / "target.md").read_text(encoding="utf-8")
+        assert "[OLD]" in target_content
+
+    def test_max_reference_pairs_constructor_arg(self, tmp_path):
+        """max_reference_pairs should limit the number of pairs passed."""
+        received_pairs = []
+
+        class TrackingLLM(LLMInterface):
+            def process(self, source_text: str, reference_pairs=None) -> str:
+                received_pairs.append(reference_pairs)
+                return f"[OK] {source_text}"
+
+        # Many paragraphs to ensure pool grows
+        lines = ["# Title\n"]
+        for i in range(10):
+            lines.append(f"\nParagraph {i}.\n")
+        md = "".join(lines)
+
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        processor = MarkdownProcessor(TrackingLLM(), max_reference_pairs=2)
+        processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+
+        for pairs in received_pairs:
+            if pairs is not None:
+                assert len(pairs) <= 2

@@ -52,3 +52,37 @@ class TestMockLLMInterface:
     def test_is_instance_of_llm_interface(self):
         mock = MockLLMInterface()
         assert isinstance(mock, LLMInterface)
+
+    def test_without_reference_pairs(self):
+        mock = MockLLMInterface()
+        result = mock.process("Hello")
+        assert result == "[MOCK PROCESSING] Hello"
+
+    def test_with_reference_pairs(self):
+        mock = MockLLMInterface()
+        pairs = [("src1", "tgt1"), ("src2", "tgt2")]
+        result = mock.process("Hello", reference_pairs=pairs)
+        assert result == "[MOCK PROCESSING ref=2] Hello"
+
+    def test_with_empty_reference_pairs(self):
+        mock = MockLLMInterface()
+        result = mock.process("Hello", reference_pairs=[])
+        # Empty list is falsy, so should return the no-ref format
+        assert result == "[MOCK PROCESSING] Hello"
+
+    def test_with_none_reference_pairs(self):
+        mock = MockLLMInterface()
+        result = mock.process("Hello", reference_pairs=None)
+        assert result == "[MOCK PROCESSING] Hello"
+
+
+class TestOldStyleSubclass:
+    """Backward compatibility: subclasses without reference_pairs still work."""
+
+    def test_old_style_subclass(self):
+        class OldLLM(LLMInterface):
+            def process(self, source_text: str) -> str:
+                return source_text.upper()
+
+        llm = OldLLM()
+        assert llm.process("hello") == "HELLO"
