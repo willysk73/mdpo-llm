@@ -2,29 +2,48 @@
 
 [![Python Version](https://img.shields.io/pypi/pyversions/mdpo-llm.svg)](https://pypi.org/project/mdpo-llm/)
 [![PyPI Version](https://img.shields.io/pypi/v/mdpo-llm.svg)](https://pypi.org/project/mdpo-llm/)
-[![License](https://img.shields.io/pypi/l/mdpo-llm.svg)](https://github.com/yourusername/mdpo-llm/blob/main/LICENSE)
+[![Tests](https://img.shields.io/badge/tests-169%20passed-brightgreen)]()
+[![License](https://img.shields.io/pypi/l/mdpo-llm.svg)](https://github.com/willysk73/mdpo-llm/blob/main/LICENSE)
 
-Process Markdown documents with LLMs using PO files for efficient, incremental translation and refinement.
+**Translate Markdown with LLMs — and only pay for what changed.**
 
-## Features
+mdpo-llm splits your Markdown into blocks, tracks each one in a PO file, and sends only new or changed blocks to your LLM. Edit one paragraph in a 50-block document? One API call, not fifty.
 
-- Incremental processing — only changed content gets sent to your LLM
-- Structure preservation — Markdown formatting survives the round-trip intact
-- Translation context — previously translated blocks are passed as few-shot examples for consistent tone and terminology
-- Concurrent execution — process multiple files in parallel
-- LLM agnostic — bring any provider (OpenAI, Anthropic, local models, etc.)
-- Batch processing — process entire directory trees in one call
+## How It Works
 
-## Why mdpo-llm?
+```mermaid
+flowchart LR
+    A["Markdown\nSource"] --> B["Parse\ninto blocks"]
+    B --> C["Track\nin PO file"]
+    C --> D{"Changed?"}
+    D -- Yes --> E["Send to\nLLM"]
+    D -- No --> F["Reuse existing\ntranslation"]
+    E --> G["Reconstruct\nMarkdown"]
+    F --> G
+```
 
-Traditional approaches send the entire file to an LLM on every change. mdpo-llm does better:
+Each block (heading, paragraph, code block, list, table) is tracked independently. On subsequent runs, only blocks whose source text changed get sent to the LLM — the rest are served from the PO cache.
 
-1. **Parse** — split Markdown into semantic blocks (headings, paragraphs, code blocks, etc.)
-2. **Track** — record each block's content and state in a PO file
-3. **Process** — send only new or changed blocks to your LLM
-4. **Reconstruct** — reassemble the document with original formatting
+### Incremental processing in practice
 
-Only pay for the sections that actually changed.
+```
+First run:    8 blocks parsed → 8 API calls → full document translated
+Edit source:  change 1 paragraph
+Second run:   8 blocks parsed → 1 API call  → only the changed block retranslated
+```
+
+## Translation Context
+
+Blocks aren't translated in isolation. As each block is translated, it's added to a reference pool. Subsequent blocks receive the most similar previous translations as few-shot examples, so the LLM maintains consistent tone, terminology, and style across the entire document.
+
+```
+Block 1: "Introduction"     → translated (no context yet)
+Block 2: "Getting Started"  → translated with Block 1 as reference
+Block 3: "Installation"     → translated with Blocks 1–2 as reference
+...
+```
+
+On re-runs, the pool is seeded from all existing translations in the PO file, so even a single changed paragraph benefits from the full document's context.
 
 ## Installation
 
@@ -34,25 +53,34 @@ pip install mdpo-llm
 
 ## Quick Start
 
-### 1. Implement the LLM Interface
+### 1. Implement the LLM interface
+
+One method. Any provider.
 
 ```python
 from mdpo_llm import LLMInterface, MdpoLLM
 
 class MyLLM(LLMInterface):
-    def process(self, source_text: str) -> str:
-        # Call any LLM here
+    def process(self, source_text: str, reference_pairs=None) -> str:
+        messages = [
+            {"role": "system", "content": "Translate to Korean."},
+        ]
+        # Use reference pairs as few-shot examples for consistency
+        if reference_pairs:
+            for src, tgt in reference_pairs:
+                messages.append({"role": "user", "content": src})
+                messages.append({"role": "assistant", "content": tgt})
+        messages.append({"role": "user", "content": source_text})
+
         response = openai.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "Translate to Korean"},
-                {"role": "user", "content": source_text},
-            ],
+            model="gpt-4", messages=messages,
         )
         return response.choices[0].message.content
 ```
 
-### 2. Process a single document
+> The `reference_pairs` parameter is optional. If your `process()` method doesn't include it, mdpo-llm detects this automatically and calls without it. Existing implementations won't break.
+
+### 2. Process a document
 
 ```python
 from pathlib import Path
@@ -63,10 +91,9 @@ result = processor.process_document(
     source_path=Path("docs/README.md"),
     target_path=Path("docs/README_ko.md"),
     po_path=Path("translations/README.po"),
-    inplace=False,  # True for same-language refinement
 )
 
-print(f"Processed {result['blocks_count']} blocks")
+print(f"Processed {result['translation_stats']['processed']} blocks")
 print(f"Coverage: {result['coverage']['coverage_percentage']}%")
 ```
 
@@ -80,13 +107,27 @@ result = processor.process_directory(
     target_dir=Path("docs_ko/"),
     po_dir=Path("translations/"),
     glob="**/*.md",
+    max_workers=4,  # files processed concurrently
 )
 
 print(f"{result['files_processed']} files processed")
 print(f"{result['files_skipped']} files unchanged")
 ```
 
-The directory structure under `source_dir` is mirrored into `target_dir` and `po_dir`.
+The directory structure is mirrored into `target_dir` and `po_dir`. Each file gets its own PO file and its own reference pool.
+
+## Comparison
+
+| | mdpo-llm | mdpo | md-translator | llm-translator |
+|---|:---:|:---:|:---:|:---:|
+| LLM-powered | Yes | No | Yes | Yes |
+| Incremental (block-level) | Yes | Yes | No | No |
+| PO file tracking | Yes | Yes | No | No |
+| Translation context (few-shot) | Yes | No | Partial | No |
+| LLM-agnostic | Yes | — | Multi-provider | OpenAI only |
+| Batch directory processing | Yes | Yes | No | No |
+
+**mdpo** pioneered PO-based Markdown translation but targets manual/MT workflows, not LLMs. **md-translator** and **llm-translator** use LLMs but reprocess entire files on every run. mdpo-llm combines both: PO-tracked incremental processing with LLM-powered translation and cross-block context.
 
 ## API Reference
 
@@ -95,7 +136,7 @@ The directory structure under `source_dir` is mirrored into `target_dir` and `po
 | Method | Description |
 |--------|-------------|
 | `process_document(source_path, target_path, po_path, inplace=False)` | Process a single Markdown file |
-| `process_directory(source_dir, target_dir, po_dir, glob="**/*.md", inplace=False, max_workers=4)` | Process all matching files in a directory tree (concurrently) |
+| `process_directory(source_dir, target_dir, po_dir, glob, inplace, max_workers)` | Process a directory tree concurrently |
 | `get_translation_stats(source_path, po_path)` | Return coverage and block statistics |
 | `export_report(source_path, po_path)` | Generate a detailed text report |
 
@@ -104,27 +145,29 @@ The directory structure under `source_dir` is mirrored into `target_dir` and `po
 Abstract base class. Implement one method:
 
 ```python
-def process(self, source_text: str) -> str:
-    ...
+class LLMInterface(ABC):
+    @abstractmethod
+    def process(self, source_text: str) -> str: ...
 ```
 
-Optionally accept `reference_pairs` for translation context — a list of `(source, translation)` tuples from previously translated blocks in the same document. The processor detects this parameter automatically via `inspect.signature` and passes it when available:
+Optionally accept `reference_pairs` for translation context:
 
 ```python
-def process(self, source_text: str, reference_pairs=None) -> str:
-    ...
+def process(self, source_text: str, reference_pairs=None) -> str: ...
 ```
+
+The processor detects this parameter via `inspect.signature` and passes a list of `(source, translation)` tuples from the most similar previously translated blocks. If the parameter isn't present, the processor calls without it — no breaking changes.
 
 ## Working with PO Files
 
 PO files (GNU gettext) track the state of each content block:
 
-- **Untranslated** — new content that needs processing
-- **Translated** — completed, up-to-date translations
-- **Fuzzy** — source changed since last processing; will be reprocessed on the next run
-- **Obsolete** — source block was removed; cleaned up automatically
+- **Untranslated** — new content, will be sent to the LLM
+- **Translated** — completed, reused on subsequent runs
+- **Fuzzy** — source changed since last run, will be retranslated
+- **Obsolete** — source block was removed, cleaned up automatically
 
-You can inspect PO files with any standard gettext tool or PO editor.
+You can inspect and edit PO files with any standard gettext tool (Poedit, Lokalize, etc.).
 
 ## Development
 
@@ -132,7 +175,7 @@ You can inspect PO files with any standard gettext tool or PO editor.
 # Install with dev dependencies
 uv pip install -e ".[dev]"
 
-# Run tests
+# Run tests (169 tests)
 pytest tests/
 ```
 

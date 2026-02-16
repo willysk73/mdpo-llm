@@ -5,26 +5,35 @@ build-backend = "hatchling.build"
 [project]
 name = "mdpo-llm"
 version = "0.1.0"
-description = "Process Markdown documents with LLMs using PO files for efficient translation and refinement"
+description = "Incremental Markdown translation with LLMs — track blocks in PO files, only retranslate what changed"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Your Name", email = "your.email@example.com"},
+    {name = "William Kang", email = "willysk73@outlook.com"},
 ]
 keywords = [
     "markdown",
     "translation",
     "llm",
+    "gpt",
+    "openai",
+    "anthropic",
     "po",
     "gettext",
     "localization",
     "i18n",
-    "document-processing",
+    "l10n",
+    "incremental",
+    "document-translation",
+    "markdown-translation",
+    "few-shot",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Topic :: Software Development :: Internationalization",
+    "Topic :: Software Development :: Localization",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Text Processing :: Markup :: Markdown",
     "Topic :: Text Processing :: Linguistic",
@@ -33,7 +42,9 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
+    "Typing :: Typed",
 ]
 dependencies = [
     "polib>=1.2.0",
@@ -43,10 +54,10 @@ dependencies = [
 dev = ["pytest>=7.0", "pytest-cov>=4.0"]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/mdpo-llm"
-Documentation = "https://github.com/yourusername/mdpo-llm#readme"
-Repository = "https://github.com/yourusername/mdpo-llm.git"
-Issues = "https://github.com/yourusername/mdpo-llm/issues"
+Homepage = "https://github.com/willysk73/mdpo-llm"
+Documentation = "https://github.com/willysk73/mdpo-llm#readme"
+Repository = "https://github.com/willysk73/mdpo-llm.git"
+Issues = "https://github.com/willysk73/mdpo-llm/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
