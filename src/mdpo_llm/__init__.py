@@ -1,7 +1,7 @@
 """mdpo-llm: Markdown document processing with LLMs and PO files.
 
 A Python package for processing Markdown documents using Language Learning Models (LLMs)
-with GNU gettext PO files for efficient translation and refinement workflows.
+with GNU gettext PO files for efficient translation workflows.
 """
 
 from .processor import MarkdownProcessor

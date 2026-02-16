@@ -41,16 +41,3 @@ class TestValidateTemplates:
         assert "{lang}" in Prompts.VALIDATE_CRITERIA
 
 
-class TestRefineTemplates:
-    def test_refine_system_has_placeholders(self):
-        tmpl = Prompts.REFINE_SYSTEM_TEMPLATE
-        assert "{lang}" in tmpl
-        assert "{instruction}" in tmpl
-
-    def test_refine_instruction_has_placeholders(self):
-        tmpl = Prompts.REFINE_INSTRUCTION
-        assert "{reason}" in tmpl
-        assert "{previous_chunk}" in tmpl
-
-    def test_refinement_validate_criteria_has_placeholder(self):
-        assert "{previous_chunk}" in Prompts.REFINEMENT_VALIDATE_CRITERIA

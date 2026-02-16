@@ -14,17 +14,6 @@ class Prompts:
         "OUTPUT:\n{processed}\n\n"
         'Respond with JSON → "reason":"…","binary_score":"yes|no"'
     )
-    REFINE_SYSTEM_TEMPLATE = (
-        "You are an expert technical **editor**. Refine the following text written in **{lang}**.\n\n"
-        "Your tasks:\n"
-        "1. Correct spelling, grammar, punctuation, and word choice.\n"
-        "2. Improve clarity, flow, and overall readability while **preserving original meaning**.\n"
-        "3. Keep all Markdown structures (headings, code blocks, lists, links, tables, etc.) exactly as they appear.\n"
-        "4. Do **not** translate, summarize, or add new information unless explicitly instructed.\n"
-        "Output only the refined result. Do not include any explanations, change logs, or additional comments—only the refined text.\n\n"
-        "Instruction: {instruction}"
-    )
-
     TRANSLATE_INSTRUCTION = (
         "Translate the following technical/developer Markdown into the target language. "
         "Preserve every Markdown construct exactly as-is (headings, lists, tables, fenced code, etc.).\n"
@@ -80,68 +69,3 @@ class Prompts:
         '   - **Do not translate** non-user-facing identifiers/config-like strings (e.g., "user_id", "config_path").\n'
     )
 
-    REFINE_INSTRUCTION = (
-        "You are an expert technical writer. Refine the following Markdown document **without altering meaning**. "
-        "Focus only on improving the natural language text (human-readable parts), including comments inside code blocks.\n\n"
-        "**STYLE CONSISTENCY WITH PREVIOUS CHUNK (if provided):**\n"
-        "• A previous refined chunk may be provided as a style anchor.\n"
-        "• Match its tone, voice (active/passive), person (e.g., second person vs. neutral), sentence length, and formality.\n"
-        "• Mirror punctuation habits in lists and sentences (e.g., whether list items end with periods), and capitalization style for terms.\n"
-        "• Prefer the same terminology/wording for the same concepts to keep consistency across chunks.\n"
-        "• Never restructure Markdown to force consistency; adjust wording only.\n\n"
-        "**CORE RULES (NEVER VIOLATE):**\n"
-        "• Preserve ALL Markdown structure exactly (headings, lists, tables, links, bold, italics, etc.)\n"
-        "• Inside code blocks: You may revise comments for clarity/grammar, but DO NOT change code, identifiers, order, or formatting\n"
-        "• URLs: Keep structure intact; change only to correct obvious typos\n"
-        "• Meaning must remain 100% identical - no additions, removals, or changes\n\n"
-        "**LANGUAGE IMPROVEMENTS:**\n"
-        "• Remove redundant words and phrases\n"
-        "• Fix grammatical errors and typos\n"
-        "• Improve sentence flow and clarity\n"
-        "• Use active voice where appropriate (unless the style anchor consistently uses another voice)\n"
-        "• Ensure consistent terminology throughout, aligning with the style anchor when present\n"
-        "• Maintain a professional, concise tone suitable for technical documentation\n\n"
-        "Work methodically through the entire document. Miss nothing.\n"
-        "Reason for previous rejection (if any): {reason}\n"
-        "Previous refined chunk (optional, style anchor): {previous_chunk}\n"
-    )
-
-    REFINEMENT_VALIDATE_SYSTEM = (
-        "You are a strict Markdown quality validator. Evaluate the refinement against ALL criteria. "
-        "Be thorough and critical - if ANY criterion fails, score 'no'. "
-        "Respond **only** with a JSON object containing: "
-        "'binary_score' (\"yes\" or \"no\") and 'reason' (brief justification, especially if 'no')."
-    )
-
-    REFINEMENT_VALIDATE_CRITERIA = (
-        "**VALIDATION CHECKLIST - ALL must pass:**\n\n"
-        "1. **Structural Integrity**\n"
-        "   - All headings, lists, tables, links, bold/italic text preserved exactly\n"
-        "   - Markdown syntax unchanged in structure\n"
-        "   - No missing or added content sections\n\n"
-        "2. **Code Block Compliance**\n"
-        "   - Only comments within code blocks may be edited\n"
-        "   - Code itself (logic, identifiers, order, formatting) remains unchanged\n"
-        "   - Fenced block delimiters and language identifiers remain unchanged\n\n"
-        "3. **Language Quality**\n"
-        "   - Grammar and spelling correct\n"
-        "   - Concise, professional tone\n"
-        "   - Consistent terminology\n"
-        "   - Clear, readable sentences\n\n"
-        "4. **Semantic Preservation**\n"
-        "   - Meaning identical to original\n"
-        "   - No information added, removed, or altered\n"
-        "   - Technical accuracy maintained\n\n"
-        "5. **URL Integrity**\n"
-        "   - URLs preserved; only correct obvious typos if necessary\n\n"
-        "6. **Style Consistency with Previous Chunk (if provided)**\n"
-        "   - Tone, voice, and formality align with the provided style anchor\n"
-        "   - Terminology matches prior choices for the same concepts\n"
-        "   - Punctuation habits (e.g., periods in list items) mirror the style anchor\n\n"
-        "**FAIL immediately if:**\n"
-        "- Any change to code (non-comment) inside code blocks\n"
-        "- Structural changes to Markdown elements\n"
-        "- Meaning alterations of any kind\n"
-        "- Addition or removal of content beyond comment wording improvements\n\n"
-        "Previous refined chunk (optional, style anchor): {previous_chunk}\n"
-    )
