@@ -129,9 +129,7 @@ class MarkdownProcessor:
         Returns:
             List of message dicts suitable for ``litellm.completion()``.
         """
-        instruction = self._system_prompt or Prompts.TRANSLATE_INSTRUCTION.format(
-            reason=""
-        )
+        instruction = self._system_prompt or Prompts.TRANSLATE_INSTRUCTION
         system_content = Prompts.TRANSLATE_SYSTEM_TEMPLATE.format(
             lang=self.target_lang,
             instruction=instruction,
@@ -386,19 +384,30 @@ class MarkdownProcessor:
                 entry_obj, processed, error = self._process_entry(
                     entry, reference_pairs=similar or None
                 )
-                if error is None:
-                    entry_obj.msgstr = processed
-                    if inplace:
-                        entry_obj.msgid = processed
-                    po_manager.mark_entry_processed(entry_obj)
-                    stats["processed"] += 1
-                    pool.add(entry.msgid, processed)
-                else:
-                    print(f"Failed to process entry {entry_obj.msgctxt}: {str(error)}")
+                if error is not None:
+                    logger.warning(
+                        "Failed to translate entry %s: %s",
+                        entry_obj.msgctxt, error,
+                    )
                     stats["failed"] += 1
+                    continue
+
+                if processed is not None and processed.strip() == entry.msgid.strip():
+                    logger.warning(
+                        "LLM returned untranslated output for entry %s",
+                        entry.msgctxt,
+                    )
+
+                entry_obj.msgstr = processed
+                if inplace:
+                    entry_obj.msgid = processed
+                po_manager.mark_entry_processed(entry_obj)
+                stats["processed"] += 1
+                pool.add(entry.msgid, processed)
             except Exception as exc:
-                print(
-                    f"Unexpected error for entry {getattr(entry, 'msgctxt', None)}: {exc}"
+                logger.warning(
+                    "Unexpected error for entry %s: %s",
+                    getattr(entry, "msgctxt", None), exc,
                 )
                 stats["failed"] += 1
 
@@ -414,114 +423,6 @@ class MarkdownProcessor:
                 if end != -1:
                     return msgctxt[start:end]
         return ""
-
-    def _process_entries(
-        self, po_file: polib.POFile, inplace: bool = False
-    ) -> Dict[str, int]:
-        """Process unprocessed entries in PO file."""
-        stats = {"processed": 0, "failed": 0, "skipped": 0}
-
-        for entry in po_file:
-            if entry.obsolete:
-                continue
-
-            block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
-            if block_type in self.SKIP_TYPES:
-                stats["skipped"] += 1
-                continue
-
-            needs_translation = (not entry.msgstr) or ("fuzzy" in entry.flags)
-            if not needs_translation:
-                continue
-
-            try:
-                entry_obj, processed, error = self._process_entry(entry)
-                if error is None:
-                    entry_obj.msgstr = processed
-                    if inplace:
-                        entry_obj.msgid = processed
-                    self.po_manager.mark_entry_processed(entry_obj)
-                    stats["processed"] += 1
-                else:
-                    print(f"Failed to process entry {entry_obj.msgctxt}: {str(error)}")
-                    stats["failed"] += 1
-            except Exception as exc:
-                print(
-                    f"Unexpected error for entry {getattr(entry, 'msgctxt', None)}: {exc}"
-                )
-                stats["failed"] += 1
-
-        return stats
-
-    def _process_entries_concurrent(
-        self, po_file: "polib.POFile", inplace: bool = False, max_workers: int = 10
-    ) -> Dict[str, int]:
-        """Process unprocessed entries in PO file concurrently."""
-        import concurrent.futures
-        import threading
-
-        stats = {"processed": 0, "failed": 0, "skipped": 0}
-        entries_to_process = []
-
-        for entry in po_file:
-            if entry.obsolete:
-                continue
-
-            block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
-            if block_type in self.SKIP_TYPES:
-                stats["skipped"] += 1
-                continue
-
-            needs_translation = (not entry.msgstr) or ("fuzzy" in entry.flags)
-            if not needs_translation:
-                continue
-
-            entries_to_process.append(entry)
-
-        stop_event = threading.Event()
-        future_to_entry = {}
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            try:
-                future_to_entry = {
-                    executor.submit(self._process_entry, entry): entry
-                    for entry in entries_to_process
-                }
-                for future in concurrent.futures.as_completed(future_to_entry):
-                    entry = future_to_entry[future]
-                    try:
-                        entry_obj, processed, error = future.result()
-                        if error is None:
-                            entry_obj.msgstr = processed
-                            if inplace:
-                                entry_obj.msgid = processed
-                            self.po_manager.mark_entry_processed(entry_obj)
-                            stats["processed"] += 1
-                        else:
-                            print(
-                                f"Failed to process entry {entry_obj.msgctxt}: {str(error)}"
-                            )
-                            stats["failed"] += 1
-                    except concurrent.futures.CancelledError:
-                        stats["failed"] += 1
-                    except Exception as exc:
-                        print(
-                            f"Unexpected error for entry {getattr(entry, 'msgctxt', None)}: {exc}"
-                        )
-                        stats["failed"] += 1
-
-            except KeyboardInterrupt:
-                stop_event.set()
-
-                for f in list(future_to_entry.keys()):
-                    f.cancel()
-
-                executor.shutdown(cancel_futures=True)
-                logging.info(
-                    "Ctrl+C pressed — cancelling pending tasks and shutting down…"
-                )
-
-        return stats
 
     def _extract_block_type(self, context_id: str) -> str:
         """Extract block type from context ID."""
