@@ -203,7 +203,7 @@ MdpoLLM(
     model,                     # any LiteLLM model string (required)
     target_lang,               # BCP 47 string, baked into system prompt (required)
     max_reference_pairs=5,     # max similar pairs passed as few-shot context
-    system_prompt=None,        # override the default translation instruction
+    extra_instructions=None,   # appended to the built-in translation prompt
     post_process=None,         # Callable[[str], str] applied to every LLM response
     glossary=None,             # dict[str, str | None] — inline glossary
     glossary_path=None,        # path to JSON glossary file (multi-locale)
@@ -220,7 +220,7 @@ MdpoLLM(
 
 ### Prompts
 
-The `Prompts` class exposes all built-in prompt templates used by the processor. You can reference them when building custom `system_prompt` values or validation pipelines:
+The `Prompts` class exposes all built-in prompt templates used by the processor:
 
 ```python
 from mdpo_llm import Prompts

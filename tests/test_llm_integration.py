@@ -41,21 +41,22 @@ class TestBuildMessages:
         assert messages[3] == {"role": "user", "content": "src2"}
         assert messages[4] == {"role": "assistant", "content": "tgt2"}
 
-    def test_custom_system_prompt_overrides_default(self):
+    def test_extra_instructions_appended(self):
         proc = MarkdownProcessor(
-            model="test-model", target_lang="ko", system_prompt="Custom instruction"
+            model="test-model", target_lang="ko",
+            extra_instructions="Use formal tone throughout.",
         )
         messages = proc._build_messages("Hello")
         system_content = messages[0]["content"]
-        assert "Custom instruction" in system_content
-        # Should NOT contain the default instruction text
-        assert "Fenced code blocks" not in system_content
+        # Extra instructions present
+        assert "Use formal tone" in system_content
+        # Default rules still present
+        assert "code blocks" in system_content
 
-    def test_default_instruction_used_when_no_custom(self, processor):
+    def test_default_instruction_used_when_no_extra(self, processor):
         messages = processor._build_messages("Hello")
         system_content = messages[0]["content"]
-        # Default instruction mentions fenced code blocks
-        assert "Fenced code blocks" in system_content
+        assert "code blocks" in system_content
 
 
 class TestCallLLM:

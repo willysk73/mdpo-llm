@@ -28,7 +28,7 @@ class MarkdownProcessor:
         model: str,
         target_lang: str,
         max_reference_pairs: int = 5,
-        system_prompt: str | None = None,
+        extra_instructions: str | None = None,
         post_process: Callable[[str], str] | None = None,
         glossary: Dict[str, str | None] | None = None,
         glossary_path: Path | str | None = None,
@@ -44,9 +44,10 @@ class MarkdownProcessor:
                 the system prompt sent to the LLM.
             max_reference_pairs: Maximum number of similar reference pairs
                 to pass as context to the LLM per entry.
-            system_prompt: Optional override for the default translation
-                instruction.  When ``None``, the built-in
-                ``Prompts.TRANSLATE_INSTRUCTION`` is used.
+            extra_instructions: Additional instructions appended to the
+                default translation prompt.  Use this to specify tone,
+                terminology, domain context, or audience without
+                replacing the built-in Markdown rules.
             post_process: Optional callable applied to every LLM response
                 before it is stored.  Useful for stripping unwanted
                 wrappers, fixing formatting, etc.
@@ -66,7 +67,7 @@ class MarkdownProcessor:
         self.model = model
         self.target_lang = target_lang
         self.max_reference_pairs = max_reference_pairs
-        self._system_prompt = system_prompt
+        self._extra_instructions = extra_instructions
         self._post_process = post_process
         self._glossary = self._resolve_glossary(glossary, glossary_path)
         self._litellm_kwargs = litellm_kwargs
@@ -129,7 +130,9 @@ class MarkdownProcessor:
         Returns:
             List of message dicts suitable for ``litellm.completion()``.
         """
-        instruction = self._system_prompt or Prompts.TRANSLATE_INSTRUCTION
+        instruction = Prompts.TRANSLATE_INSTRUCTION
+        if self._extra_instructions:
+            instruction += "\n" + self._extra_instructions
         system_content = Prompts.TRANSLATE_SYSTEM_TEMPLATE.format(
             lang=self.target_lang,
             instruction=instruction,
