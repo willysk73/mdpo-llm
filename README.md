@@ -71,7 +71,7 @@ processor = MdpoLLM(
 result = processor.process_document(
     source_path=Path("docs/README.md"),
     target_path=Path("docs/README_ko.md"),
-    po_path=Path("translations/README.po"),
+    # po_path defaults to docs/README_ko.po
 )
 
 print(f"Processed {result['translation_stats']['processed']} blocks")
@@ -182,7 +182,7 @@ MdpoLLM(
 
 | Method | Description |
 |--------|-------------|
-| `process_document(source_path, target_path, po_path, inplace=False)` | Process a single Markdown file |
+| `process_document(source_path, target_path, po_path=None, inplace=False)` | Process a single Markdown file. `po_path` defaults to `target_path` with `.po` extension. |
 | `process_directory(source_dir, target_dir, po_dir, glob, inplace, max_workers)` | Process a directory tree concurrently |
 | `get_translation_stats(source_path, po_path)` | Return coverage and block statistics |
 | `export_report(source_path, po_path)` | Generate a detailed text report |

@@ -64,6 +64,13 @@ class TestFullWorkflow:
         result = processor.process_document(source_file, target_file, po_file)
         assert result["translation_stats"]["skipped"] >= 1
 
+    def test_po_path_defaults_to_target_with_po_ext(self, processor, source_file, target_file):
+        """When po_path is omitted, PO file is created next to target with .po extension."""
+        result = processor.process_document(source_file, target_file)
+        expected_po = target_file.with_suffix(".po")
+        assert expected_po.exists()
+        assert result["po_path"] == str(expected_po)
+
 
 class TestIncrementalProcessing:
     def test_no_reprocessing_unchanged(

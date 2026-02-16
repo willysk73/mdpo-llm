@@ -118,7 +118,7 @@ class MarkdownProcessor:
         return result
 
     def process_document(
-        self, source_path: Path, target_path: Path, po_path: Path, inplace: bool = False
+        self, source_path: Path, target_path: Path, po_path: Path | None = None, inplace: bool = False
     ) -> Dict[str, Any]:
         """
         Process a markdown document.
@@ -129,11 +129,15 @@ class MarkdownProcessor:
         Args:
             source_path: Path to source markdown file
             target_path: Path for processed markdown file
-            po_path: Path for PO file
+            po_path: Path for PO file.  When ``None``, defaults to
+                ``target_path`` with a ``.po`` extension (e.g.
+                ``docs/README_ko.md`` → ``docs/README_ko.po``).
 
         Returns:
             Dictionary with translation results and statistics
         """
+        if po_path is None:
+            po_path = Path(target_path).with_suffix(".po")
         # Local instances for thread safety
         parser = BlockParser()
         po_manager = POManager(skip_types=self.SKIP_TYPES)
