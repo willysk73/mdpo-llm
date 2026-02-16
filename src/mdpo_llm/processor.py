@@ -32,6 +32,8 @@ class MarkdownProcessor:
         source_langs: List[str] | None = None,
         system_prompt: str | None = None,
         post_process: Callable[[str], str] | None = None,
+        glossary: Dict[str, str | None] | None = None,
+        glossary_path: Path | str | None = None,
         **litellm_kwargs,
     ):
         """
@@ -54,6 +56,12 @@ class MarkdownProcessor:
             post_process: Optional callable applied to every LLM response
                 before it is stored.  Useful for stripping unwanted
                 wrappers, fixing formatting, etc.
+            glossary: Inline glossary mapping terms to translations.
+                ``None`` values mean "do not translate"; string values
+                mean "use this exact translation".  Merged on top of
+                ``glossary_path`` (inline wins).
+            glossary_path: Path to a JSON glossary file.  Supports
+                per-locale translations — see README for the format.
             **litellm_kwargs: Extra keyword arguments forwarded to
                 ``litellm.completion()`` (e.g. ``temperature``,
                 ``api_key``, ``api_base``).
@@ -67,7 +75,55 @@ class MarkdownProcessor:
         self.source_langs = source_langs
         self._system_prompt = system_prompt
         self._post_process = post_process
+        self._glossary = self._resolve_glossary(glossary, glossary_path)
         self._litellm_kwargs = litellm_kwargs
+
+    def _resolve_glossary(self, glossary, glossary_path):
+        """Resolve glossary from file and/or inline dict for the current target_lang.
+
+        Returns:
+            A flat ``dict[str, str | None]`` or ``None`` if empty.
+        """
+        import json
+
+        resolved: Dict[str, str | None] = {}
+
+        if glossary_path:
+            raw = json.loads(Path(glossary_path).read_text(encoding="utf-8"))
+            for term, value in raw.items():
+                if value is None:
+                    resolved[term] = None
+                elif isinstance(value, str):
+                    resolved[term] = value
+                elif isinstance(value, dict):
+                    resolved[term] = value.get(self.target_lang)
+
+        if glossary:
+            resolved.update(glossary)
+
+        return resolved or None
+
+    def _format_glossary(self, source_text: str) -> str | None:
+        """Return a glossary prompt block containing only terms found in *source_text*.
+
+        Returns:
+            A formatted string to append to the system message, or
+            ``None`` when no glossary terms match.
+        """
+        if not self._glossary:
+            return None
+
+        relevant = {k: v for k, v in self._glossary.items() if k in source_text}
+        if not relevant:
+            return None
+
+        lines = []
+        for term, translation in relevant.items():
+            if translation is None:
+                lines.append(f'- "{term}" \u2192 do not translate')
+            else:
+                lines.append(f'- "{term}" \u2192 "{translation}"')
+        return "Glossary (use these exact forms, do not alter):\n" + "\n".join(lines)
 
     def _build_messages(self, source_text: str, reference_pairs=None):
         """Build the chat messages list for the LLM call.
@@ -87,6 +143,10 @@ class MarkdownProcessor:
             lang=self.target_lang,
             instruction=instruction,
         )
+
+        glossary_block = self._format_glossary(source_text)
+        if glossary_block:
+            system_content += "\n\n" + glossary_block
 
         messages = [{"role": "system", "content": system_content}]
 

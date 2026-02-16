@@ -149,6 +149,57 @@ When `source_langs` is `None` (the default), code block skipping is disabled and
 
 Region subtags (e.g. `zh-CN`, `zh-TW`) are accepted — only the primary subtag is used for detection.
 
+## Glossary
+
+Protect brand names, trademarks, and proper nouns from translation — or force specific translations for them.
+
+### Inline glossary
+
+```python
+processor = MdpoLLM(
+    model="gpt-4",
+    target_lang="ko",
+    glossary={
+        "GitHub": None,                # None = do not translate
+        "Markdown": None,
+        "pull request": "풀 리퀘스트",  # force specific translation
+        "API": "API",
+    },
+)
+```
+
+### JSON glossary file
+
+For multi-locale projects, keep a single `glossary.json`:
+
+```json
+{
+  "GitHub": null,
+  "Markdown": null,
+  "pull request": {
+    "ko": "풀 리퀘스트",
+    "ja": "プルリクエスト"
+  },
+  "API": "API"
+}
+```
+
+- `null` — do not translate (any locale)
+- `"string"` — use this translation for all locales
+- `{"ko": "...", "ja": "..."}` — per-locale; if the current locale isn't listed, the term is kept as-is
+
+```python
+processor = MdpoLLM(
+    model="gpt-4",
+    target_lang="ko",
+    glossary_path="glossary.json",
+)
+```
+
+If both `glossary` and `glossary_path` are provided, inline entries override the file.
+
+Only glossary terms that actually appear in each block are injected into the prompt, so a large glossary doesn't waste tokens on irrelevant blocks.
+
 ## Comparison
 
 | | mdpo-llm | mdpo | md-translator | llm-translator |
@@ -176,6 +227,8 @@ MdpoLLM(
     source_langs=None,         # list of BCP 47 strings for code block skipping
     system_prompt=None,        # override the default translation instruction
     post_process=None,         # Callable[[str], str] applied to every LLM response
+    glossary=None,             # dict[str, str | None] — inline glossary
+    glossary_path=None,        # path to JSON glossary file (multi-locale)
     **litellm_kwargs,          # temperature, api_key, api_base, etc.
 )
 ```

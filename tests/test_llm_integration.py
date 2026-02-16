@@ -1,5 +1,6 @@
 """Tests for LiteLLM integration — _build_messages and _call_llm."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -96,3 +97,113 @@ class TestCallLLM:
         proc = MarkdownProcessor(model="gpt-4", target_lang="ko")
         with pytest.raises(RuntimeError, match="API error"):
             proc._call_llm("Hello")
+
+
+class TestGlossary:
+    def test_glossary_terms_in_system_message(self):
+        proc = MarkdownProcessor(
+            model="test-model", target_lang="ko",
+            glossary={"GitHub": None, "API": "API"},
+        )
+        messages = proc._build_messages("Check the GitHub API docs.")
+        system = messages[0]["content"]
+        assert "GitHub" in system
+        assert "API" in system
+        assert "Glossary" in system
+
+    def test_glossary_irrelevant_terms_excluded(self):
+        proc = MarkdownProcessor(
+            model="test-model", target_lang="ko",
+            glossary={"GitHub": None, "Kubernetes": None},
+        )
+        messages = proc._build_messages("Hello world")
+        system = messages[0]["content"]
+        assert "Glossary" not in system
+        assert "GitHub" not in system or "GitHub" in Prompts.TRANSLATE_INSTRUCTION
+
+    def test_glossary_none_means_do_not_translate(self):
+        proc = MarkdownProcessor(
+            model="test-model", target_lang="ko",
+            glossary={"GitHub": None},
+        )
+        messages = proc._build_messages("Visit GitHub today.")
+        system = messages[0]["content"]
+        assert '"GitHub" \u2192 do not translate' in system
+
+    def test_glossary_with_translation(self):
+        proc = MarkdownProcessor(
+            model="test-model", target_lang="ko",
+            glossary={"pull request": "\ud480 \ub9ac\ud018\uc2a4\ud2b8"},
+        )
+        messages = proc._build_messages("Open a pull request.")
+        system = messages[0]["content"]
+        assert '"\ud480 \ub9ac\ud018\uc2a4\ud2b8"' in system
+
+    def test_glossary_path_json_loading(self, tmp_path):
+        glossary_file = tmp_path / "glossary.json"
+        glossary_file.write_text(
+            json.dumps({"GitHub": None, "API": "API"}),
+            encoding="utf-8",
+        )
+        proc = MarkdownProcessor(
+            model="test-model", target_lang="ko",
+            glossary_path=glossary_file,
+        )
+        messages = proc._build_messages("GitHub API")
+        system = messages[0]["content"]
+        assert "GitHub" in system
+        assert "API" in system
+
+    def test_glossary_path_per_locale_resolution(self, tmp_path):
+        glossary_file = tmp_path / "glossary.json"
+        glossary_file.write_text(
+            json.dumps({
+                "pull request": {"ko": "\ud480 \ub9ac\ud018\uc2a4\ud2b8", "ja": "\u30d7\u30eb\u30ea\u30af\u30a8\u30b9\u30c8"},
+            }),
+            encoding="utf-8",
+        )
+        proc_ko = MarkdownProcessor(
+            model="test-model", target_lang="ko", glossary_path=glossary_file,
+        )
+        messages = proc_ko._build_messages("Open a pull request.")
+        assert '"\ud480 \ub9ac\ud018\uc2a4\ud2b8"' in messages[0]["content"]
+
+        proc_ja = MarkdownProcessor(
+            model="test-model", target_lang="ja", glossary_path=glossary_file,
+        )
+        messages = proc_ja._build_messages("Open a pull request.")
+        assert '"\u30d7\u30eb\u30ea\u30af\u30a8\u30b9\u30c8"' in messages[0]["content"]
+
+    def test_glossary_path_locale_not_found_keeps_original(self, tmp_path):
+        glossary_file = tmp_path / "glossary.json"
+        glossary_file.write_text(
+            json.dumps({"pull request": {"ja": "\u30d7\u30eb\u30ea\u30af\u30a8\u30b9\u30c8"}}),
+            encoding="utf-8",
+        )
+        proc = MarkdownProcessor(
+            model="test-model", target_lang="ko", glossary_path=glossary_file,
+        )
+        # "ko" not in the dict → resolved to None (keep original)
+        messages = proc._build_messages("Open a pull request.")
+        assert "do not translate" in messages[0]["content"]
+
+    def test_glossary_inline_overrides_file(self, tmp_path):
+        glossary_file = tmp_path / "glossary.json"
+        glossary_file.write_text(
+            json.dumps({"GitHub": "file-value"}),
+            encoding="utf-8",
+        )
+        proc = MarkdownProcessor(
+            model="test-model", target_lang="ko",
+            glossary_path=glossary_file,
+            glossary={"GitHub": "inline-value"},
+        )
+        messages = proc._build_messages("Visit GitHub.")
+        system = messages[0]["content"]
+        assert '"inline-value"' in system
+        assert '"file-value"' not in system
+
+    def test_no_glossary_no_change(self, processor):
+        messages = processor._build_messages("Hello world")
+        system = messages[0]["content"]
+        assert "Glossary" not in system
