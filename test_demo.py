@@ -80,7 +80,7 @@ def main():
     # Display results
     print("\n📊 Processing Results:")
     print(f"   • Total blocks parsed: {result['blocks_count']}")
-    print(f"   • Processed blocks: {result['translation_stats'].get('processd', 0)}")
+    print(f"   • Processed blocks: {result['translation_stats'].get('processed', 0)}")
     print(f"   • Failed blocks: {result['translation_stats'].get('failed', 0)}")
     print(f"   • Skipped blocks: {result['translation_stats'].get('skipped', 0)}")
     
@@ -148,7 +148,7 @@ def main():
         inplace=False
     )
     
-    print(f"   • Newly processed blocks: {result2['translation_stats'].get('processd', 0)}")
+    print(f"   • Newly processed blocks: {result2['translation_stats'].get('processed', 0)}")
     print("   ✓ Only changed blocks were reprocessed!")
     
     # Show sample of processed content

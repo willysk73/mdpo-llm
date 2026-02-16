@@ -109,7 +109,7 @@ This document demonstrates the translation capabilities.
     print(f"\n✅ Processing complete!")
     print(f"📊 Statistics:")
     print(f"  - Total blocks: {result['blocks_count']}")
-    print(f"  - Translated: {result['translation_stats'].get('processd', 0)}")
+    print(f"  - Translated: {result['translation_stats'].get('processed', 0)}")
     print(f"  - Failed: {result['translation_stats'].get('failed', 0)}")
     print(f"  - Skipped: {result['translation_stats'].get('skipped', 0)}")
     print(f"  - Coverage: {result['coverage']['coverage_percentage']:.1f}%")
@@ -134,7 +134,7 @@ This document demonstrates the translation capabilities.
         inplace=False
     )
     
-    print(f"  - Newly translated: {result2['translation_stats'].get('processd', 0)} blocks")
+    print(f"  - Newly translated: {result2['translation_stats'].get('processed', 0)} blocks")
     print("✨ Only the changed paragraph was retranslated!")
 
 

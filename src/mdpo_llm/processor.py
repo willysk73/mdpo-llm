@@ -72,16 +72,16 @@ class MarkdownProcessor:
                 blocks, po_file, self.parser.context_id
             )
 
-            # Step 5: Rebuild processd document
-            processd_content = self.reconstructor.rebuild_markdown(
+            # Step 5: Rebuild processed document
+            processed_content = self.reconstructor.rebuild_markdown(
                 source_lines, blocks, po_file, self.parser.context_id
             )
 
             if inplace:
-                self._match_ctxt(processed_content=processd_content)
+                self._match_ctxt(processed_content=processed_content)
 
-            # Step 6: Save processd document
-            self._save_processed_document(processd_content, target_path)
+            # Step 6: Save processed document
+            self._save_processed_document(processed_content, target_path)
 
             return {
                 "source_path": str(source_path),
@@ -123,8 +123,8 @@ class MarkdownProcessor:
     def _process_entries(
         self, po_file: polib.POFile, inplace: bool = False
     ) -> Dict[str, int]:
-        """process unprocessd entries in PO file."""
-        stats = {"processd": 0, "failed": 0, "skipped": 0}
+        """Process unprocessed entries in PO file."""
+        stats = {"processed": 0, "failed": 0, "skipped": 0}
 
         for entry in po_file:
             if entry.obsolete:
@@ -146,7 +146,7 @@ class MarkdownProcessor:
                     if inplace:
                         entry_obj.msgid = processed
                     self.po_manager.mark_entry_processed(entry_obj)
-                    stats["processd"] += 1
+                    stats["processed"] += 1
                 else:
                     print(f"Failed to process entry {entry_obj.msgctxt}: {str(error)}")
                     stats["failed"] += 1
@@ -165,7 +165,7 @@ class MarkdownProcessor:
         import concurrent.futures
         import threading
 
-        stats = {"processd": 0, "failed": 0, "skipped": 0}
+        stats = {"processed": 0, "failed": 0, "skipped": 0}
         entries_to_process = []
 
         for entry in po_file:
@@ -208,7 +208,7 @@ class MarkdownProcessor:
                             if inplace:
                                 entry_obj.msgid = processed
                             self.po_manager.mark_entry_processed(entry_obj)
-                            stats["processd"] += 1
+                            stats["processed"] += 1
                         else:
                             print(
                                 f"Failed to process entry {entry_obj.msgctxt}: {str(error)}"
