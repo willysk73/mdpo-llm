@@ -1,0 +1,30 @@
+{
+  "GitHub": null,
+  "Markdown": null,
+  "Python": null,
+  "Docker": null,
+  "Kubernetes": null,
+  "API": "API",
+  "CLI": "CLI",
+  "SDK": "SDK",
+  "pull request": {
+    "ko": "풀 리퀘스트",
+    "ja": "プルリクエスト",
+    "zh": "拉取请求"
+  },
+  "repository": {
+    "ko": "리포지토리",
+    "ja": "リポジトリ",
+    "zh": "仓库"
+  },
+  "open source": {
+    "ko": "오픈 소스",
+    "ja": "オープンソース",
+    "zh": "开源"
+  },
+  "machine learning": {
+    "ko": "머신 러닝",
+    "ja": "機械学習",
+    "zh": "机器学习"
+  }
+}

@@ -200,6 +200,8 @@ If both `glossary` and `glossary_path` are provided, inline entries override the
 
 Only glossary terms that actually appear in each block are injected into the prompt, so a large glossary doesn't waste tokens on irrelevant blocks.
 
+See [`examples/glossary.json`](examples/glossary.json) for a full example with brand names, technical terms, and per-locale translations.
+
 ## Comparison
 
 | | mdpo-llm | mdpo | md-translator | llm-translator |
