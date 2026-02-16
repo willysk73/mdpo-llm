@@ -3,8 +3,10 @@ Main Markdown Translator orchestrator class.
 """
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 import logging
+
+logger = logging.getLogger(__name__)
 
 import polib
 
@@ -94,6 +96,69 @@ class MarkdownProcessor:
         finally:
             if po_file is not None:
                 self.po_manager.save_po(po_file, po_path)
+
+    def process_directory(
+        self,
+        source_dir: Path,
+        target_dir: Path,
+        po_dir: Path,
+        glob: str = "**/*.md",
+        inplace: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Process all markdown files in a directory tree.
+
+        Args:
+            source_dir: Root directory containing source markdown files
+            target_dir: Root directory for processed output (mirrors source structure)
+            po_dir: Root directory for PO files (mirrors source structure)
+            glob: Glob pattern to match markdown files
+            inplace: Whether to use inplace mode for processing
+
+        Returns:
+            Dictionary with aggregate results and per-file details
+        """
+        source_dir = Path(source_dir)
+        target_dir = Path(target_dir)
+        po_dir = Path(po_dir)
+
+        matched_files = sorted(source_dir.glob(glob))
+
+        results: List[Dict[str, Any]] = []
+        files_processed = 0
+        files_failed = 0
+        files_skipped = 0
+
+        for source_file in matched_files:
+            relative_path = source_file.relative_to(source_dir)
+            target_path = target_dir / relative_path
+            po_path = po_dir / relative_path.with_suffix(".po")
+
+            try:
+                result = self.process_document(
+                    source_file, target_path, po_path, inplace=inplace
+                )
+                results.append(result)
+
+                newly_processed = result.get("translation_stats", {}).get("processed", 0)
+                if newly_processed == 0:
+                    files_skipped += 1
+                else:
+                    files_processed += 1
+            except Exception:
+                logger.exception("Failed to process %s", source_file)
+                files_failed += 1
+                results.append({"source_path": str(source_file), "error": True})
+
+        return {
+            "source_dir": str(source_dir),
+            "target_dir": str(target_dir),
+            "po_dir": str(po_dir),
+            "files_processed": files_processed,
+            "files_failed": files_failed,
+            "files_skipped": files_skipped,
+            "results": results,
+        }
 
     def _match_ctxt(self, processed_content: str):
         processed_lines = processed_content.splitlines(keepends=True)
