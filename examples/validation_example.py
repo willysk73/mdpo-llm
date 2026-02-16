@@ -7,7 +7,7 @@ This demonstrates best practices for ensuring quality in translation/refinement 
 import time
 from pathlib import Path
 from typing import Optional
-from mdpo_llm import LLMInterface, MdpoLLM, LanguageCode
+from mdpo_llm import LLMInterface, MdpoLLM
 
 
 class ValidatingLLM(LLMInterface):

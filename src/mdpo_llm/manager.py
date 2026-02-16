@@ -26,8 +26,17 @@ class POManager:
         for entry in po.obsolete_entries():
             po.remove(entry)
 
-    def load_or_create_po(self, po_path: Optional[Path] = None) -> polib.POFile:
-        """Load existing PO file or create new one."""
+    def load_or_create_po(
+        self, po_path: Optional[Path] = None, target_lang: Optional[str] = None
+    ) -> polib.POFile:
+        """Load existing PO file or create new one.
+
+        Args:
+            po_path: Path to the PO file.
+            target_lang: BCP 47 locale string.  Sets the ``Language``
+                metadata header on *new* files; existing files are not
+                overwritten.
+        """
         path = po_path or self.po_path
         if not path:
             raise ValueError("No PO file path provided")
@@ -38,7 +47,10 @@ class POManager:
             self.po_file = polib.pofile(path.read_text(encoding="utf-8"))
         else:
             self.po_file = polib.POFile()
-            self.po_file.metadata = {"Content-Type": "text/plain; charset=UTF-8"}
+            metadata = {"Content-Type": "text/plain; charset=UTF-8"}
+            if target_lang:
+                metadata["Language"] = target_lang
+            self.po_file.metadata = metadata
 
         return self.po_file
 
@@ -82,8 +94,12 @@ class POManager:
         self._remove_obsolete_entries(po_file)
 
     def redraw_context(self, blocks: List[Dict[str, Any]], context_id_func) -> None:
+        old_metadata = getattr(self.po_file, "metadata", {}) if self.po_file is not None else {}
         self.po_file = polib.POFile()
-        self.po_file.metadata = {"Content-Type": "text/plain; charset=UTF-8"}
+        metadata = {"Content-Type": "text/plain; charset=UTF-8"}
+        if old_metadata.get("Language"):
+            metadata["Language"] = old_metadata["Language"]
+        self.po_file.metadata = metadata
         po_file = self.po_file
 
         for block in blocks:

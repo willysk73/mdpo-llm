@@ -76,6 +76,30 @@ class TestMockLLMInterface:
         assert result == "[MOCK PROCESSING] Hello"
 
 
+class TestMockLLMTargetLang:
+    def test_target_lang_only(self):
+        mock = MockLLMInterface()
+        result = mock.process("Hello", target_lang="ko")
+        assert result == "[MOCK PROCESSING lang=ko] Hello"
+
+    def test_target_lang_with_reference_pairs(self):
+        mock = MockLLMInterface()
+        pairs = [("a", "b")]
+        result = mock.process("Hello", reference_pairs=pairs, target_lang="ja")
+        assert result == "[MOCK PROCESSING lang=ja ref=1] Hello"
+
+    def test_target_lang_none_omitted(self):
+        mock = MockLLMInterface()
+        result = mock.process("Hello", target_lang=None)
+        assert result == "[MOCK PROCESSING] Hello"
+
+    def test_target_lang_empty_string_omitted(self):
+        mock = MockLLMInterface()
+        result = mock.process("Hello", target_lang="")
+        # Empty string is falsy
+        assert result == "[MOCK PROCESSING] Hello"
+
+
 class TestOldStyleSubclass:
     """Backward compatibility: subclasses without reference_pairs still work."""
 
@@ -86,3 +110,15 @@ class TestOldStyleSubclass:
 
         llm = OldLLM()
         assert llm.process("hello") == "HELLO"
+
+    def test_old_style_with_reference_pairs_only(self):
+        """Subclass accepting reference_pairs but not target_lang still works."""
+
+        class RefOnlyLLM(LLMInterface):
+            def process(self, source_text: str, reference_pairs=None) -> str:
+                if reference_pairs:
+                    return f"[REF={len(reference_pairs)}] {source_text}"
+                return source_text
+
+        llm = RefOnlyLLM()
+        assert llm.process("hello", reference_pairs=[("a", "b")]) == "[REF=1] hello"

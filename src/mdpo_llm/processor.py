@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 import polib
 
-from .language import LanguageCode, contains_language
+from .language import contains_language
 
 from .llm_interface import LLMInterface
 from .manager import POManager
@@ -25,7 +25,13 @@ class MarkdownProcessor:
 
     SKIP_TYPES = ["hr"]  # Block types to skip processing
 
-    def __init__(self, llm_interface: LLMInterface, max_reference_pairs: int = 5):
+    def __init__(
+        self,
+        llm_interface: LLMInterface,
+        max_reference_pairs: int = 5,
+        target_lang: str | None = None,
+        source_langs: List[str] | None = None,
+    ):
         """
         Initialize the processor.
 
@@ -33,21 +39,31 @@ class MarkdownProcessor:
             llm_interface: Custom LLM interface, if provided
             max_reference_pairs: Maximum number of similar reference pairs
                 to pass as context to the LLM per entry.
+            target_lang: BCP 47 locale string (e.g. ``"ko"``).  Forwarded
+                to the LLM's ``process()`` method when it accepts a
+                ``target_lang`` keyword argument.
+            source_langs: BCP 47 locale strings (e.g. ``["ko"]``).  Code
+                blocks that do not contain any of these languages are
+                skipped.  When ``None`` (default), code block skipping is
+                disabled and all code blocks are sent to the LLM.
         """
         self.parser = BlockParser()
         self.po_manager = POManager(skip_types=self.SKIP_TYPES)
         self.reconstructor = DocumentReconstructor(skip_types=self.SKIP_TYPES)
         self.llm = llm_interface
         self.max_reference_pairs = max_reference_pairs
+        self.target_lang = target_lang
+        self.source_langs = source_langs
 
-        # Detect whether the LLM accepts reference_pairs
-        self._llm_accepts_reference_pairs = self._check_llm_accepts_reference_pairs()
+        # Detect which optional kwargs the LLM's process() accepts
+        self._llm_accepts_reference_pairs = self._check_llm_param("reference_pairs")
+        self._llm_accepts_target_lang = self._check_llm_param("target_lang")
 
-    def _check_llm_accepts_reference_pairs(self) -> bool:
-        """Check if the LLM's process() method accepts a reference_pairs parameter."""
+    def _check_llm_param(self, name: str) -> bool:
+        """Check if the LLM's process() method accepts a given parameter."""
         try:
             sig = inspect.signature(self.llm.process)
-            return "reference_pairs" in sig.parameters
+            return name in sig.parameters
         except (ValueError, TypeError):
             return False
 
@@ -83,7 +99,7 @@ class MarkdownProcessor:
             )
 
             # Step 2: Sync with PO file
-            po_file = po_manager.load_or_create_po(po_path)
+            po_file = po_manager.load_or_create_po(po_path, target_lang=self.target_lang)
             po_manager.sync_po(po_file, blocks, parser.context_id)
 
             # Step 3: process sequentially with reference context
@@ -211,10 +227,12 @@ class MarkdownProcessor:
 
     def _process_entry(self, entry, reference_pairs=None):
         try:
+            kwargs: Dict[str, Any] = {}
             if reference_pairs is not None and self._llm_accepts_reference_pairs:
-                processed = self.llm.process(entry.msgid, reference_pairs=reference_pairs)
-            else:
-                processed = self.llm.process(entry.msgid)
+                kwargs["reference_pairs"] = reference_pairs
+            if self.target_lang is not None and self._llm_accepts_target_lang:
+                kwargs["target_lang"] = self.target_lang
+            processed = self.llm.process(entry.msgid, **kwargs)
             return (entry, processed, None)
         except Exception as e:
             return (entry, None, e)
@@ -251,8 +269,8 @@ class MarkdownProcessor:
                 stats["skipped"] += 1
                 continue
 
-            if block_type == "code":
-                if not contains_language(entry.msgid, [LanguageCode.KO]):
+            if block_type == "code" and self.source_langs is not None:
+                if not contains_language(entry.msgid, self.source_langs):
                     entry.msgstr = entry.msgid
                     po_manager.mark_entry_processed(entry)
                     stats["skipped"] += 1
@@ -354,8 +372,8 @@ class MarkdownProcessor:
                 stats["skipped"] += 1
                 continue
 
-            if block_type == "code":
-                if not contains_language(entry.msgid, [LanguageCode.KO]):
+            if block_type == "code" and self.source_langs is not None:
+                if not contains_language(entry.msgid, self.source_langs):
                     entry.msgstr = entry.msgid
                     self.po_manager.mark_entry_processed(entry)
                     stats["skipped"] += 1

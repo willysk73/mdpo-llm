@@ -105,30 +105,122 @@ class TestInplaceMode:
 
 
 class TestCodeBlockSkipping:
-    def test_code_without_korean_skipped(self, tmp_path):
-        """Code blocks without Korean content are skipped (msgstr=msgid)."""
+    def test_code_without_source_lang_skipped(self, tmp_path):
+        """Code blocks without source language content are skipped (msgstr=msgid)."""
         md = "# Title\n\n```python\nprint('hello')\n```\n"
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
         target = tmp_path / "target.md"
         po_path = tmp_path / "messages.po"
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(MockLLMInterface(), source_langs=["ko"])
         result = processor.process_document(source, target, po_path)
         # Code block should be skipped (no Korean)
         assert result["translation_stats"]["skipped"] >= 1
 
-    def test_code_with_korean_processed(self, tmp_path):
-        """Code blocks with Korean content should be processed."""
+    def test_code_with_source_lang_processed(self, tmp_path):
+        """Code blocks with source language content should be processed."""
         md = "# Title\n\n```python\n# 한국어 주석\nprint('hello')\n```\n"
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
         target = tmp_path / "target.md"
         po_path = tmp_path / "messages.po"
 
-        processor = MarkdownProcessor(MockLLMInterface())
+        processor = MarkdownProcessor(MockLLMInterface(), source_langs=["ko"])
         result = processor.process_document(source, target, po_path)
         assert result["translation_stats"]["processed"] >= 1
+
+    def test_no_source_langs_processes_all_code(self, tmp_path):
+        """When source_langs is None, all code blocks are sent to the LLM."""
+        md = "# Title\n\n```python\nprint('hello')\n```\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        target = tmp_path / "target.md"
+        po_path = tmp_path / "messages.po"
+
+        # No source_langs → code block skipping disabled
+        processor = MarkdownProcessor(MockLLMInterface())
+        result = processor.process_document(source, target, po_path)
+        # Code block should be processed (not skipped)
+        assert result["translation_stats"]["processed"] >= 2  # heading + code
+
+    def test_multiple_source_langs(self, tmp_path):
+        """Code blocks with any of multiple source languages are processed."""
+        md = "# Title\n\n```python\n# 你好世界\nprint('hello')\n```\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        target = tmp_path / "target.md"
+        po_path = tmp_path / "messages.po"
+
+        processor = MarkdownProcessor(MockLLMInterface(), source_langs=["ko", "zh"])
+        result = processor.process_document(source, target, po_path)
+        # Chinese detected → code block should be processed
+        assert result["translation_stats"]["processed"] >= 1
+
+
+class TestTargetLangFlow:
+    def test_target_lang_forwarded_to_mock(self, tmp_path):
+        """target_lang should appear in MockLLMInterface output."""
+        md = "# Title\n\nParagraph.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        processor = MarkdownProcessor(MockLLMInterface(), target_lang="ko")
+        result = processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        content = (tmp_path / "target.md").read_text(encoding="utf-8")
+        assert "lang=ko" in content
+        assert result["translation_stats"]["processed"] >= 1
+
+    def test_no_target_lang_no_lang_tag(self, tmp_path):
+        """Without target_lang, no lang= should appear in output."""
+        md = "# Title\n\nParagraph.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        processor = MarkdownProcessor(MockLLMInterface())
+        processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+        content = (tmp_path / "target.md").read_text(encoding="utf-8")
+        assert "lang=" not in content
+
+    def test_target_lang_not_sent_to_old_llm(self, tmp_path):
+        """Old-style LLM without target_lang param should not receive it."""
+
+        class OldLLM(LLMInterface):
+            def process(self, source_text: str) -> str:
+                return f"[OLD] {source_text}"
+
+        md = "# Title\n\nParagraph.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        processor = MarkdownProcessor(OldLLM(), target_lang="ko")
+        result = processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        assert result["translation_stats"]["processed"] >= 1
+        assert result["translation_stats"]["failed"] == 0
+
+    def test_target_lang_with_reference_pairs(self, tmp_path):
+        """Both target_lang and reference_pairs forwarded when LLM accepts both."""
+        received = []
+
+        class TrackingLLM(LLMInterface):
+            def process(self, source_text: str, reference_pairs=None, target_lang=None) -> str:
+                received.append({"text": source_text, "pairs": reference_pairs, "lang": target_lang})
+                return f"[OK] {source_text}"
+
+        md = "# Title\n\nParagraph one.\n\nParagraph two.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        processor = MarkdownProcessor(TrackingLLM(), target_lang="ko")
+        processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+
+        # Every call should have target_lang="ko"
+        for call in received:
+            assert call["lang"] == "ko"
 
 
 class TestLLMFailureHandling:

@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/pypi/pyversions/mdpo-llm.svg)](https://pypi.org/project/mdpo-llm/)
 [![PyPI Version](https://img.shields.io/pypi/v/mdpo-llm.svg)](https://pypi.org/project/mdpo-llm/)
-[![Tests](https://img.shields.io/badge/tests-169%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
 [![License](https://img.shields.io/pypi/l/mdpo-llm.svg)](https://github.com/willysk73/mdpo-llm/blob/main/LICENSE)
 
 **Translate Markdown with LLMs — and only pay for what changed.**
@@ -61,9 +61,10 @@ One method. Any provider.
 from mdpo_llm import LLMInterface, MdpoLLM
 
 class MyLLM(LLMInterface):
-    def process(self, source_text: str, reference_pairs=None) -> str:
+    def process(self, source_text: str, reference_pairs=None, target_lang=None) -> str:
+        language = target_lang or "Korean"
         messages = [
-            {"role": "system", "content": "Translate to Korean."},
+            {"role": "system", "content": f"Translate to {language}."},
         ]
         # Use reference pairs as few-shot examples for consistency
         if reference_pairs:
@@ -78,14 +79,18 @@ class MyLLM(LLMInterface):
         return response.choices[0].message.content
 ```
 
-> The `reference_pairs` parameter is optional. If your `process()` method doesn't include it, mdpo-llm detects this automatically and calls without it. Existing implementations won't break.
+> Both `reference_pairs` and `target_lang` are optional. If your `process()` method doesn't include either parameter, mdpo-llm detects this automatically and calls without it. Existing implementations won't break.
 
 ### 2. Process a document
 
 ```python
 from pathlib import Path
 
-processor = MdpoLLM(MyLLM())
+processor = MdpoLLM(
+    MyLLM(),
+    target_lang="ko",        # forwarded to LLM's process() as target_lang
+    source_langs=["ko"],     # code blocks without Korean are skipped
+)
 
 result = processor.process_document(
     source_path=Path("docs/README.md"),
@@ -116,6 +121,40 @@ print(f"{result['files_skipped']} files unchanged")
 
 The directory structure is mirrored into `target_dir` and `po_dir`. Each file gets its own PO file and its own reference pool.
 
+## Language Handling
+
+### `target_lang` — tell the LLM which language to produce
+
+A BCP 47 locale string (e.g. `"ko"`, `"ja"`, `"zh-CN"`) passed through to your LLM's `process()` method. The source language is auto-detected by the LLM — you only specify the target.
+
+```python
+processor = MdpoLLM(MyLLM(), target_lang="ja")
+```
+
+When `target_lang` is set, new PO files will include a `Language` header (e.g. `Language: ja`).
+
+### `source_langs` — control code block skipping
+
+A list of BCP 47 locale strings. Code blocks that don't contain any of these languages are skipped (copied as-is). This prevents pure-English code from being sent to the LLM unnecessarily.
+
+```python
+# Skip code blocks that don't contain Korean or Chinese
+processor = MdpoLLM(MyLLM(), source_langs=["ko", "zh"])
+```
+
+When `source_langs` is `None` (the default), code block skipping is disabled and all code blocks are sent to the LLM.
+
+### Supported locale codes
+
+| Code | Language |
+|------|----------|
+| `en` | English |
+| `zh` | Chinese |
+| `ja` | Japanese |
+| `ko` | Korean |
+
+Region subtags (e.g. `zh-CN`, `zh-TW`) are accepted — only the primary subtag is used for detection.
+
 ## Comparison
 
 | | mdpo-llm | mdpo | md-translator | llm-translator |
@@ -132,6 +171,17 @@ The directory structure is mirrored into `target_dir` and `po_dir`. Each file ge
 ## API Reference
 
 ### MdpoLLM
+
+Constructor:
+
+```python
+MdpoLLM(
+    llm_interface,             # your LLMInterface implementation
+    max_reference_pairs=5,     # max similar pairs passed as context
+    target_lang=None,          # BCP 47 string forwarded to LLM
+    source_langs=None,         # list of BCP 47 strings for code block skipping
+)
+```
 
 | Method | Description |
 |--------|-------------|
@@ -150,13 +200,13 @@ class LLMInterface(ABC):
     def process(self, source_text: str) -> str: ...
 ```
 
-Optionally accept `reference_pairs` for translation context:
+Optionally accept `reference_pairs` and/or `target_lang`:
 
 ```python
-def process(self, source_text: str, reference_pairs=None) -> str: ...
+def process(self, source_text: str, reference_pairs=None, target_lang=None) -> str: ...
 ```
 
-The processor detects this parameter via `inspect.signature` and passes a list of `(source, translation)` tuples from the most similar previously translated blocks. If the parameter isn't present, the processor calls without it — no breaking changes.
+The processor detects these parameters via `inspect.signature` and passes them only when present — no breaking changes to existing implementations.
 
 ## Working with PO Files
 
@@ -169,13 +219,15 @@ PO files (GNU gettext) track the state of each content block:
 
 You can inspect and edit PO files with any standard gettext tool (Poedit, Lokalize, etc.).
 
+When `target_lang` is set, new PO files include a `Language` metadata header so tools can identify the target language.
+
 ## Development
 
 ```bash
 # Install with dev dependencies
 uv pip install -e ".[dev]"
 
-# Run tests (169 tests)
+# Run tests
 pytest tests/
 ```
 

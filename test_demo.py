@@ -3,7 +3,7 @@ Test demonstration of mdpo-llm package functionality.
 """
 
 from pathlib import Path
-from src.mdpo_llm import MdpoLLM, MockLLMInterface, LanguageCode
+from src.mdpo_llm import MdpoLLM, MockLLMInterface, LANGUAGE_PATTERNS
 
 def create_sample_document():
     """Create a sample markdown document for testing."""
@@ -117,14 +117,9 @@ def main():
     
     for text, description in test_texts:
         detected = []
-        if LanguageCode.EN.in_text(text):
-            detected.append("EN")
-        if LanguageCode.CN.in_text(text):
-            detected.append("CN")
-        if LanguageCode.JP.in_text(text):
-            detected.append("JP")
-        if LanguageCode.KO.in_text(text):
-            detected.append("KO")
+        for code, pattern in LANGUAGE_PATTERNS.items():
+            if pattern.search(text):
+                detected.append(code)
         print(f"   • '{text}' ({description}): {', '.join(detected) if detected else 'None'}")
     
     # Demonstrate incremental processing

@@ -4,7 +4,7 @@ Example implementation using OpenAI's GPT models for translation.
 
 import os
 from pathlib import Path
-from mdpo_llm import LLMInterface, MdpoLLM, LanguageCode
+from mdpo_llm import LLMInterface, MdpoLLM
 
 # You'll need to install openai: pip install openai
 try:
@@ -16,32 +16,37 @@ except ImportError:
 
 class OpenAITranslator(LLMInterface):
     """OpenAI-based translator implementation."""
-    
+
     def __init__(self, api_key: str = None, model: str = "gpt-4", target_language: str = "Korean"):
         """Initialize OpenAI translator.
-        
+
         Args:
             api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
             model: Model to use (e.g., "gpt-4", "gpt-3.5-turbo")
-            target_language: Target language for translation
+            target_language: Fallback target language label for the prompt
         """
         self.client = openai.OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
         self.model = model
         self.target_language = target_language
-        
-    def process(self, source_text: str, reference_pairs=None) -> str:
+
+    def process(self, source_text: str, reference_pairs=None, target_lang=None) -> str:
         """Translate text using OpenAI.
 
         Args:
             source_text: The text to translate.
             reference_pairs: Optional list of (source, translation) tuples
                 providing few-shot context from previously translated blocks.
+            target_lang: Optional BCP 47 locale string (e.g. "ko") passed
+                by the processor.  Falls back to ``self.target_language``.
         """
+        # Use target_lang from processor if provided, else fall back
+        language = target_lang or self.target_language
+
         try:
             messages = [
                 {
                     "role": "system",
-                    "content": f"You are a professional translator. Translate the following text to {self.target_language}. "
+                    "content": f"You are a professional translator. Translate the following text to {language}. "
                                f"Preserve all Markdown formatting, code blocks, and special characters exactly as they appear."
                 },
             ]
@@ -67,12 +72,12 @@ class OpenAITranslator(LLMInterface):
 
 def main():
     """Example usage."""
-    
+
     # Setup paths
     source_file = Path("README.md")
     output_file = Path("README_ko.md")
     po_file = Path("translations/README.po")
-    
+
     # Check if source file exists
     if not source_file.exists():
         print(f"Source file {source_file} not found. Creating example...")
@@ -97,17 +102,21 @@ def hello_world():
 
 This document demonstrates the translation capabilities.
 """)
-    
+
     # Initialize translator
     translator = OpenAITranslator(
         api_key=os.getenv("OPENAI_API_KEY"),  # Set your API key as environment variable
         model="gpt-3.5-turbo",  # Use gpt-4 for better quality
         target_language="Korean"
     )
-    
-    # Create processor
-    processor = MdpoLLM(translator)
-    
+
+    # Create processor with language parameters
+    processor = MdpoLLM(
+        translator,
+        target_lang="ko",             # passed to LLM's process() as target_lang
+        source_langs=["ko"],           # code blocks without Korean are skipped
+    )
+
     # Process document
     print(f"Processing {source_file} -> {output_file}")
     result = processor.process_document(
@@ -116,28 +125,28 @@ This document demonstrates the translation capabilities.
         po_path=po_file,
         inplace=False
     )
-    
+
     # Print results
-    print(f"\n✅ Processing complete!")
-    print(f"📊 Statistics:")
+    print(f"\nProcessing complete!")
+    print(f"Statistics:")
     print(f"  - Total blocks: {result['blocks_count']}")
     print(f"  - Translated: {result['translation_stats'].get('processed', 0)}")
     print(f"  - Failed: {result['translation_stats'].get('failed', 0)}")
     print(f"  - Skipped: {result['translation_stats'].get('skipped', 0)}")
     print(f"  - Coverage: {result['coverage']['coverage_percentage']:.1f}%")
-    
-    print(f"\n📁 Files created:")
+
+    print(f"\nFiles created:")
     print(f"  - Translation: {output_file}")
     print(f"  - PO file: {po_file}")
-    
+
     # Example: Make a small edit and reprocess
-    print("\n🔄 Demonstrating incremental processing...")
+    print("\nDemonstrating incremental processing...")
     print("Making a small edit to the source file...")
-    
+
     content = source_file.read_text()
     content = content.replace("Something amazing", "Something truly amazing")
     source_file.write_text(content)
-    
+
     print("Reprocessing (only changed blocks will be translated)...")
     result2 = processor.process_document(
         source_path=source_file,
@@ -145,9 +154,9 @@ This document demonstrates the translation capabilities.
         po_path=po_file,
         inplace=False
     )
-    
+
     print(f"  - Newly translated: {result2['translation_stats'].get('processed', 0)} blocks")
-    print("✨ Only the changed paragraph was retranslated!")
+    print("Only the changed paragraph was retranslated!")
 
 
 if __name__ == "__main__":

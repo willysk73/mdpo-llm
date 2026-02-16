@@ -1,78 +1,96 @@
-"""Tests for language detection."""
+"""Tests for language detection using BCP 47 locale strings."""
 
 import pytest
 
 from mdpo_llm.language import (
-    LanguageCode,
+    LANGUAGE_PATTERNS,
+    _resolve_primary,
     contains_any,
     contains_language,
     detect_languages,
 )
 
 
-class TestLanguageCodeEnum:
+class TestLanguagePatterns:
     def test_english_detected(self):
-        assert LanguageCode.EN.in_text("Hello world")
+        assert LANGUAGE_PATTERNS["en"].search("Hello world")
 
     def test_chinese_detected(self):
-        assert LanguageCode.CN.in_text("你好世界")
+        assert LANGUAGE_PATTERNS["zh"].search("你好世界")
 
     def test_japanese_detected(self):
-        assert LanguageCode.JP.in_text("こんにちは")
+        assert LANGUAGE_PATTERNS["ja"].search("こんにちは")
 
     def test_japanese_katakana_detected(self):
-        assert LanguageCode.JP.in_text("カタカナ")
+        assert LANGUAGE_PATTERNS["ja"].search("カタカナ")
 
     def test_korean_detected(self):
-        assert LanguageCode.KO.in_text("안녕하세요")
+        assert LANGUAGE_PATTERNS["ko"].search("안녕하세요")
 
     def test_english_not_in_korean(self):
-        assert not LanguageCode.EN.in_text("안녕하세요")
+        assert not LANGUAGE_PATTERNS["en"].search("안녕하세요")
 
     def test_korean_not_in_english(self):
-        assert not LanguageCode.KO.in_text("Hello world")
+        assert not LANGUAGE_PATTERNS["ko"].search("Hello world")
 
     def test_empty_string_no_detection(self):
-        for lang in LanguageCode:
-            assert not lang.in_text("")
+        for pattern in LANGUAGE_PATTERNS.values():
+            assert not pattern.search("")
 
     def test_numbers_only_no_language(self):
-        assert not LanguageCode.KO.in_text("12345")
-        assert not LanguageCode.CN.in_text("12345")
-        assert not LanguageCode.JP.in_text("12345")
+        assert not LANGUAGE_PATTERNS["ko"].search("12345")
+        assert not LANGUAGE_PATTERNS["zh"].search("12345")
+        assert not LANGUAGE_PATTERNS["ja"].search("12345")
 
-    def test_label_attribute(self):
-        assert LanguageCode.EN.label == "English"
-        assert LanguageCode.CN.label == "Chinese"
-        assert LanguageCode.JP.label == "Japanese"
-        assert LanguageCode.KO.label == "Korean"
+    def test_supported_languages(self):
+        assert set(LANGUAGE_PATTERNS.keys()) == {"en", "zh", "ja", "ko"}
+
+
+class TestResolvePrimary:
+    def test_simple_locale(self):
+        assert _resolve_primary("ko") == "ko"
+
+    def test_region_stripped(self):
+        assert _resolve_primary("zh-CN") == "zh"
+
+    def test_case_insensitive(self):
+        assert _resolve_primary("JA") == "ja"
+
+    def test_complex_tag(self):
+        assert _resolve_primary("zh-Hant-TW") == "zh"
 
 
 class TestContainsLanguage:
     def test_single_language_match(self):
-        assert contains_language("Hello", [LanguageCode.EN])
+        assert contains_language("Hello", ["en"])
 
     def test_single_language_no_match(self):
-        assert not contains_language("Hello", [LanguageCode.KO])
+        assert not contains_language("Hello", ["ko"])
 
     def test_multiple_languages_one_matches(self):
-        assert contains_language("Hello", [LanguageCode.KO, LanguageCode.EN])
+        assert contains_language("Hello", ["ko", "en"])
 
     def test_empty_languages_list(self):
         assert not contains_language("Hello", [])
+
+    def test_region_subtag_works(self):
+        assert contains_language("你好", ["zh-CN"])
+
+    def test_unknown_locale_no_crash(self):
+        assert not contains_language("Hello", ["xx"])
 
 
 class TestDetectLanguages:
     def test_mixed_en_ko(self):
         result = detect_languages("Hello 안녕하세요")
-        assert LanguageCode.EN in result
-        assert LanguageCode.KO in result
+        assert "en" in result
+        assert "ko" in result
 
-    def test_mixed_en_cn_jp(self):
+    def test_mixed_en_zh_ja(self):
         result = detect_languages("Hello 你好 こんにちは")
-        assert LanguageCode.EN in result
-        assert LanguageCode.CN in result
-        assert LanguageCode.JP in result
+        assert "en" in result
+        assert "zh" in result
+        assert "ja" in result
 
     def test_pure_numbers(self):
         result = detect_languages("12345")
@@ -83,8 +101,12 @@ class TestDetectLanguages:
         assert result == set()
 
     def test_subset_languages(self):
-        result = detect_languages("Hello 안녕", [LanguageCode.EN, LanguageCode.KO])
-        assert result == {LanguageCode.EN, LanguageCode.KO}
+        result = detect_languages("Hello 안녕", ["en", "ko"])
+        assert result == {"en", "ko"}
+
+    def test_region_subtag(self):
+        result = detect_languages("你好", ["zh-CN"])
+        assert result == {"zh"}
 
 
 class TestContainsAny:

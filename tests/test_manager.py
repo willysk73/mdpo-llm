@@ -58,6 +58,33 @@ class TestLoadOrCreatePO:
         with pytest.raises(ValueError):
             manager.load_or_create_po(None)
 
+    def test_language_header_set_on_new(self, manager, tmp_path):
+        """New PO files should have Language header when target_lang is given."""
+        po_path = tmp_path / "new.po"
+        po = manager.load_or_create_po(po_path, target_lang="ko")
+        assert po.metadata.get("Language") == "ko"
+
+    def test_language_header_absent_without_target_lang(self, manager, tmp_path):
+        """New PO files should not have Language header when target_lang is None."""
+        po_path = tmp_path / "new.po"
+        po = manager.load_or_create_po(po_path)
+        assert "Language" not in po.metadata
+
+    def test_language_header_not_overwritten(self, manager, tmp_path):
+        """Existing PO files with Language header should not be overwritten."""
+        po_path = tmp_path / "existing.po"
+        po = polib.POFile()
+        po.metadata = {
+            "Content-Type": "text/plain; charset=UTF-8",
+            "Language": "ja",
+        }
+        po.append(polib.POEntry(msgctxt="x", msgid="hi", msgstr=""))
+        po.save(po_path.as_posix())
+
+        loaded = manager.load_or_create_po(po_path, target_lang="ko")
+        # Should keep "ja", not overwrite with "ko"
+        assert loaded.metadata.get("Language") == "ja"
+
 
 class TestSyncPO:
     def test_new_entries_created(self, manager, fresh_po, simple_blocks):
@@ -199,6 +226,23 @@ class TestRedrawContext:
 
         hr_entry = next(e for e in po if "hr" in e.msgctxt)
         assert hr_entry.msgstr == ""
+
+    def test_preserves_language_header(self, manager, simple_blocks):
+        """Language header from old PO should survive redraw."""
+        manager.po_file = polib.POFile()
+        manager.po_file.metadata = {
+            "Content-Type": "text/plain; charset=UTF-8",
+            "Language": "ko",
+        }
+        manager.redraw_context(simple_blocks, ctx_func)
+        assert manager.po_file.metadata.get("Language") == "ko"
+
+    def test_no_language_header_stays_absent(self, manager, simple_blocks):
+        """If old PO had no Language header, redraw shouldn't add one."""
+        manager.po_file = polib.POFile()
+        manager.po_file.metadata = {"Content-Type": "text/plain; charset=UTF-8"}
+        manager.redraw_context(simple_blocks, ctx_func)
+        assert "Language" not in manager.po_file.metadata
 
 
 class TestSavePO:
