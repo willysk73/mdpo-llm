@@ -277,8 +277,9 @@ class MarkdownProcessor:
         """
         import concurrent.futures
 
-        source_dir = Path(source_dir)
-        target_dir = Path(target_dir)
+        source_dir = Path(source_dir).resolve()
+        target_dir = Path(target_dir).resolve()
+        resolved_po_dir = Path(po_dir).resolve() if po_dir is not None else None
 
         matched_files = sorted(source_dir.glob(glob))
 
@@ -288,15 +289,37 @@ class MarkdownProcessor:
         files_skipped = 0
 
         def _process_one(source_file: Path):
-            relative_path = source_file.relative_to(source_dir)
+            # Resolve symlinks and verify source stays within source_dir
+            resolved_source = source_file.resolve()
+            if not resolved_source.is_relative_to(source_dir):
+                raise ValueError(
+                    f"Source file {source_file} resolves to {resolved_source} "
+                    f"which is outside source directory {source_dir}"
+                )
+
+            relative_path = resolved_source.relative_to(source_dir)
             target_path = target_dir / relative_path
-            po_path_file = (
-                po_dir / relative_path.with_suffix(".po")
-                if po_dir is not None
-                else None
-            )
+
+            # Verify target stays within target_dir
+            resolved_target = target_path.resolve()
+            if not resolved_target.is_relative_to(target_dir):
+                raise ValueError(
+                    f"Target path {target_path} resolves to {resolved_target} "
+                    f"which is outside target directory {target_dir}"
+                )
+
+            po_path_file = None
+            if resolved_po_dir is not None:
+                po_path_file = resolved_po_dir / relative_path.with_suffix(".po")
+                resolved_po_path = po_path_file.resolve()
+                if not resolved_po_path.is_relative_to(resolved_po_dir):
+                    raise ValueError(
+                        f"PO path {po_path_file} resolves to {resolved_po_path} "
+                        f"which is outside PO directory {resolved_po_dir}"
+                    )
+
             return self.process_document(
-                source_file, target_path, po_path_file, inplace=inplace
+                resolved_source, target_path, po_path_file, inplace=inplace
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -322,7 +345,7 @@ class MarkdownProcessor:
         return {
             "source_dir": str(source_dir),
             "target_dir": str(target_dir),
-            "po_dir": str(po_dir) if po_dir is not None else None,
+            "po_dir": str(resolved_po_dir) if resolved_po_dir is not None else None,
             "files_processed": files_processed,
             "files_failed": files_failed,
             "files_skipped": files_skipped,

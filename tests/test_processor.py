@@ -507,3 +507,45 @@ class TestSequentialProcessing:
             pair_messages = messages[1:-1]  # exclude system and final user
             # Each pair = 2 messages, so at most 4 pair messages for max_reference_pairs=2
             assert len(pair_messages) <= 4
+
+
+class TestPathTraversalProtection:
+    """Tests for path traversal prevention in process_directory."""
+
+    def _make_md_file(self, path: Path, content: str = "# Hello\n\nWorld.\n"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def test_symlink_outside_source_dir_rejected(self, tmp_path, mock_completion):
+        """Symlinked source files pointing outside source_dir should be rejected."""
+        src = tmp_path / "src"
+        tgt = tmp_path / "tgt"
+        outside = tmp_path / "outside"
+
+        # Create a file outside the source directory
+        self._make_md_file(outside / "secret.md", "# Secret\n\nSensitive data.\n")
+
+        # Create a symlink inside source_dir pointing outside
+        src.mkdir(parents=True, exist_ok=True)
+        symlink_path = src / "secret.md"
+        symlink_path.symlink_to(outside / "secret.md")
+
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
+        result = processor.process_directory(src, tgt)
+
+        # The symlinked file should be rejected (counted as failed)
+        assert result["files_failed"] == 1
+        assert result["files_processed"] == 0
+
+    def test_normal_files_still_work(self, tmp_path, mock_completion):
+        """Normal files within source_dir should still be processed."""
+        src = tmp_path / "src"
+        tgt = tmp_path / "tgt"
+
+        self._make_md_file(src / "doc.md", "# Hello\n\nWorld.\n")
+
+        processor = MarkdownProcessor(model="test-model", target_lang="ko")
+        result = processor.process_directory(src, tgt)
+
+        assert result["files_failed"] == 0
+        assert result["files_processed"] + result["files_skipped"] == 1
