@@ -12,5 +12,13 @@ wheels/
 # Temporary directories
 tmp/
 
+# Test artifacts
+.coverage
+test_sample*.md
+test_sample*.po
+
+# Environment variables
+.env
+
 # WARP configuration
 WARP.md
