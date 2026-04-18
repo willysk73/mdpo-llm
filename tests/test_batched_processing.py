@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from mdpo_llm.placeholder import TOKEN_RE
 from mdpo_llm.processor import MarkdownProcessor
 
 
@@ -354,6 +355,133 @@ class TestGlossaryPlaceholderMode:
         out = (tmp_path / "target.md").read_text(encoding="utf-8")
         assert "GitHub" in out
         assert "\ud480 \ub9ac\ud018\uc2a4\ud2b8" in out
+
+
+class TestBuiltinPlaceholders:
+    """T-6: always-on anchor + HTML attribute placeholders.
+
+    The regression fixture called out in the T-6 acceptance criteria —
+    a source block with 5 anchors + 3 class-attr HTML links — must
+    round-trip every placeholder unchanged end-to-end through the
+    batched path.  No user registry, no glossary: built-ins alone.
+    """
+
+    def test_anchors_and_html_attrs_round_trip_through_batched_path(
+        self, tmp_path, mock_completion
+    ):
+        captured = {"user_payloads": []}
+
+        def _echo(*args, **kwargs):
+            messages = kwargs.get("messages", [])
+            user = messages[-1]["content"]
+            captured["user_payloads"].append(user)
+            parsed = json.loads(user) if user.strip().startswith("{") else None
+            resp = MagicMock()
+            if isinstance(parsed, dict):
+                # LLM preserves every token verbatim — tests the T-6
+                # guarantee that encoded spans survive the round trip.
+                resp.choices[0].message.content = json.dumps(
+                    parsed, ensure_ascii=False
+                )
+            else:
+                resp.choices[0].message.content = user
+            return resp
+
+        mock_completion.completion.side_effect = _echo
+
+        md = (
+            "# Title\n\n"
+            "Intro pointing at "
+            '<a href="/a" class="bare">A</a>, '
+            '<a href="/b" class="bare">B</a>, and '
+            '<a href="/c" class="bare">C</a>.\n\n'
+            "## Anchors {#first-anchor}\n\n"
+            "See also {#second-anchor} {#third-anchor} "
+            "{#fourth-anchor} {#fifth-anchor} refs.\n"
+        )
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        p.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+
+        # The user payload sent to the LLM must NOT contain any of the
+        # protected spans — every one has been swapped for an opaque
+        # token before the call.
+        joined_payloads = "\n".join(captured["user_payloads"])
+        for protected in (
+            "{#first-anchor}",
+            "{#second-anchor}",
+            "{#third-anchor}",
+            "{#fourth-anchor}",
+            "{#fifth-anchor}",
+            'href="/a"',
+            'href="/b"',
+            'href="/c"',
+            'class="bare"',
+        ):
+            assert protected not in joined_payloads, protected
+
+        # Every placeholder is restored verbatim in the rendered output.
+        out = (tmp_path / "target.md").read_text(encoding="utf-8")
+        for protected in (
+            "{#first-anchor}",
+            "{#second-anchor}",
+            "{#third-anchor}",
+            "{#fourth-anchor}",
+            "{#fifth-anchor}",
+            'href="/a"',
+            'href="/b"',
+            'href="/c"',
+        ):
+            assert protected in out, protected
+        # ``class="bare"`` appears three times — count preserved.
+        assert out.count('class="bare"') == 3
+
+    def test_dropped_anchor_marks_entry_fuzzy(self, tmp_path, mock_completion):
+        # When the LLM drops an anchor token, the round-trip check must
+        # fail the entry as a structural validator issue — not a
+        # warning.  Brief: "validator failure on a missing anchor is a
+        # structural fail, not a warning."
+        def _strip_anchor_tokens(*args, **kwargs):
+            messages = kwargs.get("messages", [])
+            user = messages[-1]["content"]
+            parsed = json.loads(user) if user.strip().startswith("{") else None
+            resp = MagicMock()
+            if isinstance(parsed, dict):
+                # Drop every placeholder token the encode step produced;
+                # this simulates the exact failure mode T-6 guards
+                # against (anchor mangling in the real-world test).
+                stripped = {k: TOKEN_RE.sub("", v) for k, v in parsed.items()}
+                resp.choices[0].message.content = json.dumps(
+                    stripped, ensure_ascii=False
+                )
+            else:
+                resp.choices[0].message.content = user
+            return resp
+
+        mock_completion.completion.side_effect = _strip_anchor_tokens
+
+        md = "## Heading {#my-anchor}\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        po_path = tmp_path / "m.po"
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        p.process_document(source, tmp_path / "target.md", po_path)
+
+        po = p.po_manager.load_or_create_po(po_path)
+        flagged = [e for e in po if "fuzzy" in e.flags]
+        assert flagged, "dropped anchor must mark the entry fuzzy"
+        assert any(
+            "placeholder_roundtrip" in (e.tcomment or "") for e in flagged
+        )
 
 
 class TestSectionAwareChunking:

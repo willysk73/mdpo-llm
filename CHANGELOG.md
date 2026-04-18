@@ -22,6 +22,85 @@
   sharper wording removes the ambiguity.
 
 ### Added
+- **`placeholder.py` — T-6 built-in patterns (`anchor`, `html_attr`)**:
+  every `MarkdownProcessor` now registers two always-on placeholder
+  patterns on top of the T-4 machinery:
+  - `anchor` protects Kramdown / Pandoc anchor IDs — the plain
+    `{#overview}` form AND longer IAL variants that co-declare classes
+    or key=val attrs (`{#overview .lead}`, `{#detail key=val}`).
+    Mangling an anchor breaks every `#overview` link pointing at the
+    heading.
+  - `html_attr` protects raw-HTML attribute pairs on an allowlist of
+    identity / link / structural attributes (`class`, `id`, `href`,
+    `src`, `srcset`, `rel`, `target`, `name`, `for`, `style`, `type`,
+    `role`, `lang`, `dir`, `xml:lang`, `xmlns`, `action`, `method`,
+    `width`, `height`, `data-*`). Matches double-quoted, single-quoted,
+    AND HTML5 unquoted values (`<img width=320 height=240>`) and is
+    compiled case-insensitively so uppercase attribute names
+    (`<A HREF="/docs" Class="bare">`) are protected too. Tag boundary
+    detection (`HTML_TAG_OPEN_RE`) is quote-aware — attributes that
+    follow a quoted value containing `>` (e.g.
+    `<a title="1 > 0" href="/docs">`) are still recognised as in-tag.
+    Real-world runs showed these link-attribute strings getting
+    translated or reordered. Attribute values that normally contain
+    user-facing prose — `alt`, `title`, `aria-label`, `placeholder`,
+    `label` — are deliberately NOT on the allowlist so the LLM still
+    gets to translate accessibility and tooltip text.
+
+  Built-ins additionally skip Markdown code contexts entirely —
+  fenced blocks (```` ``` ```` and `~~~`, including blockquoted and
+  nested-blockquoted fences like `> ~~~html` / `>> ~~~html`),
+  indented code blocks (4-space / tab indent after a blank line or
+  directly after a heading, with list-continuation lines excluded),
+  and backtick inline code spans (any run length, spanning newlines
+  per CommonMark). Partial tokenization of a literal HTML / anchor
+  example would otherwise let the model rewrite the example while
+  the token count still balanced.
+
+  There is no opt-out flag — the brief explicitly forbids one. Missing
+  any of these tokens in the LLM output is a structural fail via the
+  placeholder round-trip check (same hard-fail path used by every other
+  pattern), independent of `validation` mode. A user-supplied
+  `placeholders` kwarg layers additional patterns on top of the
+  built-ins without disabling them — a same-name user pattern only
+  suppresses the default when the caller explicitly sets
+  `replace_builtin=True` on the registration (the no-opt-out contract
+  stays intact by default). Glossary placeholder mode layers its own
+  patterns last — the four-layer composition is consolidated in
+  `MarkdownProcessor._build_effective_registry`.
+- **`placeholder.py` — `check_structural_position`**: token-count
+  round-trip alone could not catch a model that kept `⟦P:N⟧` exactly
+  once but relocated it. The new check compares structural placement
+  between source and decoded translation:
+  - Heading anchors use per-heading `(anchor, heading_ordinal)`
+    multisets, so a swap between two headings still fires even when
+    total anchor count is unchanged. Heading detection covers both
+    ATX (`#`) and setext (`===` / `---` underlined) styles.
+  - HTML attributes use a multiset of per-tag attribute signatures
+    (see `_attr_tag_signatures`) rather than tag ordinals, so legal
+    cross-language inline-tag reorders
+    (`<a href="/a">A</a> and <a href="/b">B</a>` →
+    `<a href="/b">B</a>와 <a href="/a">A</a>`) aren't flagged while
+    attribute mixes across tag boundaries still are.
+  Reports a `placeholder_position` issue on any drift. Integrated
+  into `MarkdownProcessor._apply_validation` alongside
+  `check_round_trip` so position drift is a structural fail
+  independent of `validation` mode.
+- **`placeholder.py` — `PlaceholderPattern.predicate`**: optional
+  `Callable[[text, start, end], bool]` attached to a registered
+  pattern; when supplied, `PlaceholderRegistry.encode` filters each
+  candidate match through it before treating the match as a
+  substitution. Lets a pattern restrict itself to a surrounding
+  context a vanilla regex can't express. The T-6 `html_attr`
+  built-in uses this via `_is_inside_html_tag` (which in turn calls
+  `_in_quoted_value`) so only attribute pairs that are BOTH inside a
+  `<...>` opening tag AND at the top level of that tag — not nested
+  inside another attribute's quoted value — are substituted.
+  Attribute-like substrings in prose (`` `class="primary"` `` inside
+  backticks, `href=/docs` in a sentence) and inside translatable
+  attribute values (`<a title='see href="/docs"' href="/real">`) are
+  all left alone so the LLM can still translate the prose while the
+  real attributes stay protected.
 - **`processor.py` — `glossary_mode` kwarg / `--glossary-mode` CLI flag**:
   selects how glossary terms are fed to the LLM. `"instruction"`
   (default, v0.4 back-compat) keeps the existing prompt-block flow.

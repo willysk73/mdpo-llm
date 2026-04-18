@@ -21,7 +21,16 @@ import polib
 from .batch import BatchTranslator
 from .manager import POManager
 from .parser import BlockParser
-from .placeholder import Placeholder, PlaceholderMap, PlaceholderRegistry, check_round_trip
+from .placeholder import (
+    ANCHOR_PATTERN,
+    BUILTIN_PATTERNS,
+    HTML_ATTR_PATTERN,
+    Placeholder,
+    PlaceholderMap,
+    PlaceholderRegistry,
+    check_round_trip,
+    check_structural_position,
+)
 from .prompts import Prompts
 from .reconstructor import DocumentReconstructor
 from .reference_pool import ReferencePool
@@ -218,13 +227,16 @@ class MarkdownProcessor:
                 callback that raises is logged and suppressed so progress
                 rendering never breaks the actual work.
             placeholders: Optional :class:`PlaceholderRegistry` whose patterns
-                are substituted with opaque ``\u27e6P:N\u27e7`` tokens before
-                each source block is sent to the LLM and restored afterwards.
-                When provided, the post-translation validator additionally
-                runs a round-trip check — any mapped token that is missing,
-                duplicated, or unexpected in the output fails the entry.
-                ``None`` (default) disables the feature; an empty registry
-                is a pass-through. T-4 ships no built-in patterns.
+                are registered IN ADDITION to the always-on T-6 built-ins
+                (``{#anchor-id}`` Kramdown attributes and raw-HTML attribute
+                pairs like ``class="bare"``).  Every match is substituted
+                with an opaque ``\u27e6P:N\u27e7`` token before the source
+                block is sent to the LLM and restored afterwards; the
+                round-trip check flags any mapped token that is missing,
+                duplicated, or unexpected in the output as a structural
+                fail — independent of the ``validation`` mode.
+                ``None`` (default) runs with only the T-6 built-ins;
+                passing an extra registry layers additional patterns on top.
             glossary_mode: How the configured glossary is fed to the LLM.
                 ``"instruction"`` (default, v0.4 back-compat) appends a
                 glossary block to the system prompt.  ``"placeholder"``
@@ -442,35 +454,51 @@ class MarkdownProcessor:
 
     # ----- placeholder pipeline -----
 
-    def _encode_source(self, text: str) -> Tuple[str, Optional[PlaceholderMap]]:
-        """Apply the effective placeholder registry to ``text`` if configured.
+    def _encode_source(self, text: str) -> Tuple[str, PlaceholderMap]:
+        """Run the effective placeholder registry over ``text``.
 
-        The effective registry is the user-supplied ``placeholders`` plus
-        glossary patterns in placeholder mode (see
+        The effective registry always starts with the T-6 built-ins
+        (``anchor`` + ``html_attr``) and layers user-supplied patterns
+        and glossary placeholder patterns on top (see
         :meth:`_build_effective_registry`).  Returns ``(encoded, mapping)``;
-        mapping is ``None`` when neither source of patterns is active, or
-        an empty :class:`PlaceholderMap` when the registry produced no
-        matches — callers can rely on ``bool(mapping)`` to distinguish a
-        no-op from an active encoding.
+        the mapping may be empty when no pattern matched, so callers can
+        rely on ``bool(mapping)`` to tell an active encoding from a no-op.
         """
-        if self._effective_registry is None:
-            return text, None
         encoded, mapping = self._effective_registry.encode(text)
         mapping = self._apply_glossary_replacements(mapping)
         return encoded, mapping
 
     def _build_effective_registry(
         self, user_registry: Optional[PlaceholderRegistry]
-    ) -> Optional[PlaceholderRegistry]:
-        """Merge user patterns with glossary patterns for placeholder mode.
+    ) -> PlaceholderRegistry:
+        """Compose the registry the processor actually uses on every call.
 
-        When ``glossary_mode == "placeholder"`` and a glossary is
-        configured, each glossary term is registered as a case-sensitive
-        word-boundary pattern (``\\bterm\\b``).  Encode will substitute
-        matches with opaque ``\u27e6P:N\u27e7`` tokens;
-        :meth:`_apply_glossary_replacements` then stamps each entry with
-        the target-language form so decode restores the translation
-        rather than the original source span.
+        Registration order determines the tie-break: encode sorts
+        candidates by ``(earliest start, longest match)`` and Python's
+        stable sort keeps insertion order on remaining ties, so
+        **earlier-registered wins equal-start/equal-length overlaps**.
+        Patterns are therefore registered in descending priority:
+
+            1. User-supplied ``placeholders`` — the caller's explicit
+               intent.  Registered first so a user pattern wins on
+               exact-match ties.  Additionally, any user pattern whose
+               ``name`` matches a built-in (``anchor`` / ``html_attr``)
+               SUPPRESSES that built-in entirely: the caller's regex
+               and predicate replace the defaults end-to-end, which
+               gives "stricter predicate" overrides a path that
+               actually works.  No-opt-out applies to the *behaviour*
+               (something named ``anchor`` / ``html_attr`` is still
+               always on), not to the specific regex.
+            2. T-6 built-ins (``anchor``, ``html_attr``) — no opt-out
+               flag except the by-name override above.  These protect
+               Markdown anchor IDs and raw HTML attribute pairs that
+               have been observed to mangle in real-world runs.
+            3. Glossary patterns when ``glossary_mode == "placeholder"``
+               and a glossary is configured.  Each term becomes a
+               case-sensitive word-boundary pattern (``\\bterm\\b``);
+               :meth:`_apply_glossary_replacements` stamps each entry
+               with the target-language form so decode emits the
+               translation rather than the original source span.
 
         **Morphology rule** — trailing morphology is NOT matched.
         ``"APIs"`` does not hit a glossary term ``"API"`` because the
@@ -484,28 +512,55 @@ class MarkdownProcessor:
         :meth:`_compile_glossary_pattern` because ``\\b`` anchors would
         reject the entire term; they fall through to the LLM, consistent
         with the same prefer-false-negative rule.
-
-        User-registered patterns come first so a user's explicit pattern
-        wins over an inferred glossary pattern on overlap; longer
-        glossary terms beat shorter ones via the registry's
-        longest-match-on-tie rule (``"pull request"`` beats ``"pull"``).
         """
-        need_glossary = bool(self._glossary) and self.glossary_mode == "placeholder"
-        if not need_glossary:
-            return user_registry
         registry = PlaceholderRegistry()
+        # Tracks same-name user patterns whose ``replace_builtin=True``
+        # flag explicitly suppresses the default built-in.  Without
+        # that opt-in a user pattern named ``anchor`` / ``html_attr``
+        # LAYERS on top of the default so every ``{#...}`` anchor /
+        # HTML attribute is still tokenized even when the user's
+        # regex or predicate would reject it — the T-6 "always-on /
+        # no opt-out" contract.
+        suppress_default: Dict[
+            str,
+            List[
+                Tuple["re.Pattern[str]", Optional[Callable[[str, int, int], bool]]]
+            ],
+        ] = {}
         if user_registry is not None:
             for p in user_registry.patterns:
-                registry.register(p.name, p.regex)
-        # Sort longest-first so "pull request" gets registered before
-        # "pull"; the encode overlap resolver also prefers the longer
-        # match on tie, but keeping insertion order sorted is defensive.
-        terms = sorted(self._glossary.keys(), key=len, reverse=True)
-        for term in terms:
-            pattern = self._compile_glossary_pattern(term)
-            if pattern is None:
+                registry.register(
+                    p.name,
+                    p.regex,
+                    predicate=p.predicate,
+                    replace_builtin=p.replace_builtin,
+                )
+                if p.replace_builtin:
+                    suppress_default.setdefault(p.name, []).append(
+                        (p.regex, p.predicate)
+                    )
+        for name, pattern, predicate in BUILTIN_PATTERNS:
+            if name in suppress_default:
                 continue
-            registry.register(f"glossary:{term}", pattern)
+            registry.register(name, pattern, predicate=predicate)
+        # Stash the override (regex, predicate) pairs per name so
+        # ``_apply_validation`` runs ``check_structural_position`` with
+        # the SAME matching behaviour the user configured for encoding
+        # — a stricter predicate narrows the check's match set too,
+        # instead of falling back to the default and flagging spans
+        # the override never tokenized.
+        self._builtin_overrides = suppress_default
+        need_glossary = bool(self._glossary) and self.glossary_mode == "placeholder"
+        if need_glossary:
+            # Sort longest-first so "pull request" gets registered before
+            # "pull"; the encode overlap resolver also prefers the longer
+            # match on tie, but keeping insertion order sorted is defensive.
+            terms = sorted(self._glossary.keys(), key=len, reverse=True)
+            for term in terms:
+                pattern = self._compile_glossary_pattern(term)
+                if pattern is None:
+                    continue
+                registry.register(f"glossary:{term}", pattern)
         return registry
 
     @staticmethod
@@ -1411,6 +1466,56 @@ class MarkdownProcessor:
             if reason:
                 issues.append(
                     ValidationIssue("placeholder_roundtrip", reason)
+                )
+            # Positional guard for the T-6 built-ins: a count-only check
+            # lets a model that moves ``\u27e6P:N\u27e7`` elsewhere in the
+            # same block pass silently — an anchor slid off its heading
+            # into the next paragraph, or an attribute jumped to a
+            # different tag, then decodes to a structurally broken
+            # document.  Compare the structural context (heading line
+            # for anchors, in-tag for HTML attributes) between source
+            # and decoded translation and fail on any drift.
+            # Scan with the user's override (regex + predicate) when
+            # they replaced a built-in, so the structural check still
+            # guards the exact spans they tokenized; otherwise fall
+            # back to the default regex and let ``_anchor_positions``
+            # / ``_attr_tag_signatures`` apply their built-in filters.
+            # Multiple same-name overrides are supported: the check
+            # runs once per ``(regex, predicate)`` pair so every
+            # override keeps its positional guarantee.
+            anchor_overrides = self._builtin_overrides.get(
+                "anchor", [(ANCHOR_PATTERN, None)]
+            )
+            html_attr_overrides = self._builtin_overrides.get(
+                "html_attr", [(HTML_ATTR_PATTERN, None)]
+            )
+            position_reasons: List[str] = []
+            for a_regex, a_pred in anchor_overrides:
+                r = check_structural_position(
+                    entry.msgid,
+                    processed,
+                    anchor_pattern=a_regex,
+                    anchor_predicate=a_pred,
+                    check_html_attr=False,
+                )
+                if r:
+                    position_reasons.append(r)
+            for h_regex, h_pred in html_attr_overrides:
+                r = check_structural_position(
+                    entry.msgid,
+                    processed,
+                    html_attr_pattern=h_regex,
+                    html_attr_predicate=h_pred,
+                    check_anchor=False,
+                )
+                if r:
+                    position_reasons.append(r)
+            if position_reasons:
+                issues.append(
+                    ValidationIssue(
+                        "placeholder_position",
+                        "; ".join(position_reasons),
+                    )
                 )
 
         if self.validation != "off":
