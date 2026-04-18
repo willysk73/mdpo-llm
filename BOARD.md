@@ -256,11 +256,14 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: pending
+  status: assigned
   priority: low
   depends_on: [T-1]
   brief: .ccx/tasks/T-8.md
-  attempts: 0
+  attempts: 1
+  worktree: /home/will/Repositories/mdpo-llm-T-8
+  branch: ccx/T-8
+  started_at: "2026-04-18T11:50:24Z"
   notes: |
     Roadmap #3. Expose `--batch-concurrency N` that allows N batches
     within a single file to fly in parallel after the first 1–2
