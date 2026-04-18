@@ -3314,3 +3314,308 @@ class TestMultiTargetProcessing:
         # batched_calls is shared across langs (same call served both).
         assert ko_stats["batched_calls"] == ja_stats["batched_calls"]
         assert ko_stats["batched_calls"] >= 1
+
+
+class TestTranslatePaths:
+    """``--translate-paths`` opt-in: per-segment _paths.po + path_map.json."""
+
+    def _write_tree(self, root: Path) -> None:
+        (root / "guide").mkdir(parents=True, exist_ok=True)
+        (root / "guide" / "intro.md").write_text(
+            "# Intro\n\nHello.\n", encoding="utf-8"
+        )
+        (root / "guide" / "setup.md").write_text(
+            "# Setup\n\nSteps.\n", encoding="utf-8"
+        )
+        (root / "api.md").write_text("# API\n\nReference.\n", encoding="utf-8")
+
+    def test_default_off_unchanged(self, tmp_path, mock_completion):
+        """Without the flag, target paths mirror source paths exactly and no
+        ``_paths.po`` / ``path_map.json`` are emitted."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        po = tmp_path / "po"
+        self._write_tree(src)
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        p.process_directory(src, dst, po)
+
+        assert (dst / "guide" / "intro.md").exists()
+        assert (dst / "guide" / "setup.md").exists()
+        assert (dst / "api.md").exists()
+        assert not (dst / "path_map.json").exists()
+        assert not (po / "_paths.po").exists()
+
+    def test_emits_paths_po_and_path_map(self, tmp_path, mock_completion):
+        """With the flag on, every source path has a translated target
+        mirror, ``_paths.po`` lives under ``po_dir`` and ``path_map.json``
+        sits at the target-tree root."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        po = tmp_path / "po"
+        self._write_tree(src)
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        p.process_directory(src, dst, po, translate_paths=True)
+
+        paths_po = po / "_paths.po"
+        path_map_file = dst / "path_map.json"
+        assert paths_po.exists()
+        assert path_map_file.exists()
+
+        path_map = json.loads(path_map_file.read_text(encoding="utf-8"))
+        assert set(path_map.keys()) == {
+            "api.md",
+            "guide/intro.md",
+            "guide/setup.md",
+        }
+        # mock_completion prefixes with "[TRANSLATED] " and
+        # slugify_path_segment collapses the space + brackets.  The mocked
+        # translation of ``api`` yields ``"[TRANSLATED] api"`` → slug
+        # ``"TRANSLATED-api"``.  Assert shape, not exact form: every
+        # translated relative path should differ from its source and
+        # preserve the .md extension.
+        for src_rel, tgt_rel in path_map.items():
+            assert tgt_rel.endswith(".md")
+            assert tgt_rel != src_rel
+            assert (dst / tgt_rel).exists()
+
+        # The actual translated markdown files sit at the translated
+        # relative paths; originals must NOT be written.
+        assert not (dst / "api.md").exists()
+        assert not (dst / "guide" / "intro.md").exists()
+
+    def test_idempotent_cache_reuse(self, tmp_path, mock_completion):
+        """Re-running with a populated ``_paths.po`` reuses cached
+        translations — no further LLM calls for path segments."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        po = tmp_path / "po"
+        self._write_tree(src)
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        p.process_directory(src, dst, po, translate_paths=True)
+
+        calls_after_first = mock_completion.completion.call_count
+        # Second run: path segments are already translated in _paths.po AND
+        # content PO entries are already msgstr-populated, so the run
+        # should issue zero additional LLM calls.
+        p.process_directory(src, dst, po, translate_paths=True)
+        assert mock_completion.completion.call_count == calls_after_first
+
+    def test_disambiguates_colliding_slugs(self, tmp_path, mock_completion):
+        """Two sibling files whose translated stems collapse to the same
+        slug get ``-2``/``-3`` disambiguators."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        (src / "alpha.md").write_text("# A\n", encoding="utf-8")
+        (src / "beta.md").write_text("# B\n", encoding="utf-8")
+
+        def _collide(*args, **kwargs):
+            """Force every segment and every content block to translate
+            to the same constant string so slug collisions fire."""
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            resp = MagicMock()
+            # Batched content path sends JSON objects; preserve shape so
+            # the processor can thread the response back to per-entry msgstrs.
+            if isinstance(user_content, str) and user_content.strip().startswith("{"):
+                try:
+                    parsed = json.loads(user_content)
+                    resp.choices[0].message.content = json.dumps(
+                        {k: "same" for k in parsed}, ensure_ascii=False
+                    )
+                except json.JSONDecodeError:
+                    resp.choices[0].message.content = "same"
+            else:
+                resp.choices[0].message.content = "same"
+            return resp
+
+        mock_completion.completion.side_effect = _collide
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        p.process_directory(src, dst, translate_paths=True)
+
+        path_map = json.loads((dst / "path_map.json").read_text(encoding="utf-8"))
+        targets = sorted(path_map.values())
+        # Both files land at distinct, deterministic slugs; the
+        # alphabetically-first source wins the base slug.
+        assert len(set(targets)) == 2
+        assert all(t.endswith(".md") for t in targets)
+        # Base slug is "same"; disambiguator gives "same-2".
+        assert path_map["alpha.md"] == "same.md"
+        assert path_map["beta.md"] == "same-2.md"
+
+    def test_colliding_parents_and_stems_disambig_cleanly(
+        self, tmp_path, mock_completion
+    ):
+        """When two distinct source directories AND both of their child
+        stems all translate to identical slugs, every output must still
+        land at a distinct on-disk path — the directory-level disambig
+        must propagate through so stems don't overwrite each other."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        (src / "a").mkdir(parents=True)
+        (src / "b").mkdir(parents=True)
+        (src / "a" / "readme.md").write_text("# A\n", encoding="utf-8")
+        (src / "b" / "readme.md").write_text("# B\n", encoding="utf-8")
+
+        def _collapse_to_same(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            resp = MagicMock()
+            if isinstance(user_content, str) and user_content.strip().startswith("{"):
+                try:
+                    parsed = json.loads(user_content)
+                    resp.choices[0].message.content = json.dumps(
+                        {k: "same" for k in parsed}, ensure_ascii=False
+                    )
+                except json.JSONDecodeError:
+                    resp.choices[0].message.content = "same"
+            else:
+                # Every path segment (a, b, readme) translates to "same".
+                resp.choices[0].message.content = "same"
+            return resp
+
+        mock_completion.completion.side_effect = _collapse_to_same
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        p.process_directory(src, dst, translate_paths=True)
+
+        path_map = json.loads((dst / "path_map.json").read_text(encoding="utf-8"))
+        targets = list(path_map.values())
+        # Every target path is unique AND exists on disk.
+        assert len(set(targets)) == len(targets)
+        for tgt in targets:
+            assert (dst / tgt).is_file()
+
+    def test_reserved_name_with_extension_is_rewritten(
+        self, tmp_path, mock_completion
+    ):
+        """``CON.txt``, ``AUX.foo`` etc. are reserved on Windows even with
+        trailing extensions.  ``slugify_path_segment`` must rewrite the
+        stem portion so the resulting path stays writable on every
+        platform."""
+        from mdpo_llm.parser import slugify_path_segment
+
+        assert slugify_path_segment("CON") == "CON_"
+        assert slugify_path_segment("CON.txt") == "CON_.txt"
+        assert slugify_path_segment("aux.foo") == "aux_.foo"
+        assert slugify_path_segment("LPT1.bak") == "LPT1_.bak"
+        # Non-reserved stems must still round-trip unchanged.
+        assert slugify_path_segment("console") == "console"
+        assert slugify_path_segment("config.bak") == "config.bak"
+
+    def test_dotfile_segments_pass_through(self, tmp_path, mock_completion):
+        """Segments starting with ``.`` (``.github``, ``.well-known``) are
+        filesystem-navigation / convention tokens and MUST NOT be
+        translated — they pass through the path map unchanged so CI / web
+        infrastructure paths don't break."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        (src / ".github").mkdir(parents=True)
+        (src / ".github" / "CONTRIBUTING.md").write_text(
+            "# Contributing\n", encoding="utf-8"
+        )
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        p.process_directory(src, dst, translate_paths=True)
+
+        path_map = json.loads((dst / "path_map.json").read_text(encoding="utf-8"))
+        target = path_map[".github/CONTRIBUTING.md"]
+        # ".github" is untouched; the stem "CONTRIBUTING" can be translated.
+        assert target.startswith(".github/")
+        assert target.endswith(".md")
+
+    def test_cleanup_stale_translated_outputs(self, tmp_path, mock_completion):
+        """When a path mapping changes between runs (e.g. an operator edits
+        ``_paths.po``), the old localized file MUST be removed so
+        static-site deploys don't double-publish outdated content."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        po = tmp_path / "po"
+        src.mkdir()
+        (src / "alpha.md").write_text("# A\n", encoding="utf-8")
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        p.process_directory(src, dst, po, translate_paths=True)
+        first_map = json.loads((dst / "path_map.json").read_text(encoding="utf-8"))
+        first_target_rel = first_map["alpha.md"]
+        first_target = dst / first_target_rel
+        assert first_target.exists()
+
+        # Simulate an operator editing the _paths.po entry so the next
+        # run produces a different translation for "alpha".
+        paths_po = po / "_paths.po"
+        import polib as _polib
+
+        po_file = _polib.pofile(str(paths_po))
+        edited = False
+        for entry in po_file:
+            if entry.msgid == "alpha":
+                entry.msgstr = "renamed"
+                edited = True
+        assert edited, "expected an `alpha` segment entry in _paths.po"
+        po_file.save(str(paths_po), newline="\n")
+
+        p.process_directory(src, dst, po, translate_paths=True)
+        second_map = json.loads((dst / "path_map.json").read_text(encoding="utf-8"))
+        assert second_map["alpha.md"] == "renamed.md"
+        assert (dst / "renamed.md").exists()
+        # The stale file from the first run is gone — path_map.json and
+        # the on-disk tree stay in sync.
+        if first_target_rel != "renamed.md":
+            assert not first_target.exists()
+
+    def test_receipt_includes_path_translation_tokens(
+        self, tmp_path, mock_completion
+    ):
+        """Path-segment API calls bill into the directory-level receipt so
+        operators see the real cost of a translate-paths run."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        (src / "doc.md").parent.mkdir(parents=True, exist_ok=True)
+        (src / "doc.md").write_text("# Hi\n", encoding="utf-8")
+
+        # Give every response a fixed token count so we can compare
+        # directly against the expected lower bound.
+        def _priced(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            resp = MagicMock()
+            if isinstance(user_content, str) and user_content.strip().startswith("{"):
+                try:
+                    parsed = json.loads(user_content)
+                    resp.choices[0].message.content = json.dumps(
+                        {k: f"T {v}" for k, v in parsed.items()},
+                        ensure_ascii=False,
+                    )
+                except json.JSONDecodeError:
+                    resp.choices[0].message.content = user_content
+            else:
+                resp.choices[0].message.content = f"T {user_content}"
+            resp.usage.prompt_tokens = 11
+            resp.usage.completion_tokens = 3
+            return resp
+
+        mock_completion.completion.side_effect = _priced
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        result = p.process_directory(src, dst, translate_paths=True)
+
+        # Two segments ("doc" stem) + one content batch → at least two calls.
+        assert result.receipt.api_calls >= 2
+        assert result.receipt.input_tokens >= 22
