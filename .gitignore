@@ -22,3 +22,6 @@ test_sample*.po
 
 # WARP configuration
 WARP.md
+
+docs/
+BOARD.md
