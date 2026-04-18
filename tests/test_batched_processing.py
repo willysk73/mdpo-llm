@@ -1,12 +1,40 @@
 """Integration tests for the batched processing path in MarkdownProcessor."""
 
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from mdpo_llm.processor import MarkdownProcessor
+
+
+def _identity_side_effect(*args, **kwargs):
+    """Return each batch value unchanged so output == source for every entry.
+
+    Drives the "LLM returned untranslated output" path without mutating any
+    value — every block, including prose, comes back verbatim. Tests that
+    exercise the warning gate rely on this shape.
+    """
+    messages = kwargs.get("messages", args[0] if args else [])
+    user_content = ""
+    for msg in reversed(messages):
+        if msg["role"] == "user":
+            user_content = msg["content"]
+            break
+    parsed = None
+    if isinstance(user_content, str) and user_content.strip().startswith("{"):
+        try:
+            parsed = json.loads(user_content)
+        except json.JSONDecodeError:
+            parsed = None
+    resp = MagicMock()
+    if isinstance(parsed, dict):
+        resp.choices[0].message.content = json.dumps(parsed, ensure_ascii=False)
+    else:
+        resp.choices[0].message.content = user_content
+    return resp
 
 
 @pytest.fixture
@@ -166,6 +194,86 @@ class TestBatchedProcessing:
         p.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
         call = mock_completion.completion.call_args_list[0]
         assert "response_format" not in call.kwargs
+
+
+class TestUntranslatedWarningGate:
+    """Warning for ``output == source`` skips ``code`` block types only.
+
+    The v0.3 real-world test produced a flood of false-positive warnings
+    because code blocks legitimately pass through unchanged (per rule 3 of
+    the translation instruction). These tests pin the exemption in both
+    processing paths while guaranteeing prose regressions still surface.
+    """
+
+    def _run_identity(self, tmp_path, mock_completion, caplog, *, batch_size):
+        mock_completion.completion.side_effect = _identity_side_effect
+        md = (
+            "# Heading\n\n"
+            "A paragraph that should be translated.\n\n"
+            "```python\nprint('hi')\n```\n"
+        )
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=batch_size
+        )
+        with caplog.at_level(logging.WARNING, logger="mdpo_llm.processor"):
+            p.process_document(
+                source, tmp_path / "target.md", tmp_path / "m.po"
+            )
+        return [
+            r
+            for r in caplog.records
+            if "LLM returned untranslated output" in r.getMessage()
+        ]
+
+    def test_code_block_suppresses_warning_batched(
+        self, tmp_path, mock_completion, caplog
+    ):
+        warnings = self._run_identity(
+            tmp_path, mock_completion, caplog, batch_size=40
+        )
+        # Prose still trips the warning so real regressions stay visible.
+        assert warnings, "non-code entries must still emit the warning"
+        # But no warning references a code-block msgctxt.
+        assert all("::code:" not in r.getMessage() for r in warnings), (
+            "code blocks must be exempt from the untranslated warning; "
+            f"offending records: {[r.getMessage() for r in warnings]}"
+        )
+
+    def test_code_block_suppresses_warning_sequential(
+        self, tmp_path, mock_completion, caplog
+    ):
+        warnings = self._run_identity(
+            tmp_path, mock_completion, caplog, batch_size=0
+        )
+        assert warnings, "non-code entries must still emit the warning"
+        assert all("::code:" not in r.getMessage() for r in warnings), (
+            "code blocks must be exempt from the untranslated warning; "
+            f"offending records: {[r.getMessage() for r in warnings]}"
+        )
+
+
+class TestBatchPromptFenceProhibition:
+    """The batched system prompt must explicitly forbid Markdown fences.
+
+    The v0.3 run occasionally saw models wrap their JSON response in
+    ```json fences despite rule 1, so the rule is tightened to call out
+    the exact wrapping behaviour. Pin the language so a future prompt
+    tweak doesn't quietly regress the instruction.
+    """
+
+    def test_instruction_forbids_fences_explicitly(self):
+        from mdpo_llm.prompts import Prompts
+
+        instruction = Prompts.BATCH_TRANSLATE_INSTRUCTION
+        # Must mention that the response has to start with `{` and end
+        # with `}` and explicitly call out backticks / ```json fences.
+        assert "start with `{`" in instruction
+        assert "end with `}`" in instruction
+        assert "```json" in instruction
+        assert "backticks" in instruction
 
 
 class TestInplaceModeBatched:

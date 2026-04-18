@@ -945,10 +945,19 @@ class MarkdownProcessor:
                     continue
 
                 if processed is not None and processed.strip() == entry.msgid.strip():
-                    logger.warning(
-                        "LLM returned untranslated output for entry %s",
-                        entry.msgctxt,
-                    )
+                    # Code blocks legitimately round-trip unchanged — rule 3
+                    # of the translation instruction tells the LLM to keep
+                    # code as-is and only translate comments / user-facing
+                    # strings — so output==source is the expected outcome,
+                    # not a failure signal. Suppress the warning for the
+                    # ``code`` block type only; real regressions in prose
+                    # still surface.
+                    block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
+                    if block_type != "code":
+                        logger.warning(
+                            "LLM returned untranslated output for entry %s",
+                            entry.msgctxt,
+                        )
 
                 if not self._apply_validation(entry_obj, processed, inplace, pool):
                     stats["failed"] += 1
@@ -1169,9 +1178,15 @@ class MarkdownProcessor:
                 continue
 
             if processed.strip() == entry.msgid.strip():
-                logger.warning(
-                    "LLM returned untranslated output for entry %s", entry.msgctxt
-                )
+                # See the sequential path for rationale: code blocks are
+                # instructed to pass through unchanged so output==source
+                # is not a failure; only warn for non-code block types so
+                # prose regressions stay visible.
+                block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
+                if block_type != "code":
+                    logger.warning(
+                        "LLM returned untranslated output for entry %s", entry.msgctxt
+                    )
 
             if not self._apply_validation(entry, processed, inplace, pool, stats):
                 stats["failed"] += 1
