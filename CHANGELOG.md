@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **`results.py` — `Receipt`**: per-run token/cost/duration summary with
+  fields `model`, `target_lang`, `source_path`, `target_path`, `po_path`,
+  `input_tokens`, `output_tokens`, `total_tokens`, `api_calls`,
+  `duration_seconds`, per-1M USD prices, and per-category / total cost in
+  USD. Cost fields are `None` for models not listed in `litellm.model_cost`
+  and render as `"—"`. Exposed as `result.receipt` on both `ProcessResult`
+  and `DirectoryResult` (backward-compatible — omitting the kwarg still
+  constructs a valid result with `receipt=None`).
+- **`processor.py`**: sums `response.usage.prompt_tokens` /
+  `completion_tokens` across every `litellm.completion` call (batched,
+  bisected, and per-entry fallback) and measures wall-clock. Pricing is
+  resolved from `litellm.model_cost` with a provider-prefix fallback
+  (`anthropic/claude-sonnet-4-5` → `claude-sonnet-4-5`).
+  `process_directory` aggregates per-file receipts into a directory-level
+  receipt whose duration is the wall-clock of the concurrent run.
+- **CLI**: `mdpo-llm translate` / `translate-dir` print the receipt block
+  to stderr after the JSON result. New `--json-receipt PATH` flag writes
+  the structured receipt to a file for CI consumers.
+- **Tests** — `tests/test_results.py` (Receipt dataclass, render, optional
+  fields), `tests/test_batched_processing.py::TestReceipt` (token
+  accumulation, unpriced-model fallback, directory aggregation).
+
 ## 0.3.0
 
 ### Added
