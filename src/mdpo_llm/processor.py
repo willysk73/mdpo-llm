@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 import litellm
 import polib
 
-from .batch import BatchTranslator
+from .batch import BatchTranslator, MultiTargetBatchTranslator
 from .manager import POManager
 from .parser import BlockParser
 from .placeholder import (
@@ -302,6 +302,19 @@ class MarkdownProcessor:
         self.max_reference_pairs = max_reference_pairs
         self._extra_instructions = extra_instructions
         self._post_process = post_process
+        # Keep the raw inputs so :meth:`process_document_multi` can
+        # re-resolve locale-specific glossary entries for each target
+        # language — the baked ``self._glossary`` below is pinned to
+        # ``target_lang`` and would silently feed wrong-locale
+        # replacements into other langs otherwise.
+        self._glossary_inline = (
+            dict(glossary) if glossary else None
+        )
+        self._glossary_file: Optional[Dict[str, Any]] = None
+        if glossary_path:
+            self._glossary_file = json.loads(
+                Path(glossary_path).read_text(encoding="utf-8")
+            )
         self._glossary = self._resolve_glossary(glossary, glossary_path)
         self.batch_size = batch_size
         self.batch_max_chars = batch_max_chars
@@ -406,6 +419,51 @@ class MarkdownProcessor:
             resolved.update(glossary)
 
         return resolved or None
+
+    def _resolve_glossary_for_lang(
+        self, target_lang: str
+    ) -> Optional[Dict[str, Optional[str]]]:
+        """Re-resolve the configured glossary for an arbitrary locale.
+
+        Used by :meth:`process_document_multi` so each target language
+        gets its own locale-specific glossary resolution rather than
+        inheriting ``self.target_lang``'s pinning.  Falls back to the
+        baked ``self._glossary`` when the processor was built without
+        either a ``glossary_path`` or an inline ``glossary``, so callers
+        who never configured one pay no overhead.
+        """
+        if not self._glossary_inline and self._glossary_file is None:
+            return self._glossary
+        resolved: Dict[str, Optional[str]] = {}
+        if self._glossary_file is not None:
+            for term, value in self._glossary_file.items():
+                if value is None:
+                    resolved[term] = None
+                elif isinstance(value, str):
+                    resolved[term] = value
+                elif isinstance(value, dict):
+                    resolved[term] = value.get(target_lang)
+        if self._glossary_inline:
+            resolved.update(self._glossary_inline)
+        return resolved or None
+
+    def _format_glossary_for_lang(
+        self, source_text: str, target_lang: str
+    ) -> Optional[str]:
+        """Per-lang counterpart of :meth:`_format_glossary`."""
+        glossary = self._resolve_glossary_for_lang(target_lang)
+        if not glossary or self.glossary_mode != "instruction":
+            return None
+        relevant = {k: v for k, v in glossary.items() if k in source_text}
+        if not relevant:
+            return None
+        lines = []
+        for term, translation in relevant.items():
+            if translation is None:
+                lines.append(f'- "{term}" \u2192 do not translate')
+            else:
+                lines.append(f'- "{term}" \u2192 "{translation}"')
+        return "Glossary (use these exact forms, do not alter):\n" + "\n".join(lines)
 
     def _format_glossary(self, source_text: str) -> str | None:
         # In placeholder mode the glossary is fed to the LLM as opaque
@@ -2160,6 +2218,861 @@ class MarkdownProcessor:
             stats["processed"] += 1
             with pool_cm:
                 pool.add(source_msgid, processed)
+
+    # ----- multi-target translation -----
+
+    def process_document_multi(
+        self,
+        source_path: Path,
+        target_langs: List[str],
+        target_paths: Dict[str, Path],
+        po_paths: Optional[Dict[str, Path]] = None,
+    ) -> Dict[str, Any]:
+        """Translate one Markdown document into several target languages in
+        a single batched LLM call per source group.
+
+        Source-side decomposition (placeholder substitution, reference
+        lookup, glossary matching) runs ONCE per block regardless of the
+        number of target languages, so the input-token bill is amortised
+        across every language while only the output tokens grow with
+        ``len(target_langs)``.  The batched wire format returns
+        ``{block_id: {lang: translation}}``; any missing per-lang entry
+        forces the affected blocks into bisection / per-language
+        single-target fallback, preserving the deterministic behaviour
+        of the single-target batched path.
+
+        The processor's own ``target_lang`` / ``mode`` are ignored here —
+        multi-target is translate-only and the caller names every
+        per-call locale explicitly.  ``inplace`` is NOT supported (the
+        contract is one source -> many targets; overwriting the single
+        source msgid with N different translations is undefined).  The
+        refine-first composition is out of scope for this method.
+
+        Args:
+            source_path: Markdown source file.
+            target_langs: BCP 47 locale list; order is preserved, and
+                duplicate entries are removed with a warning.  Must be
+                non-empty.
+            target_paths: Per-language output markdown path.  Every lang
+                in ``target_langs`` MUST have an entry.
+            po_paths: Per-language PO path.  When omitted (or a lang is
+                missing), defaults to ``target_paths[lang]`` with a
+                ``.po`` suffix.  Callers who want a per-lang PO
+                directory layout should pre-compute paths and pass them
+                explicitly.
+
+        Returns:
+            A dict with:
+                - ``by_lang``: ``Dict[str, ProcessResult]`` — one entry
+                  per target language (PO path, target markdown path,
+                  coverage, per-lang stats; ``receipt=None`` because
+                  tokens are billed ONCE across all languages).
+                - ``receipt``: a single :class:`Receipt` summarising the
+                  multi-target run.  ``target_lang`` is a
+                  comma-separated list so operators still see which
+                  languages were in scope.
+                - ``source_path``: str.
+                - ``target_langs``: list of locales actually processed
+                  (duplicates removed).
+
+        The human-runnable "canonical-seeded" comparison (translate to
+        one anchor lang, then reuse its output as few-shot context for
+        other langs) is already expressible via the existing
+        single-target :meth:`process_document` repeated per lang.  This
+        method ships alongside for direct A/B comparison without any
+        additional machinery — nothing in the call graph depends on
+        live API access.
+        """
+        if self.mode != "translate":
+            raise ValueError(
+                "process_document_multi requires mode='translate'. "
+                "Multi-target refine is not supported — refine is "
+                "same-language by contract."
+            )
+        if not target_langs:
+            raise ValueError("target_langs must not be empty.")
+        # Placeholder-mode glossary bakes the target-language replacement
+        # into the PlaceholderMap at encode time — the same decoded token
+        # would then be restored to a single locale across every
+        # per-lang output, silently injecting one language's glossary
+        # forms into the others.  The multi-target flow's "shared
+        # source-side decomposition" contract is incompatible with that
+        # per-lang decoding requirement, so refuse up front and point
+        # callers at the safe alternatives.  Guard against ANY
+        # configured glossary source (inline dict OR glossary_file),
+        # not just ``self._glossary`` — a locale-keyed file whose
+        # entries happen not to resolve for the constructor-time
+        # ``target_lang`` would silently leave ``self._glossary``
+        # empty, so the narrower check would let the multi-target run
+        # proceed with the glossary silently dropped instead of
+        # failing fast.
+        has_glossary_source = bool(self._glossary_inline) or (
+            self._glossary_file is not None
+        )
+        if has_glossary_source and self.glossary_mode == "placeholder":
+            raise ValueError(
+                "process_document_multi does not support "
+                "glossary_mode='placeholder'. The placeholder path bakes "
+                "target-language replacements into the PlaceholderMap at "
+                "encode time, which cannot fan out to multiple target "
+                "languages without corrupting at least one. Either "
+                "switch to glossary_mode='instruction' for the "
+                "multi-target call, or run the single-target "
+                "process_document once per language (the "
+                "canonical-seeded baseline)."
+            )
+
+        if self.batch_concurrency and self.batch_concurrency > 1:
+            # Multi-target does not yet honour ``batch_concurrency``:
+            # the shared per-lang pools / stats counters would need the
+            # same lock-protected merge logic as
+            # :meth:`_run_groups_concurrent`, which is not yet wired
+            # through ``_translate_group_multi``.  Log a loud warning
+            # so callers who opted in for performance know the flag is
+            # being ignored on this call, then fall through to the
+            # sequential loop below.  A silent ignore would otherwise
+            # mask throughput regressions relative to single-target runs.
+            logger.warning(
+                "batch_concurrency=%d is not yet honoured by "
+                "process_document_multi; running groups sequentially. "
+                "Run single-target process_document per lang to exploit "
+                "intra-file concurrency.",
+                self.batch_concurrency,
+            )
+
+        langs: List[str] = []
+        seen_langs: set = set()
+        for lang in target_langs:
+            if not isinstance(lang, str) or not lang:
+                raise ValueError(
+                    "target_langs entries must be non-empty strings."
+                )
+            if lang in seen_langs:
+                logger.warning(
+                    "target_langs contains duplicate %r; ignoring.", lang
+                )
+                continue
+            seen_langs.add(lang)
+            langs.append(lang)
+
+        missing_targets = [l for l in langs if l not in target_paths]
+        if missing_targets:
+            raise ValueError(
+                "target_paths missing entries for: " + ", ".join(missing_targets)
+            )
+
+        resolved_target_paths: Dict[str, Path] = {
+            lang: Path(target_paths[lang]) for lang in langs
+        }
+        resolved_po_paths: Dict[str, Path] = {}
+        for lang in langs:
+            p = (po_paths or {}).get(lang) if po_paths else None
+            if p is None:
+                p = resolved_target_paths[lang].with_suffix(".po")
+            resolved_po_paths[lang] = Path(p)
+
+        # Distinctness guard: two languages writing to the same target
+        # or PO path would silently clobber each other on save.  Compare
+        # resolved absolute paths so ``./a.md`` vs ``a.md`` spellings
+        # trip the guard the same way the refine-first checks do.
+        def _resolve(p: Path) -> Path:
+            try:
+                return p.resolve(strict=False)
+            except OSError:
+                return p.absolute()
+
+        target_resolved: Dict[str, Path] = {
+            lang: _resolve(p) for lang, p in resolved_target_paths.items()
+        }
+        po_resolved: Dict[str, Path] = {
+            lang: _resolve(p) for lang, p in resolved_po_paths.items()
+        }
+        if len({str(p) for p in target_resolved.values()}) != len(langs):
+            raise ValueError(
+                "target_paths must resolve to distinct paths per language."
+            )
+        if len({str(p) for p in po_resolved.values()}) != len(langs):
+            raise ValueError(
+                "po_paths must resolve to distinct paths per language."
+            )
+        # Also forbid writing a target on top of the source and the
+        # source-path aliasing any PO path, mirroring the single-target
+        # safeguards.
+        source_resolved = _resolve(Path(source_path))
+        for lang, p in target_resolved.items():
+            if p == source_resolved:
+                raise ValueError(
+                    f"target_paths[{lang!r}] cannot be the source path "
+                    f"({source_resolved})."
+                )
+        for lang, p in po_resolved.items():
+            if p == source_resolved:
+                raise ValueError(
+                    f"po_paths[{lang!r}] cannot be the source path "
+                    f"({source_resolved})."
+                )
+        # Cross-set collision: a target path and a PO path that resolve
+        # to the same file (same lang or different lang) would let the
+        # two save loops clobber each other — the PO save rewrites a
+        # markdown file, or vice versa — deterministically corrupting
+        # output.  Forbid any overlap between the two sets.
+        for tgt_lang, tgt_p in target_resolved.items():
+            for po_lang, po_p in po_resolved.items():
+                if tgt_p == po_p:
+                    raise ValueError(
+                        f"target_paths[{tgt_lang!r}] and "
+                        f"po_paths[{po_lang!r}] resolve to the same "
+                        f"file ({tgt_p}); target markdown and PO files "
+                        f"must not alias each other across languages."
+                    )
+
+        parser = BlockParser()
+        usage = getattr(self._tls, "usage", None) or _UsageAccumulator()
+        start = time.monotonic()
+
+        po_managers: Dict[str, POManager] = {
+            lang: POManager(skip_types=self.SKIP_TYPES) for lang in langs
+        }
+        po_files: Dict[str, polib.POFile] = {}
+        po_saved: Dict[str, bool] = {lang: False for lang in langs}
+        source_path_str = str(source_path)
+        document_started = False
+
+        try:
+            source_text = Path(source_path).read_text(encoding="utf-8")
+            source_lines = source_text.splitlines(keepends=True)
+            blocks = parser.segment_markdown(
+                [line.rstrip("\n") for line in source_lines]
+            )
+
+            for lang in langs:
+                po_files[lang] = po_managers[lang].load_or_create_po(
+                    resolved_po_paths[lang], target_lang=lang
+                )
+                po_managers[lang].sync_po(
+                    po_files[lang], blocks, parser.context_id
+                )
+
+            # Per-lang reference pools seeded from the respective PO.
+            pools: Dict[str, ReferencePool] = {}
+            for lang in langs:
+                pool = ReferencePool(max_results=self.max_reference_pairs)
+                pool.seed_from_po(po_files[lang])
+                pools[lang] = pool
+
+            # Union pending entries across langs — a block is "in play"
+            # if any language still needs it.  Entries are matched by
+            # msgctxt so the processor can commit per-lang writes
+            # independently even when langs are at different coverage.
+            pending_by_lang: Dict[str, List[polib.POEntry]] = {}
+            initial_skipped_by_lang: Dict[str, int] = {}
+            for lang in langs:
+                pending_lang, skipped = self._collect_pending_entries(
+                    po_files[lang]
+                )
+                pending_by_lang[lang] = pending_lang
+                initial_skipped_by_lang[lang] = skipped
+
+            pending_ctx_any: set = set()
+            for pl in pending_by_lang.values():
+                pending_ctx_any.update(e.msgctxt for e in pl)
+
+            # Canonical per-lang entry lookup so commit logic below can
+            # address the exact POEntry per (lang, ctx) pair rather than
+            # scanning the whole PO file each time.
+            entry_by_ctx_by_lang: Dict[str, Dict[str, polib.POEntry]] = {}
+            for lang in langs:
+                entry_by_ctx_by_lang[lang] = {
+                    e.msgctxt: e
+                    for e in po_files[lang]
+                    if not e.obsolete and e.msgctxt
+                }
+
+            # Build the ordered "any-lang pending" list in SOURCE
+            # document order.  Walk ``blocks`` (the parser's
+            # source-order view) so a later-Korean-only entry can't
+            # jump ahead of an earlier-Japanese-only entry on
+            # incremental runs.  Sorting by per-lang pending subsets
+            # would break section-aware grouping and reference-pool
+            # seeding whenever the langs' coverage differ.
+            ordered_ctx_seen: set = set()
+            any_pending_ordered: List[polib.POEntry] = []
+            for block in blocks:
+                ctx = parser.context_id(block)
+                if ctx in ordered_ctx_seen:
+                    continue
+                if ctx not in pending_ctx_any:
+                    continue
+                # Pull the canonical POEntry from whichever lang's PO
+                # has it — sync_po typically adds every block to every
+                # lang's PO, but an externally-edited PO could leave a
+                # gap.  Any lang's entry is usable for source-side
+                # decomposition (msgid / msgctxt are shared across
+                # langs).
+                entry: Optional[polib.POEntry] = None
+                for lang in langs:
+                    candidate = entry_by_ctx_by_lang[lang].get(ctx)
+                    if candidate is not None:
+                        entry = candidate
+                        break
+                if entry is None:
+                    continue
+                ordered_ctx_seen.add(ctx)
+                any_pending_ordered.append(entry)
+
+            stats: Dict[str, int] = {
+                "processed": 0,
+                "failed": 0,
+                "skipped": 0,
+                "batched_calls": 0,
+                "per_entry_calls": 0,
+                "validated": 0,
+                "validation_failed": 0,
+            }
+
+            progress_total: int
+            if self.batch_size and self.batch_size > 0:
+                groups = self._section_aware_groups(any_pending_ordered)
+                progress_total = max(1, len(groups))
+            else:
+                groups = [[e] for e in any_pending_ordered]
+                progress_total = max(1, len(groups))
+
+            self._emit_progress(
+                kind="document_start",
+                path=source_path_str,
+                total=progress_total,
+            )
+            document_started = True
+
+            if any_pending_ordered:
+                for i, group in enumerate(groups, start=1):
+                    self._translate_group_multi(
+                        group=group,
+                        langs=langs,
+                        entry_by_ctx_by_lang=entry_by_ctx_by_lang,
+                        pending_by_lang=pending_by_lang,
+                        po_managers=po_managers,
+                        pools=pools,
+                        stats=stats,
+                        usage=usage,
+                    )
+                    self._emit_progress(
+                        kind="document_progress",
+                        path=source_path_str,
+                        index=i,
+                        total=progress_total,
+                    )
+
+            # Per-lang post-processing: rebuild markdown, save PO +
+            # target markdown.  Coverage and per-lang translation_stats
+            # fall out of the per-lang PO so consumers can see exactly
+            # how many blocks each language ended up with.
+            by_lang: Dict[str, ProcessResult] = {}
+            for lang in langs:
+                po_file = po_files[lang]
+                reconstructor = DocumentReconstructor(
+                    skip_types=self.SKIP_TYPES
+                )
+                coverage_dict = reconstructor.get_process_coverage(
+                    blocks, po_file, parser.context_id
+                )
+                processed_content = reconstructor.rebuild_markdown(
+                    source_lines, blocks, po_file, parser.context_id
+                )
+                self._save_processed_document(
+                    processed_content, resolved_target_paths[lang]
+                )
+                po_managers[lang].save_po(po_file, resolved_po_paths[lang])
+                po_saved[lang] = True
+
+                # Per-language slice of the shared stats counters.  The
+                # "per lang" view is important for operators: the shared
+                # stats dict tracks bisection / batched-call counters at
+                # the call level, but processed / failed / validation
+                # and per-entry fallback totals are attributed per lang.
+                # ``batched_calls`` remains the shared total because
+                # each call served every language — splitting it
+                # would misrepresent the billed API-call count.
+                lang_stats = {
+                    "processed": stats.get(f"_lang_processed_{lang}", 0),
+                    "failed": stats.get(f"_lang_failed_{lang}", 0),
+                    "skipped": initial_skipped_by_lang[lang],
+                    "batched_calls": stats.get("batched_calls", 0),
+                    "per_entry_calls": stats.get(
+                        f"_lang_per_entry_calls_{lang}", 0
+                    ),
+                    "validated": stats.get(f"_lang_validated_{lang}", 0),
+                    "validation_failed": stats.get(
+                        f"_lang_validation_failed_{lang}", 0
+                    ),
+                }
+
+                by_lang[lang] = ProcessResult(
+                    source_path=str(source_path),
+                    target_path=str(resolved_target_paths[lang]),
+                    po_path=str(resolved_po_paths[lang]),
+                    blocks_count=len(blocks),
+                    coverage=Coverage(**coverage_dict),
+                    translation_stats=BatchStats(**lang_stats),
+                    receipt=None,
+                )
+
+            receipt = _build_receipt(
+                model=self.model,
+                target_lang=",".join(langs),
+                source_path=str(source_path),
+                target_path=",".join(
+                    str(resolved_target_paths[lang]) for lang in langs
+                ),
+                po_path=",".join(
+                    str(resolved_po_paths[lang]) for lang in langs
+                ),
+                usage=usage,
+                duration_seconds=time.monotonic() - start,
+            )
+
+            return {
+                "source_path": str(source_path),
+                "target_langs": list(langs),
+                "by_lang": by_lang,
+                "receipt": receipt,
+            }
+        except BaseException as exc:
+            if usage.api_calls > 0:
+                partial = _build_receipt(
+                    model=self.model,
+                    target_lang=",".join(langs) if langs else "",
+                    source_path=str(source_path),
+                    target_path=",".join(
+                        str(resolved_target_paths[lang]) for lang in langs
+                    ) if langs else None,
+                    po_path=",".join(
+                        str(resolved_po_paths[lang]) for lang in langs
+                    ) if langs else None,
+                    usage=usage,
+                    duration_seconds=time.monotonic() - start,
+                )
+                try:
+                    exc.partial_receipt = partial  # type: ignore[attr-defined]
+                except (AttributeError, TypeError):
+                    pass
+            # Preserve per-lang translations already written to their PO
+            # entries on failure — unless a save_po itself raised, which
+            # would likely raise again.
+            for lang in langs:
+                pf = po_files.get(lang)
+                if pf is None or po_saved.get(lang):
+                    continue
+                try:
+                    po_managers[lang].save_po(pf, resolved_po_paths[lang])
+                except Exception:
+                    logger.exception(
+                        "PO save failed during multi-target error handling "
+                        "for lang=%s path=%s",
+                        lang,
+                        resolved_po_paths[lang],
+                    )
+            raise
+        finally:
+            if document_started:
+                self._emit_progress(
+                    kind="document_end", path=source_path_str
+                )
+
+    def _translate_group_multi(
+        self,
+        *,
+        group: List[polib.POEntry],
+        langs: List[str],
+        entry_by_ctx_by_lang: Dict[str, Dict[str, polib.POEntry]],
+        pending_by_lang: Dict[str, List[polib.POEntry]],
+        po_managers: Dict[str, POManager],
+        pools: Dict[str, ReferencePool],
+        stats: Dict[str, int],
+        usage: Optional[_UsageAccumulator] = None,
+    ) -> None:
+        """Multi-target counterpart of :meth:`_translate_group`.
+
+        Drives a single LLM call that returns ``{ctx: {lang: translation}}``
+        for every block in ``group``, then fans the returned translations
+        out to each language's PO file.  Blocks missing in the response
+        (or returning incomplete per-lang coverage) fall back to
+        independent single-target :meth:`_call_llm` calls per lang so
+        the caller never ends up with a partial commit.
+        """
+        if not group:
+            return
+
+        pending_ctx_by_lang: Dict[str, set] = {
+            lang: {e.msgctxt for e in pending_by_lang[lang]}
+            for lang in langs
+        }
+
+        # Shared source-side decomposition: encode once per block, same
+        # placeholder mapping for every lang.  Skipped when a ctx is
+        # fully done across all langs (no pending lang needs it).
+        items: Dict[str, str] = {}
+        mappings: Dict[str, Optional[PlaceholderMap]] = {}
+        ctx_entries: Dict[str, polib.POEntry] = {}
+        for e in group:
+            if not any(e.msgctxt in pending_ctx_by_lang[l] for l in langs):
+                continue
+            encoded, mapping = self._encode_source(e.msgid)
+            items[e.msgctxt] = encoded
+            mappings[e.msgctxt] = mapping
+            ctx_entries[e.msgctxt] = e
+
+        if not items:
+            return
+
+        raw_sources = [ctx_entries[c].msgid for c in items]
+
+        # Per-lang reference block composed from each lang's pool.
+        # Merge into a single per-lang section list so the model sees
+        # terminology hints for every target at once without mixing
+        # translations between languages.
+        per_lang_references: Dict[str, Optional[List[tuple]]] = {}
+        for lang in langs:
+            per_lang_references[lang] = self._collect_references(
+                raw_sources, pools[lang]
+            )
+
+        per_lang_glossary_blocks = self._collect_multi_glossary_blocks(
+            raw_sources, langs
+        )
+
+        # ``batch_size=0`` is documented as the per-entry opt-out — a
+        # caller on a provider that misbehaves with JSON-mode batch
+        # calls should be able to get N independent single-target
+        # calls per block without silently going through the batched
+        # wire.  Skip the MultiTargetBatchTranslator entirely in that
+        # case; every entry then drops into the per-lang fallback
+        # below, which mirrors what ``_process_entries_sequential``
+        # does for single-target ``batch_size=0``.
+        if self.batch_size == 0:
+            translated: Dict[str, Dict[str, str]] = {}
+        else:
+            base_caller = self._make_multi_batch_caller(
+                langs=langs,
+                per_lang_references=per_lang_references,
+                per_lang_glossary_blocks=per_lang_glossary_blocks,
+                usage=usage,
+            )
+
+            call_count = 0
+
+            def counting_caller(chunk: Dict[str, str]) -> str:
+                nonlocal call_count
+                call_count += 1
+                return base_caller(chunk)
+
+            translator = MultiTargetBatchTranslator(
+                counting_caller,
+                target_langs=langs,
+                max_entries=self.batch_size,
+                max_chars=self.batch_max_chars,
+            )
+
+            try:
+                translated = translator.translate(items)
+            except Exception as exc:
+                logger.warning(
+                    "Multi-target batch translator crashed: %s; falling back", exc
+                )
+                translated = {}
+            finally:
+                stats["batched_calls"] = stats.get("batched_calls", 0) + call_count
+
+        # Fan-out commit: per-lang PO writes.  A block that came back
+        # with full coverage commits to every pending lang; otherwise
+        # each lang falls back to the single-target per-entry call.
+        for ctx, encoded in items.items():
+            entry_any = ctx_entries[ctx]
+            mapping = mappings.get(ctx)
+            returned = translated.get(ctx)
+            for lang in langs:
+                if ctx not in pending_ctx_by_lang[lang]:
+                    continue
+                entry = entry_by_ctx_by_lang[lang].get(ctx)
+                if entry is None:
+                    # The block is not present in this lang's PO —
+                    # nothing to commit.  This can happen when
+                    # ``sync_po`` drops entries under a rare race, but
+                    # is effectively a no-op here.
+                    continue
+
+                raw: Optional[str] = None
+                if isinstance(returned, dict):
+                    lang_val = returned.get(lang)
+                    if isinstance(lang_val, str):
+                        raw = lang_val
+
+                if raw is None:
+                    # Per-lang fallback: run the single-target per-entry
+                    # call against the same pool the multi-target path
+                    # uses, so reference continuity is preserved.
+                    stats["per_entry_calls"] = stats.get("per_entry_calls", 0) + 1
+                    stats[f"_lang_per_entry_calls_{lang}"] = (
+                        stats.get(f"_lang_per_entry_calls_{lang}", 0) + 1
+                    )
+                    similar = pools[lang].find_similar(entry.msgid)
+                    processed = self._call_lang_single(
+                        entry.msgid,
+                        target_lang=lang,
+                        reference_pairs=similar or None,
+                        usage=usage,
+                    )
+                    if processed is None:
+                        stats["failed"] = stats.get("failed", 0) + 1
+                        stats[f"_lang_failed_{lang}"] = (
+                            stats.get(f"_lang_failed_{lang}", 0) + 1
+                        )
+                        continue
+                    self._commit_multi_entry(
+                        entry=entry,
+                        processed=processed,
+                        lang=lang,
+                        po_manager=po_managers[lang],
+                        pool=pools[lang],
+                        stats=stats,
+                    )
+                    continue
+
+                # Normal path: post_process, round-trip stash for
+                # validation, decode, commit.
+                if self._post_process:
+                    raw = self._post_process(raw)
+                self._tls.last_encoded_response = raw
+                self._tls.last_placeholder_map = mapping
+                processed = self._decode_translation(raw, mapping)
+                self._commit_multi_entry(
+                    entry=entry,
+                    processed=processed,
+                    lang=lang,
+                    po_manager=po_managers[lang],
+                    pool=pools[lang],
+                    stats=stats,
+                )
+
+    def _call_lang_single(
+        self,
+        source_text: str,
+        *,
+        target_lang: str,
+        reference_pairs: Optional[List[tuple]] = None,
+        usage: Optional[_UsageAccumulator] = None,
+    ) -> Optional[str]:
+        """Single-target LLM call used by the multi-target per-lang fallback.
+
+        Mirrors :meth:`_call_llm` but lets the caller override
+        ``target_lang`` without mutating ``self.target_lang`` (which is
+        ignored under :meth:`process_document_multi`).  Returns ``None``
+        on call failure so the caller can count the entry as failed
+        rather than aborting the whole group.
+        """
+        try:
+            encoded_source, mapping = self._encode_source(source_text)
+            if self.mode == "refine":
+                instruction = Prompts.REFINE_INSTRUCTION
+                system_template = Prompts.REFINE_SYSTEM_TEMPLATE
+            else:
+                instruction = Prompts.TRANSLATE_INSTRUCTION
+                system_template = Prompts.TRANSLATE_SYSTEM_TEMPLATE
+            if self._extra_instructions:
+                instruction += "\n" + self._extra_instructions
+            system_content = system_template.format(
+                lang=target_lang,
+                instruction=instruction,
+            )
+            glossary_block = self._format_glossary_for_lang(
+                source_text, target_lang
+            )
+            if glossary_block:
+                system_content += "\n\n" + glossary_block
+            messages: List[Dict[str, Any]] = [
+                self._system_message(system_content)
+            ]
+            if reference_pairs:
+                for ref_src, ref_tgt in reference_pairs:
+                    messages.append({"role": "user", "content": ref_src})
+                    messages.append({"role": "assistant", "content": ref_tgt})
+            messages.append({"role": "user", "content": encoded_source})
+            response = litellm.completion(
+                model=self.model, messages=messages, **self._litellm_kwargs
+            )
+            if usage is not None:
+                usage.record(response)
+            raw = response.choices[0].message.content
+            if self._post_process:
+                raw = self._post_process(raw)
+            self._tls.last_encoded_response = raw
+            self._tls.last_placeholder_map = mapping
+            return self._decode_translation(raw, mapping)
+        except Exception as exc:
+            logger.warning(
+                "Multi-target per-lang fallback failed (lang=%s): %s",
+                target_lang,
+                exc,
+            )
+            return None
+
+    def _commit_multi_entry(
+        self,
+        *,
+        entry: polib.POEntry,
+        processed: str,
+        lang: str,
+        po_manager: POManager,
+        pool: ReferencePool,
+        stats: Dict[str, int],
+    ) -> None:
+        """Validate + commit one (entry, lang) pair for the multi-target path."""
+        if processed.strip() == entry.msgid.strip():
+            block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
+            if block_type != "code":
+                logger.warning(
+                    "LLM returned untranslated output for entry %s (lang=%s)",
+                    entry.msgctxt,
+                    lang,
+                )
+
+        # Temporarily override target_lang AND the locale-resolved
+        # glossary for validation so the target-language-presence check
+        # and glossary-preservation check both report against this
+        # call's target locale — not the processor constructor's
+        # ``target_lang``.  Without the glossary swap a ja/zh commit is
+        # measured against ko's glossary mapping, so a correct ja
+        # translation can be flagged fuzzy (missing glossary term) or a
+        # forbidden-term leak can slip through unnoticed.
+        original_target = self.target_lang
+        original_glossary = self._glossary
+        self.target_lang = lang
+        self._glossary = self._resolve_glossary_for_lang(lang)
+        try:
+            ok = self._apply_validation(entry, processed, False, pool, stats)
+        finally:
+            self.target_lang = original_target
+            self._glossary = original_glossary
+
+        if not ok:
+            stats["failed"] = stats.get("failed", 0) + 1
+            stats[f"_lang_failed_{lang}"] = (
+                stats.get(f"_lang_failed_{lang}", 0) + 1
+            )
+            if self.validation != "off":
+                stats[f"_lang_validation_failed_{lang}"] = (
+                    stats.get(f"_lang_validation_failed_{lang}", 0) + 1
+                )
+            return
+
+        source_msgid = entry.msgid
+        entry.msgstr = processed
+        po_manager.mark_entry_processed(entry)
+        stats["processed"] = stats.get("processed", 0) + 1
+        stats[f"_lang_processed_{lang}"] = (
+            stats.get(f"_lang_processed_{lang}", 0) + 1
+        )
+        if self.validation != "off":
+            stats[f"_lang_validated_{lang}"] = (
+                stats.get(f"_lang_validated_{lang}", 0) + 1
+            )
+        pool.add(source_msgid, processed)
+
+    def _collect_multi_glossary_blocks(
+        self, sources: List[str], langs: List[str]
+    ) -> Dict[str, Optional[str]]:
+        """Union glossary terms matched anywhere in the batch, resolved per lang.
+
+        Each returned block is already locale-specific: entries from a
+        ``glossary_path`` with per-locale dicts get the right
+        target-language form for ``lang`` instead of reusing
+        ``self.target_lang``'s resolution.  Returns ``{lang: block_or_None}``.
+        """
+        if not self._glossary_inline and self._glossary_file is None:
+            return {lang: None for lang in langs}
+        joined = "\n".join(sources)
+        return {
+            lang: self._format_glossary_for_lang(joined, lang)
+            for lang in langs
+        }
+
+    def _build_multi_batch_messages(
+        self,
+        items: Dict[str, str],
+        *,
+        langs: List[str],
+        per_lang_references: Dict[str, Optional[List[tuple]]],
+        per_lang_glossary_blocks: Optional[Dict[str, Optional[str]]] = None,
+    ) -> List[Dict[str, Any]]:
+        langs_str = ", ".join(langs)
+        instruction = Prompts.BATCH_MULTI_TRANSLATE_INSTRUCTION.format(
+            langs=langs_str
+        )
+        if self._extra_instructions:
+            instruction += "\n" + self._extra_instructions
+        system_content = Prompts.BATCH_MULTI_TRANSLATE_SYSTEM_TEMPLATE.format(
+            langs=langs_str,
+            instruction=instruction,
+        )
+        if per_lang_glossary_blocks:
+            for lang in langs:
+                block = per_lang_glossary_blocks.get(lang)
+                if not block:
+                    continue
+                # Label each glossary block with its locale so the LLM
+                # can apply the right mapping when producing that
+                # language's value — a single pooled block would let a
+                # Korean term's replacement leak into the Japanese
+                # output, which is exactly the wrong-terminology path
+                # this split was introduced to prevent.
+                system_content += f"\n\nGlossary ({lang}):\n" + block
+
+        for lang in langs:
+            refs = per_lang_references.get(lang)
+            if not refs:
+                continue
+            ref_lines = [
+                f"Reference translations for {lang} (maintain this tone and terminology):",
+            ]
+            for src, tgt in refs:
+                ref_lines.append(f"- SRC: {src}\n  TGT: {tgt}")
+            system_content += "\n\n" + "\n".join(ref_lines)
+
+        user_payload = json.dumps(items, ensure_ascii=False)
+        return [
+            self._system_message(system_content),
+            {"role": "user", "content": user_payload},
+        ]
+
+    def _make_multi_batch_caller(
+        self,
+        *,
+        langs: List[str],
+        per_lang_references: Dict[str, Optional[List[tuple]]],
+        per_lang_glossary_blocks: Optional[Dict[str, Optional[str]]] = None,
+        usage: Optional[_UsageAccumulator] = None,
+    ) -> Callable[[Dict[str, str]], str]:
+        def _call(items: Dict[str, str]) -> str:
+            messages = self._build_multi_batch_messages(
+                items,
+                langs=langs,
+                per_lang_references=per_lang_references,
+                per_lang_glossary_blocks=per_lang_glossary_blocks,
+            )
+            call_kwargs = dict(self._litellm_kwargs)
+            if self._supports_json_mode():
+                call_kwargs.setdefault(
+                    "response_format", {"type": "json_object"}
+                )
+            response = litellm.completion(
+                model=self.model, messages=messages, **call_kwargs
+            )
+            if usage is not None:
+                usage.record(response)
+            return response.choices[0].message.content
+
+        return _call
 
     def _collect_references(
         self, sources, pool: ReferencePool

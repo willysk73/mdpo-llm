@@ -309,6 +309,83 @@ processor.process_document(
 )
 ```
 
+## Multi-target translation in a single call (experimental)
+
+`process_document_multi` translates one Markdown source into several
+languages in a single batched LLM call per source group. Source-side
+decomposition — placeholder substitution, reference lookup, glossary
+matching — runs ONCE per block regardless of the number of target
+languages, so the input-token bill is amortised across every target
+while only output tokens grow with `len(target_langs)`.
+
+```python
+from pathlib import Path
+from mdpo_llm import MdpoLLM
+
+processor = MdpoLLM(
+    model="gpt-4o",
+    target_lang="ko",   # ignored by process_document_multi; constructor-required
+    batch_size=40,
+)
+
+result = processor.process_document_multi(
+    source_path=Path("docs/README.md"),
+    target_langs=["ko", "ja", "zh-CN"],
+    target_paths={
+        "ko": Path("docs/ko/README.md"),
+        "ja": Path("docs/ja/README.md"),
+        "zh-CN": Path("docs/zh-CN/README.md"),
+    },
+    # po_paths defaults to each target with a .po suffix
+)
+print(result["receipt"].render())
+for lang, pr in result["by_lang"].items():
+    print(lang, pr["translation_stats"]["processed"])
+```
+
+From the CLI:
+
+```bash
+mdpo-llm translate-multi docs/README.md \
+    --target-template "docs/{lang}/README.md" \
+    --langs ko,ja,zh-CN \
+    --model gpt-4o
+```
+
+Contract:
+
+- Each target language has its OWN PO file and OWN reference pool —
+  translations do not cross languages. The pool is seeded per-lang
+  from the respective PO on load.
+- Per-language distinctness is enforced: `target_paths` / `po_paths`
+  must resolve to distinct paths per lang, and neither may alias the
+  source path. Colliding paths fail up front with a `ValueError` so
+  automation gets a clean usage error rather than a mid-run clobber.
+- `mode="refine"` is rejected — refine is same-language by contract
+  and multi-target only makes sense for translate.
+- `inplace=True` is NOT supported: overwriting one source msgid with
+  N different-language translations is undefined.
+- Partial per-lang coverage in the model's response is tolerated.
+  Any languages that came back with well-typed strings commit
+  directly; missing langs per block fall back to a single-target
+  per-entry call so the PO is never left half-populated.
+- A single `Receipt` is returned at the top level; each per-lang
+  `ProcessResult` has `receipt=None` because tokens are billed ONCE
+  across the whole run. `receipt.target_lang` is a comma-joined list
+  for operator auditability.
+
+### Canonical-seeded alternative
+
+Before adopting multi-target for consistency, consider the cheaper
+"canonical-seeded" baseline: run single-target `translate` for one
+"anchor" language first, then run `translate` for each other language
+independently. Consistency comes from each run's own reference pool
+seeded from its PO file (which accumulates across re-runs), not from
+cross-language sharing. Compare the two approaches' `Receipt` totals
+and PO contents on a representative document to decide which is worth
+shipping on your workload — the machinery for both ships in the same
+release, and no live benchmarks are required for correctness.
+
 ### Batch concurrency (experimental)
 
 `batch_concurrency=N` / `--batch-concurrency N` lets multiple batches
