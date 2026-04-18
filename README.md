@@ -309,6 +309,41 @@ processor.process_document(
 )
 ```
 
+### Batch concurrency (experimental)
+
+`batch_concurrency=N` / `--batch-concurrency N` lets multiple batches
+from the same file fly in parallel once the first batch has seeded the
+reference pool. Off by default — keep it at `1` for deterministic
+v0.4 behaviour. The first section-aware group always runs sequentially
+so subsequent workers inherit a warm pool; the remaining groups are
+submitted to a thread pool of size `N`.
+
+```bash
+mdpo-llm translate docs/README.md docs/README_ko.md \
+    --model gpt-4 --target ko --batch-concurrency 4
+```
+
+```python
+processor = MdpoLLM(
+    model="gpt-4",
+    target_lang="ko",
+    batch_concurrency=4,  # up to 4 batches in flight after the seed batch
+)
+```
+
+Caveats:
+- Experimental. Compare against `--batch-concurrency 1` using the
+  per-run receipt before adopting a higher value — real speed-up depends
+  on your provider's rate limits, latency, and token budget.
+- Ignored on the sequential path (`--batch-size 0`) and on any document
+  that partitions into a single section-aware group.
+- Tokens and stats are merged across workers into the same `Receipt` /
+  `BatchStats`; the user-visible output is identical to the sequential
+  path.
+- Progress callbacks are emitted from worker threads — the contract
+  already documented for `process_directory` now applies to batched
+  single-file runs when concurrency > 1.
+
 ### `inplace=True` is deprecated
 
 Passing `inplace=True` emits a `DeprecationWarning` pointing at refine
@@ -347,6 +382,7 @@ MdpoLLM(
     glossary_path=None,        # path to JSON glossary file (multi-locale)
     progress_callback=None,    # Callable[[ProgressEvent], None] — see "Progress hook"
     mode="translate",          # "translate" (cross-language) or "refine" (same-language polish)
+    batch_concurrency=1,       # experimental: intra-file parallel batches (see "Batch concurrency")
     **litellm_kwargs,          # temperature, api_key, api_base, etc.
 )
 ```

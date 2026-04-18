@@ -1814,6 +1814,637 @@ class TestInplaceDeprecation:
         )
 
 
+class TestBatchConcurrency:
+    """T-8: experimental intra-file batch concurrency.
+
+    The parallel path kicks in only when ``batch_concurrency > 1`` AND
+    the document partitions into more than one section-aware group.
+    The first group runs on the calling thread so the reference pool
+    is warm before any worker thread reads from it; remaining groups
+    are submitted to a thread pool.
+    """
+
+    @staticmethod
+    def _concurrency_mock(mock_completion, delay: float = 0.02):
+        """Wrap ``mock_completion`` so it records concurrency + ordering.
+
+        Returns ``state`` dict with ``entries`` (active-count observed at
+        call entry, in call-arrival order) and ``max_active`` (max
+        simultaneous in-flight calls across the whole run).
+        """
+        import json as _json
+        import threading as _threading
+        import time as _time
+        from unittest.mock import MagicMock as _MagicMock
+
+        state = {"active": 0, "max_active": 0, "entries": []}
+        lock = _threading.Lock()
+
+        def _side_effect(*args, **kwargs):
+            with lock:
+                state["active"] += 1
+                state["entries"].append(state["active"])
+                if state["active"] > state["max_active"]:
+                    state["max_active"] = state["active"]
+            try:
+                if delay > 0:
+                    _time.sleep(delay)
+                messages = kwargs.get("messages", args[0] if args else [])
+                user_content = ""
+                for msg in reversed(messages):
+                    if msg["role"] == "user":
+                        user_content = msg["content"]
+                        break
+                parsed = None
+                if isinstance(user_content, str) and user_content.strip().startswith("{"):
+                    try:
+                        parsed = _json.loads(user_content)
+                    except _json.JSONDecodeError:
+                        parsed = None
+                response = _MagicMock()
+                if isinstance(parsed, dict):
+                    translated = {
+                        k: f"[TRANSLATED] {v}" for k, v in parsed.items()
+                    }
+                    response.choices[0].message.content = _json.dumps(
+                        translated, ensure_ascii=False
+                    )
+                else:
+                    response.choices[0].message.content = (
+                        f"[TRANSLATED] {user_content}"
+                    )
+                return response
+            finally:
+                with lock:
+                    state["active"] -= 1
+
+        mock_completion.completion.side_effect = _side_effect
+        return state
+
+    @staticmethod
+    def _multi_group_source(tmp_path):
+        """Produce a source document that partitions into at least 3 groups.
+
+        Section-aware grouping splits on top-level path boundaries once
+        the current group hits ``batch_size // 2`` entries, so a small
+        ``batch_size`` plus multiple independent sections reliably makes
+        the partitioner emit several groups.
+        """
+        md_sections = []
+        for sec in ("alpha", "beta", "gamma"):
+            md_sections.append(f"# {sec.capitalize()}\n")
+            for i in range(3):
+                md_sections.append(f"{sec} paragraph {i}.\n")
+        md = "\n".join(md_sections) + "\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        return source
+
+    def test_default_concurrency_is_one(self, tmp_path, mock_completion):
+        """Default kwarg leaves processor deterministic (no threads)."""
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        assert p.batch_concurrency == 1
+
+    def test_non_positive_concurrency_clamped(self, tmp_path, mock_completion):
+        """0 / negative / non-int kwargs degrade to the safe path (1)."""
+        for bad in (0, -4, "nope", None):
+            p = MarkdownProcessor(
+                model="test-model",
+                target_lang="ko",
+                batch_size=40,
+                batch_concurrency=bad,
+            )
+            assert p.batch_concurrency == 1, bad
+
+    def test_parallel_path_not_taken_when_disabled(
+        self, tmp_path, mock_completion, monkeypatch
+    ):
+        """``batch_concurrency=1`` must NOT spin up a ThreadPoolExecutor.
+
+        Patch the import that ``_run_groups_concurrent`` relies on so a
+        regression that routed the default path through the concurrent
+        helper would fail loudly.
+        """
+        import concurrent.futures as _cf
+
+        calls = {"n": 0}
+        original_cls = _cf.ThreadPoolExecutor
+
+        class _TrackedExecutor(original_cls):
+            def __init__(self, *a, **kw):
+                calls["n"] += 1
+                super().__init__(*a, **kw)
+
+        monkeypatch.setattr(_cf, "ThreadPoolExecutor", _TrackedExecutor)
+
+        source = self._multi_group_source(tmp_path)
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=3,
+            batch_concurrency=1,
+        )
+        p.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+        assert calls["n"] == 0
+
+    def test_parallel_path_processes_all_entries(
+        self, tmp_path, mock_completion
+    ):
+        """Every entry lands in the PO with the translated sentinel."""
+        self._concurrency_mock(mock_completion, delay=0.01)
+        source = self._multi_group_source(tmp_path)
+        po_path = tmp_path / "m.po"
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=3,
+            batch_concurrency=3,
+        )
+        result = p.process_document(
+            source, tmp_path / "target.md", po_path
+        )
+        stats = result.translation_stats
+        assert stats.failed == 0
+        assert stats.processed >= 9  # 3 sections x 3 paragraphs at minimum
+        rebuilt = (tmp_path / "target.md").read_text(encoding="utf-8")
+        assert "[TRANSLATED]" in rebuilt
+
+    def test_seed_batch_runs_alone_before_parallel(
+        self, tmp_path, mock_completion
+    ):
+        """First LLM call must finish before any worker starts.
+
+        Without the explicit seed step, workers would race on an empty
+        pool and ``batch_concurrency`` would deliver no consistency
+        benefit over plain per-entry parallelism. Verify the invariant
+        by checking the active-count recorded at each call's entry.
+        """
+        state = self._concurrency_mock(mock_completion, delay=0.03)
+        source = self._multi_group_source(tmp_path)
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=3,
+            batch_concurrency=3,
+        )
+        p.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+
+        assert state["entries"], "expected at least one LLM call"
+        # Seed call is alone at entry.
+        assert state["entries"][0] == 1, (
+            f"seed batch must start alone; saw {state['entries'][0]} "
+            f"active (full trace: {state['entries']})"
+        )
+        # At least one subsequent call overlapped with another — i.e.
+        # the parallel fanout actually happened, not all calls were
+        # accidentally serialised.
+        assert state["max_active"] >= 2, (
+            f"batch_concurrency=3 should have produced overlapping "
+            f"calls; saw max_active={state['max_active']}"
+        )
+        # But never more than concurrency (== 3).
+        assert state["max_active"] <= 3
+
+    def test_parallel_path_aggregates_stats(
+        self, tmp_path, mock_completion
+    ):
+        """``batched_calls`` reflects real API calls across workers."""
+        self._concurrency_mock(mock_completion, delay=0.0)
+        source = self._multi_group_source(tmp_path)
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=3,
+            batch_concurrency=2,
+        )
+        result = p.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        # Every API call should be counted in the aggregated stats,
+        # regardless of which worker thread made it.
+        assert (
+            result.translation_stats.batched_calls
+            == mock_completion.completion.call_count
+        )
+        assert result.translation_stats.batched_calls >= 2
+
+    def test_parallel_path_aggregates_receipt_tokens(
+        self, tmp_path, mock_completion
+    ):
+        """Worker-local usage accumulators merge into the shared receipt."""
+        # Give the mock responses fake usage so the accumulator sees
+        # non-zero counts to sum; without this the usage test is
+        # vacuous (the default MagicMock usage attr is non-numeric).
+        import json as _json
+        from unittest.mock import MagicMock as _MagicMock
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            parsed = None
+            if isinstance(user_content, str) and user_content.strip().startswith("{"):
+                try:
+                    parsed = _json.loads(user_content)
+                except _json.JSONDecodeError:
+                    parsed = None
+            response = _MagicMock()
+            if isinstance(parsed, dict):
+                translated = {
+                    k: f"[TRANSLATED] {v}" for k, v in parsed.items()
+                }
+                response.choices[0].message.content = _json.dumps(
+                    translated, ensure_ascii=False
+                )
+            else:
+                response.choices[0].message.content = (
+                    f"[TRANSLATED] {user_content}"
+                )
+            response.usage.prompt_tokens = 17
+            response.usage.completion_tokens = 5
+            return response
+
+        mock_completion.completion.side_effect = _side_effect
+        source = self._multi_group_source(tmp_path)
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=3,
+            batch_concurrency=3,
+        )
+        result = p.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        calls = mock_completion.completion.call_count
+        receipt = result.receipt
+        assert receipt.api_calls == calls
+        assert receipt.input_tokens == 17 * calls
+        assert receipt.output_tokens == 5 * calls
+
+    def test_progress_indices_reflect_completion_order(
+        self, tmp_path, mock_completion
+    ):
+        """``document_progress.index`` must increase monotonically.
+
+        With ``as_completed``, workers release in finishing order — if
+        we emitted the source-order group ID here, a UI bar that reads
+        ``index / total`` as "fraction done" would jump around
+        (1, 4, 2, 3). Pin the contract: progress indices form a
+        strictly-increasing sequence from 1 up to ``total``.
+        """
+        # Delay the first worker's response so later workers finish
+        # first — making completion order deliberately differ from
+        # source order.
+        import json as _json
+        import threading as _threading
+        import time as _time
+        from unittest.mock import MagicMock as _MagicMock
+
+        call_counter = {"n": 0}
+        counter_lock = _threading.Lock()
+        seen_first = _threading.Event()
+        block_first = _threading.Event()
+
+        def _side_effect(*args, **kwargs):
+            # Share one lock across every invocation — ``_threading.Lock()``
+            # inside the body would build a fresh lock per call and leave
+            # ``call_counter["n"] += 1`` unsynchronized, making the
+            # is_second / is_last branch selection flaky under
+            # concurrent dispatch.
+            with counter_lock:
+                call_counter["n"] += 1
+                is_second = call_counter["n"] == 2
+                is_last = call_counter["n"] >= 4  # tail calls unblock
+            if is_second:
+                seen_first.set()
+                # Second worker to arrive stalls so a later one passes it.
+                block_first.wait(timeout=2.0)
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            parsed = None
+            if isinstance(user_content, str) and user_content.strip().startswith("{"):
+                try:
+                    parsed = _json.loads(user_content)
+                except _json.JSONDecodeError:
+                    parsed = None
+            response = _MagicMock()
+            if isinstance(parsed, dict):
+                translated = {
+                    k: f"[TRANSLATED] {v}" for k, v in parsed.items()
+                }
+                response.choices[0].message.content = _json.dumps(
+                    translated, ensure_ascii=False
+                )
+            else:
+                response.choices[0].message.content = (
+                    f"[TRANSLATED] {user_content}"
+                )
+            if is_last:
+                # Last tail call arrives — release the stalled second
+                # call so the run can finish; by then the later groups
+                # have completed out of source order.
+                block_first.set()
+            return response
+
+        mock_completion.completion.side_effect = _side_effect
+
+        events = []
+        source = self._multi_group_source(tmp_path)
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=3,
+            batch_concurrency=3,
+            progress_callback=events.append,
+        )
+        try:
+            p.process_document(
+                source, tmp_path / "target.md", tmp_path / "m.po"
+            )
+        finally:
+            block_first.set()  # defensive unblock in case assertion fails
+
+        ticks = [e for e in events if e.kind == "document_progress"]
+        assert ticks, "expected document_progress events"
+        indices = [e.index for e in ticks]
+        total = ticks[0].total
+        # Monotonically increasing, covers 1..total exactly once.
+        assert indices == sorted(indices), (
+            f"progress indices must not regress; got {indices}"
+        )
+        assert indices == list(range(1, total + 1)), (
+            f"progress indices must form 1..{total}; got {indices}"
+        )
+
+    def test_worker_failure_preserves_billed_usage(
+        self, tmp_path, mock_completion
+    ):
+        """Late worker exception must still contribute billed tokens.
+
+        ``_translate_group`` may raise AFTER issuing an LLM call — for
+        example from a user-supplied ``post_process`` hook that
+        crashes mid-group. The partial-receipt contract promises
+        operators that a failed run still surfaces the real token
+        cost; losing a worker's ``local_usage`` on exception would
+        silently under-report.
+        """
+        import json as _json
+        import threading as _threading
+        from unittest.mock import MagicMock as _MagicMock
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            parsed = None
+            if isinstance(user_content, str) and user_content.strip().startswith("{"):
+                try:
+                    parsed = _json.loads(user_content)
+                except _json.JSONDecodeError:
+                    parsed = None
+            response = _MagicMock()
+            if isinstance(parsed, dict):
+                translated = {
+                    k: f"[TRANSLATED] {v}" for k, v in parsed.items()
+                }
+                response.choices[0].message.content = _json.dumps(
+                    translated, ensure_ascii=False
+                )
+            else:
+                response.choices[0].message.content = (
+                    f"[TRANSLATED] {user_content}"
+                )
+            response.usage.prompt_tokens = 11
+            response.usage.completion_tokens = 3
+            return response
+
+        mock_completion.completion.side_effect = _side_effect
+
+        # Fail in ``post_process`` after enough calls to guarantee a
+        # worker thread (not the seed thread) reaches the failure — the
+        # seed batch accounts for the first N entries, so a threshold
+        # safely beyond that lands in a parallel worker that has
+        # already billed its own LLM call.  Use a lock so the counter
+        # read-modify-write is race-free across workers.
+        post_lock = _threading.Lock()
+        post_calls = {"n": 0}
+
+        def _fail_post(text: str) -> str:
+            with post_lock:
+                post_calls["n"] += 1
+                n = post_calls["n"]
+            if n >= 5:
+                raise RuntimeError("simulated late post-LLM failure")
+            return text
+
+        source = self._multi_group_source(tmp_path)
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=3,
+            batch_concurrency=3,
+            post_process=_fail_post,
+        )
+
+        captured_exc: list = []
+        try:
+            p.process_document(
+                source, tmp_path / "target.md", tmp_path / "m.po"
+            )
+        except RuntimeError as exc:
+            captured_exc.append(exc)
+
+        assert captured_exc, "expected the worker failure to propagate"
+        exc = captured_exc[0]
+        partial = getattr(exc, "partial_receipt", None)
+        assert partial is not None, (
+            "process_document must annotate the exception with "
+            "partial_receipt when LLM calls were billed"
+        )
+        # Every completed LLM call contributed 11 + 3 tokens under
+        # the mock above; the receipt must reflect all of them,
+        # including those billed by the worker that eventually raised.
+        billed_calls = mock_completion.completion.call_count
+        assert billed_calls >= 2, (
+            f"expected at least 2 billed calls (seed + worker); "
+            f"got {billed_calls}"
+        )
+        assert partial.api_calls == billed_calls
+        assert partial.input_tokens == 11 * billed_calls
+        assert partial.output_tokens == 3 * billed_calls
+
+    def test_worker_failure_cancels_queued_batches(
+        self, tmp_path, mock_completion
+    ):
+        """First worker failure must cancel queued batches.
+
+        Without the cancel, ``ThreadPoolExecutor.__exit__`` drains the
+        queue via ``shutdown(wait=True)`` — every queued batch fires
+        its own LLM call and over-bills the user on exactly the
+        partial-failure path the receipt is meant to surface honestly.
+        Already-running batches cannot be interrupted (the mock's
+        non-first-worker calls still complete), but queued ones that
+        haven't been picked up yet MUST be stopped.
+        """
+        import json as _json
+        import threading as _threading
+        from unittest.mock import MagicMock as _MagicMock
+
+        call_count = {"n": 0}
+        lock = _threading.Lock()
+        first_arrived = _threading.Event()
+        release_after_failure = _threading.Event()
+
+        def _side_effect(*args, **kwargs):
+            with lock:
+                call_count["n"] += 1
+                n = call_count["n"]
+            if n == 1:
+                # Seed batch completes immediately so parallel workers
+                # can start.
+                pass
+            elif n == 2:
+                # First parallel worker raises post-call to trigger the
+                # cancellation path.  Signal so the test knows the
+                # failure has propagated, then release the gate once
+                # the executor has had a chance to cancel queued work.
+                first_arrived.set()
+            else:
+                # Any later call would prove the queue was NOT
+                # cancelled — wait on the release gate so we can
+                # observe whether they get scheduled at all.  Bound
+                # the wait so the test can never hang.
+                release_after_failure.wait(timeout=1.0)
+
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            parsed = None
+            if isinstance(user_content, str) and user_content.strip().startswith("{"):
+                try:
+                    parsed = _json.loads(user_content)
+                except _json.JSONDecodeError:
+                    parsed = None
+            response = _MagicMock()
+            if isinstance(parsed, dict):
+                translated = {
+                    k: f"[TRANSLATED] {v}" for k, v in parsed.items()
+                }
+                response.choices[0].message.content = _json.dumps(
+                    translated, ensure_ascii=False
+                )
+            else:
+                response.choices[0].message.content = (
+                    f"[TRANSLATED] {user_content}"
+                )
+            response.usage.prompt_tokens = 7
+            response.usage.completion_tokens = 2
+            return response
+
+        mock_completion.completion.side_effect = _side_effect
+
+        # Raise from ``post_process`` on the *second* LLM response —
+        # the first parallel worker's batch.  This is deterministic
+        # across thread scheduling because post_process fires once
+        # per returned entry in the batch, so the raise lands inside
+        # a worker regardless of which worker received call #2.
+        post_calls = {"n": 0}
+        post_lock = _threading.Lock()
+
+        def _fail_post(text: str) -> str:
+            with post_lock:
+                post_calls["n"] += 1
+                n = post_calls["n"]
+            # Let the seed batch (first 3 entries) succeed so parallel
+            # workers actually launch; then raise inside the first
+            # parallel worker.
+            if n >= 4:
+                raise RuntimeError("simulated worker failure")
+            return text
+
+        # Use batch_concurrency=1 with multiple groups? No — we need
+        # concurrency > 1 to exercise the cancel path.  Use
+        # concurrency=2 so only ONE parallel worker can start at once;
+        # that worker fails; the single remaining queued group MUST be
+        # cancelled rather than started.
+        source = self._multi_group_source(tmp_path)
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=3,
+            batch_concurrency=2,
+            post_process=_fail_post,
+        )
+
+        try:
+            try:
+                p.process_document(
+                    source, tmp_path / "target.md", tmp_path / "m.po"
+                )
+            except RuntimeError:
+                pass
+        finally:
+            # Always release the gate so any accidentally-scheduled
+            # call can drain; without this a test failure would hang
+            # the executor at shutdown.
+            release_after_failure.set()
+
+        # With 4 groups (alpha/beta/gamma × 3 entries at batch_size=3),
+        # the seed runs 1 call. concurrency=2 means at most 2 parallel
+        # workers can run at once. The first parallel worker fails on
+        # its post_process; the remaining two groups MUST be
+        # cancelled.  Upper bound: 1 seed + 2 concurrent workers that
+        # already started before the failure = 3 calls. A 4th call
+        # indicates the queue was drained instead of cancelled.
+        assert mock_completion.completion.call_count <= 3, (
+            f"queued batches were not cancelled after worker failure; "
+            f"saw {mock_completion.completion.call_count} LLM calls "
+            f"(expected <= 3 with concurrency=2)"
+        )
+
+    def test_single_group_falls_through_to_sequential(
+        self, tmp_path, mock_completion, monkeypatch
+    ):
+        """No thread pool when the document fits in one section group."""
+        import concurrent.futures as _cf
+
+        calls = {"n": 0}
+        original_cls = _cf.ThreadPoolExecutor
+
+        class _TrackedExecutor(original_cls):
+            def __init__(self, *a, **kw):
+                calls["n"] += 1
+                super().__init__(*a, **kw)
+
+        monkeypatch.setattr(_cf, "ThreadPoolExecutor", _TrackedExecutor)
+        md = "# T\n\nOnly one paragraph.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            batch_concurrency=4,
+        )
+        p.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+        assert calls["n"] == 0
+
+
 class TestEstimate:
     def test_estimate_returns_expected_keys(self, tmp_path, mock_completion):
         md = "# T\n\nPara one.\n\nPara two.\n"

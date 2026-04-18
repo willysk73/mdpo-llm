@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import warnings
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
@@ -199,6 +200,7 @@ class MarkdownProcessor:
         glossary_path: Path | str | None = None,
         batch_size: int = 40,
         batch_max_chars: int = 8000,
+        batch_concurrency: int = 1,
         validation: ValidationMode = "off",
         enable_prompt_cache: bool = False,
         progress_callback: Optional[ProgressCallback] = None,
@@ -227,6 +229,17 @@ class MarkdownProcessor:
             batch_size: Max entries per batched LLM call.  ``0`` disables
                 batching entirely and restores the v0.2 per-entry path.
             batch_max_chars: Soft cap on total source characters per batch.
+            batch_concurrency: EXPERIMENTAL. When ``> 1``, batches within a
+                single document may fly in parallel after the first batch
+                has seeded the reference pool.  The first section-aware
+                group is always processed sequentially so subsequent
+                groups inherit at least one fresh few-shot pair for
+                terminology / tone; the remaining groups are submitted to
+                a thread pool of size ``batch_concurrency``.  Defaults to
+                ``1`` (no intra-file concurrency), which preserves v0.4
+                determinism.  Ignored on the sequential path
+                (``batch_size == 0``) and when a document partitions into
+                a single group (nothing to parallelise after seeding).
             validation: Post-translation validation mode.  ``"off"`` (default),
                 ``"conservative"`` (structural checks), or ``"strict"`` (adds
                 inline-code count check).  Failing entries are marked fuzzy.
@@ -292,6 +305,14 @@ class MarkdownProcessor:
         self._glossary = self._resolve_glossary(glossary, glossary_path)
         self.batch_size = batch_size
         self.batch_max_chars = batch_max_chars
+        try:
+            concurrency_value = int(batch_concurrency)
+        except (TypeError, ValueError):
+            concurrency_value = 1
+        # Clamp non-positive values to ``1`` so a 0/negative kwarg
+        # degrades to the safe sequential path instead of raising deep
+        # inside the thread pool.
+        self.batch_concurrency = max(1, concurrency_value)
         self.validation: ValidationMode = validation
         self.enable_prompt_cache = enable_prompt_cache
         self._progress_callback = progress_callback
@@ -443,6 +464,7 @@ class MarkdownProcessor:
             glossary=None,
             batch_size=self.batch_size,
             batch_max_chars=self.batch_max_chars,
+            batch_concurrency=self.batch_concurrency,
             validation=self.validation,
             enable_prompt_cache=self.enable_prompt_cache,
             progress_callback=None,
@@ -1741,18 +1763,215 @@ class MarkdownProcessor:
 
         groups = self._section_aware_groups(pending)
         total = len(groups)
-        for i, group in enumerate(groups, start=1):
-            self._translate_group(
-                group, po_manager, pool, stats, inplace=inplace, usage=usage
-            )
-            self._emit_progress(
-                kind="document_progress",
-                path=source_path,
-                index=i,
-                total=total,
-            )
 
+        concurrency = max(1, int(self.batch_concurrency or 1))
+        # Intra-file concurrency is experimental and only kicks in when it
+        # can actually amortise: ``concurrency == 1`` is the deterministic
+        # v0.4 path, and a single group has nothing to parallelise after
+        # the seed batch. Fall through to the plain sequential loop for
+        # both cases so that opt-in callers don't pay ThreadPoolExecutor
+        # setup cost on documents that don't benefit.
+        if concurrency <= 1 or total <= 1:
+            for i, group in enumerate(groups, start=1):
+                self._translate_group(
+                    group, po_manager, pool, stats, inplace=inplace, usage=usage
+                )
+                self._emit_progress(
+                    kind="document_progress",
+                    path=source_path,
+                    index=i,
+                    total=total,
+                )
+            return stats
+
+        self._run_groups_concurrent(
+            groups,
+            po_manager=po_manager,
+            pool=pool,
+            stats=stats,
+            inplace=inplace,
+            usage=usage,
+            source_path=source_path,
+            total=total,
+            concurrency=concurrency,
+        )
         return stats
+
+    def _run_groups_concurrent(
+        self,
+        groups: List[List[polib.POEntry]],
+        *,
+        po_manager: POManager,
+        pool: ReferencePool,
+        stats: Dict[str, int],
+        inplace: bool,
+        usage: Optional[_UsageAccumulator],
+        source_path: Optional[str],
+        total: int,
+        concurrency: int,
+    ) -> None:
+        """Run batches in parallel after one seed batch populates the pool.
+
+        The first group is processed synchronously so its translations
+        land in ``pool`` before any worker thread calls ``find_similar``.
+        Without that seed step, a cold-start document with no prior PO
+        would hand every worker an empty pool and defeat the whole point
+        of intra-file batching (consistent terminology via few-shot).
+        The remaining groups are submitted to a ``ThreadPoolExecutor`` of
+        width ``concurrency``. Each worker accumulates into a LOCAL stats
+        dict and usage accumulator; shared state (``stats``, ``usage``,
+        and the reference ``pool``) is guarded by a single lock so the
+        hot path — the LLM call inside ``BatchTranslator`` — stays
+        lock-free. Progress events are emitted as futures complete; the
+        ``index`` field therefore reflects completion order rather than
+        source order, matching the behaviour already documented for
+        ``process_directory`` (events emitted from worker threads).
+        """
+        import concurrent.futures
+
+        # Seed: first group runs on the calling thread so its
+        # translations populate ``pool`` before any worker thread calls
+        # ``pool.find_similar``. Without this the first N workers would
+        # race on an empty pool and lose the few-shot benefit the batch
+        # path exists to provide.
+        self._translate_group(
+            groups[0], po_manager, pool, stats, inplace=inplace, usage=usage
+        )
+        self._emit_progress(
+            kind="document_progress",
+            path=source_path,
+            index=1,
+            total=total,
+        )
+
+        remaining = groups[1:]
+        if not remaining:
+            return
+
+        shared_lock = threading.Lock()
+        # Signal used by workers to bail out fast once a peer fails.
+        # ``future.cancel()`` alone is racy: a thread may pick up the
+        # next queued future in the tiny window between one worker's
+        # exception and the main thread's ``as_completed`` response,
+        # so the drained future still fires its LLM call and over-
+        # bills the user.  Checking the event at worker entry turns
+        # that window into a cheap no-op return.
+        abort_event = threading.Event()
+
+        def _merge_usage(local_usage: _UsageAccumulator) -> None:
+            """Fold a worker's billed tokens into the shared accumulator.
+
+            Called from a ``finally`` block inside ``_run_one`` so that
+            an exception raised AFTER LLM calls were billed — for
+            example from a user-supplied ``post_process`` hook or a
+            validator helper that crashes mid-group — still
+            contributes those tokens to ``partial_receipt``.  Merging
+            only on the success path would silently drop billed usage
+            exactly in the scenario the partial-receipt contract is
+            meant to surface.
+            """
+            if usage is None:
+                return
+            with shared_lock:
+                usage.input_tokens += local_usage.input_tokens
+                usage.output_tokens += local_usage.output_tokens
+                usage.api_calls += local_usage.api_calls
+
+        def _run_one(group: List[polib.POEntry]) -> Dict[str, int]:
+            # Local stats / usage so the worker can mutate them without a
+            # lock; ``_translate_group`` only needs the shared lock when
+            # it talks to the pool.  Seed the dict with every key the
+            # shared tally tracks so the merge loop doesn't accidentally
+            # invent keys that ``BatchStats(**stats)`` can't accept.
+            local_stats: Dict[str, int] = {k: 0 for k in stats}
+            local_usage = _UsageAccumulator()
+            # A peer worker has already failed — skip the LLM call
+            # entirely rather than burn more tokens on work that the
+            # caller will discard.  Returning the zero-filled
+            # ``local_stats`` keeps the merge loop in the main thread
+            # valid if it somehow still consumes this future (it
+            # won't: the main thread re-raises the first failure
+            # before iterating the rest).
+            if abort_event.is_set():
+                return local_stats
+            try:
+                self._translate_group(
+                    group,
+                    po_manager,
+                    pool,
+                    local_stats,
+                    inplace=inplace,
+                    usage=local_usage,
+                    pool_lock=shared_lock,
+                )
+            except BaseException:
+                # Set the abort flag BEFORE the ``finally`` clause
+                # propagates the exception so that any peer worker
+                # which is currently in its own ``_run_one`` entry
+                # check sees the signal; without that the peer could
+                # still issue one more LLM call in the narrow window
+                # between the failure and the main thread's
+                # ``as_completed`` loop noticing it.
+                abort_event.set()
+                raise
+            finally:
+                _merge_usage(local_usage)
+            return local_stats
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=concurrency
+        ) as executor:
+            futures = [executor.submit(_run_one, group) for group in remaining]
+            # Emit ``document_progress`` with a monotonically-increasing
+            # index so progress bars observe "N of total completed"
+            # rather than the worker's source-order group ID.  Using
+            # the source index here would bounce around (e.g. 1, 4, 2,
+            # 3) as ``as_completed`` releases futures in completion
+            # order — UIs that interpret ``index / total`` as a
+            # fraction would flash forward and then regress, which is
+            # exactly what the progress contract forbids.  ``total``
+            # stays the group count so the final progress event still
+            # lands at ``index == total``.
+            completed_index = 1  # seed batch already counted
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    # Let worker exceptions propagate: the caller
+                    # already wraps the batched path in the same
+                    # error annotation logic that covers the
+                    # sequential loop, so a mid-run crash still
+                    # attaches ``partial_receipt`` and saves whatever
+                    # the PO managed to record before the failure.
+                    # ``_run_one`` has already merged billed usage in
+                    # its ``finally`` block so partial receipts stay
+                    # correct.
+                    local_stats = future.result()
+                    with shared_lock:
+                        for k, v in local_stats.items():
+                            stats[k] = stats.get(k, 0) + v
+                    completed_index += 1
+                    self._emit_progress(
+                        kind="document_progress",
+                        path=source_path,
+                        index=completed_index,
+                        total=total,
+                    )
+            except BaseException:
+                # First worker failure aborts the document.  Cancel
+                # every queued future so the pool doesn't start new
+                # batches after the caller has already committed to
+                # failing — without this the ``with`` block's
+                # ``shutdown(wait=True)`` would drain the queue, each
+                # drained batch would issue its own LLM call, and
+                # ``partial_receipt`` would over-bill users on
+                # exactly the concurrent partial-failure runs the
+                # receipt contract is meant to surface honestly.
+                # ``cancel()`` is a no-op for futures already running
+                # — those can't be interrupted mid-call, but their
+                # billed tokens still merge via the worker's
+                # ``finally`` block so the receipt stays accurate.
+                for f in futures:
+                    f.cancel()
+                raise
 
     def _section_aware_groups(
         self, entries: List[polib.POEntry]
@@ -1817,15 +2036,31 @@ class MarkdownProcessor:
         stats: Dict[str, int],
         inplace: bool,
         usage: Optional[_UsageAccumulator] = None,
+        *,
+        pool_lock: Optional[threading.Lock] = None,
     ) -> None:
         entry_by_ctx: Dict[str, polib.POEntry] = {e.msgctxt: e for e in group}
+
+        # Pool access (reads via ``find_similar`` inside
+        # ``_collect_references`` and the per-entry fallback, writes via
+        # ``pool.add`` below) is serialised with ``pool_lock`` when the
+        # caller opted into intra-file concurrency.  The lock is narrow
+        # on purpose: the expensive LLM call happens OUTSIDE it, so
+        # parallel workers overlap API latency while the cheap
+        # SequenceMatcher scan / list append stay ordered.  When
+        # ``pool_lock`` is ``None`` (default / sequential path) the
+        # pool is not shared and no synchronisation is needed.
+        pool_cm: AbstractContextManager[Any] = (
+            pool_lock if pool_lock is not None else nullcontext()
+        )
 
         # Reference lookup and glossary matching operate on human-readable
         # source text — encoding would obscure the substrings they compare
         # against — so collect them from ``entry.msgid`` before encoding
         # swaps pattern matches for opaque tokens.
         raw_sources = [e.msgid for e in group]
-        references = self._collect_references(raw_sources, pool)
+        with pool_cm:
+            references = self._collect_references(raw_sources, pool)
         glossary_block = self._collect_glossary_block(raw_sources)
 
         # Encode each item once; stash per-ctx maps so we can decode the
@@ -1880,7 +2115,8 @@ class MarkdownProcessor:
                 processed = self._decode_translation(raw, mapping)
             else:
                 stats["per_entry_calls"] += 1
-                similar = pool.find_similar(entry.msgid)
+                with pool_cm:
+                    similar = pool.find_similar(entry.msgid)
                 try:
                     processed = self._call_llm(
                         entry.msgid, reference_pairs=similar or None, usage=usage
@@ -1922,7 +2158,8 @@ class MarkdownProcessor:
                 entry.msgid = processed
             po_manager.mark_entry_processed(entry)
             stats["processed"] += 1
-            pool.add(source_msgid, processed)
+            with pool_cm:
+                pool.add(source_msgid, processed)
 
     def _collect_references(
         self, sources, pool: ReferencePool

@@ -43,6 +43,17 @@ def _add_shared_flags(parser: argparse.ArgumentParser) -> None:
         help="Soft cap on source characters per batch.",
     )
     parser.add_argument(
+        "--batch-concurrency",
+        type=int,
+        default=1,
+        help=(
+            "EXPERIMENTAL. Max batches from the same file to send in "
+            "parallel after the first batch has seeded the reference "
+            "pool. Off by default (1 = deterministic sequential "
+            "batching). Ignored when --batch-size=0 (sequential path)."
+        ),
+    )
+    parser.add_argument(
         "--max-reference-pairs",
         type=int,
         default=5,
@@ -157,6 +168,7 @@ def _build_processor(
         target_lang=args.target,
         batch_size=args.batch_size,
         batch_max_chars=args.batch_max_chars,
+        batch_concurrency=getattr(args, "batch_concurrency", 1),
         validation=getattr(args, "validation", "off"),
         max_reference_pairs=args.max_reference_pairs,
         extra_instructions=getattr(args, "extra_instructions", None),
