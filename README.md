@@ -228,6 +228,95 @@ the same reason; use `"instruction"` mode when those matter.
 
 v0.5 will flip the default to `"placeholder"`.
 
+## Refine mode
+
+`mode="refine"` polishes a Markdown document in its **original** language:
+fixes grammar, tightens phrasing, smooths flow — without translating or
+switching languages. It reuses the translate pipeline — parsing, PO
+tracking, batching, reference pool, placeholders — and swaps in a
+refine-specific prompt and validator configuration.
+
+Key contract:
+- Refine **never** overwrites the source or its PO `msgid`. The refined
+  output goes to a separate `refined_path` (or the `target_path` you
+  supply); `msgstr` holds the refined text, `msgid` keeps the original.
+- `target_lang` names the source/output language (refine is
+  same-language by definition).
+- The validator drops the target-language-presence check and adds a
+  `language_stability` check: if the source detects as one language and
+  the refined output as another, the entry is flagged fuzzy.
+- `inplace=True` is incompatible with refine and raises.
+
+```python
+from mdpo_llm import MdpoLLM
+
+refiner = MdpoLLM(
+    model="gpt-4",
+    target_lang="en",    # refine preserves the source language
+    mode="refine",
+)
+refiner.process_document(
+    source_path="docs/README.md",
+    target_path="docs/README.refined.md",   # refined output
+    po_path="docs/README.refined.po",
+)
+```
+
+From the CLI:
+
+```bash
+mdpo-llm refine docs/README.md docs/README.refined.md --model gpt-4 --target en
+mdpo-llm refine-dir docs/ docs_refined/ --model gpt-4 --target en
+```
+
+### `translate --refine-first` composition
+
+When the upstream source is noisy (typos, bad grammar, inconsistent
+phrasing), polish it first, then translate. Both passes contribute
+tokens to the receipt; the refined intermediate lives at
+`--refined-path` so downstream re-runs can reuse it.
+
+`refine_lang` / `--refine-lang` is **required** — it names the BCP 47
+locale of the source document, which is what the refine pass must
+preserve. There is no safe default: using `target_lang` would pin the
+refine pass to the translation TARGET and the cross-language run would
+collapse into same-language nonsense.
+
+Refine-first requires **distinct** paths and POs for the two passes —
+`refined_path` ≠ `target_path`, `refined_po_path` ≠ `po_path`.
+Sharing either would let the translate pass see the refine output as
+"already processed" and skip translation entirely. On the first
+refine-first run with a pre-existing translate PO, the translate PO is
+re-keyed on refined msgids (the source changed, so prior source-keyed
+entries are obsoleted by design); the translate pass still seeds its
+reference pool with the old `(msgid, msgstr)` pairs so tone and
+terminology survive as few-shot context.
+
+```bash
+mdpo-llm translate docs/README.md docs/README_ko.md \
+    --model gpt-4 --target ko \
+    --refine-first --refined-path docs/README.refined.md --refine-lang en
+```
+
+```python
+processor = MdpoLLM(model="gpt-4", target_lang="ko")
+processor.process_document(
+    source_path="docs/README.md",
+    target_path="docs/README_ko.md",
+    refined_path="docs/README.refined.md",
+    refine_first=True,
+    refine_lang="en",
+)
+```
+
+### `inplace=True` is deprecated
+
+Passing `inplace=True` emits a `DeprecationWarning` pointing at refine
+mode; the flag is scheduled for removal in v0.5. If you were using
+`inplace=True` to "rewrite the source in place after translating",
+switch to `mode="refine"` with an explicit `refined_path` — it captures
+the intent without clobbering the original document.
+
 ## Comparison
 
 | | mdpo-llm | mdpo | md-translator | llm-translator |
@@ -257,14 +346,15 @@ MdpoLLM(
     glossary=None,             # dict[str, str | None] — inline glossary
     glossary_path=None,        # path to JSON glossary file (multi-locale)
     progress_callback=None,    # Callable[[ProgressEvent], None] — see "Progress hook"
+    mode="translate",          # "translate" (cross-language) or "refine" (same-language polish)
     **litellm_kwargs,          # temperature, api_key, api_base, etc.
 )
 ```
 
 | Method | Description |
 |--------|-------------|
-| `process_document(source_path, target_path, po_path=None, inplace=False)` | Process a single Markdown file. `po_path` defaults to `target_path` with `.po` extension. Returns a `ProcessResult` with a `.receipt` summarizing tokens, cost, and duration. |
-| `process_directory(source_dir, target_dir, po_dir=None, glob, inplace, max_workers)` | Process a directory tree concurrently. `po_dir` defaults to `target_dir`. Returns a `DirectoryResult` with a `.receipt` aggregated over every file. |
+| `process_document(source_path, target_path, po_path=None, inplace=False, *, refined_path=None, refine_first=False, refine_lang=None)` | Process a single Markdown file. `po_path` defaults to `target_path` with `.po` extension. `refined_path`, `refine_first`, `refine_lang` drive refine-mode / `translate --refine-first` composition (see "Refine mode"). `inplace=True` is deprecated — emits a `DeprecationWarning` pointing at refine mode; slated for removal in v0.5. Returns a `ProcessResult` with a `.receipt` summarizing tokens, cost, and duration. |
+| `process_directory(source_dir, target_dir, po_dir=None, glob, inplace, max_workers, *, refined_dir=None, refine_first=False, refine_lang=None)` | Process a directory tree concurrently. `po_dir` defaults to `target_dir`. The refine / refine-first kwargs mirror `process_document` across every file. Returns a `DirectoryResult` with a `.receipt` aggregated over every file. |
 | `get_translation_stats(source_path, po_path)` | Return coverage and block statistics |
 | `export_report(source_path, po_path)` | Generate a detailed text report |
 

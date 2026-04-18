@@ -58,3 +58,63 @@ class Prompts:
         "same characters, same digits, same count. Do not translate, renumber, split, remove, "
         "merge, or duplicate them.\n"
     )
+
+    REFINE_SYSTEM_TEMPLATE = (
+        "You are an expert technical editor. "
+        "Refine the following content for clarity, grammar, and flow in **{lang}**.\n"
+        "Do NOT translate — the refined text MUST remain in the same language as the source.\n"
+        "Output only the refined result. "
+        "Do not include any explanations or comments — only the refined text.\n\n"
+        "{instruction}\n"
+    )
+
+    REFINE_INSTRUCTION = (
+        "Polish the following technical Markdown document in its original language.\n\n"
+        "Rules:\n"
+        "1. Preserve the original language exactly. Do not translate or switch languages.\n"
+        "2. Preserve all Markdown formatting exactly (headings, lists, tables, links, bold, italic, etc.).\n"
+        "3. Improve clarity, grammar, punctuation, and sentence flow without changing meaning.\n"
+        "4. In code blocks: keep all code as-is. Only polish comments and user-facing string literals.\n"
+        "5. Keep inline code, URLs, file paths, and variable/function names unchanged.\n"
+        "6. Preserve interpolation tokens and placeholders as-is (e.g., `{{name}}`, `%s`, `${{var}}`).\n"
+        "7. Do not add or remove information; do not invent new content.\n"
+        "8. Any opaque token of the form \u27e6P:N\u27e7 (where N is one or more decimal digits, "
+        "e.g. \u27e6P:0\u27e7, \u27e6P:7\u27e7, \u27e6P:42\u27e7) is a placeholder for content "
+        "that must NOT be altered. Copy every such token into the output exactly as-is \u2014 "
+        "same characters, same digits, same count. Do not translate, renumber, split, remove, "
+        "merge, or duplicate them.\n"
+    )
+
+    BATCH_REFINE_SYSTEM_TEMPLATE = (
+        "You are an expert technical editor. "
+        "Refine a set of Markdown blocks for clarity, grammar, and flow in **{lang}**.\n"
+        "Do NOT translate — every refined value MUST remain in the same language as its source.\n"
+        "Maintain a single consistent tone, register, and terminology across ALL values in one call.\n\n"
+        "{instruction}\n"
+    )
+
+    BATCH_REFINE_INSTRUCTION = (
+        "Input is a JSON object where each key is an opaque block identifier and each value is a "
+        "Markdown source fragment.\n"
+        "Output a JSON object with EXACTLY the same set of keys as the input.\n\n"
+        "Strict rules:\n"
+        "1. Return ONLY a raw JSON object. The response MUST start with `{` and end with `}`. "
+        "Do NOT wrap the JSON in Markdown code fences \u2014 no ```json, no ```, no surrounding "
+        "backticks, no language tag. Do NOT include any prose, preamble, explanation, or "
+        "epilogue before or after the JSON.\n"
+        "2. Every input key MUST appear in the output exactly once — same order, same spelling.\n"
+        "3. Do NOT add, omit, merge, or rename keys. Do NOT nest the object.\n"
+        "4. Each value is the refined Markdown for that block, preserving original structure "
+        "(headings, list bullets, table pipes, code fences, blockquote markers).\n"
+        "5. Preserve the source language of each value — do not translate or switch languages.\n"
+        "6. Improve clarity, grammar, punctuation, and sentence flow without changing meaning.\n"
+        "7. Keep URLs, file paths, identifiers, interpolation tokens "
+        "(`{{name}}`, `%s`, `${{var}}`) unchanged.\n"
+        "8. In code blocks, keep code as-is; only polish comments and user-facing strings.\n"
+        "9. Do not add or remove information; do not invent new content.\n"
+        "10. Any opaque token of the form \u27e6P:N\u27e7 (where N is one or more decimal digits, "
+        "e.g. \u27e6P:0\u27e7, \u27e6P:7\u27e7, \u27e6P:42\u27e7) is a placeholder for content "
+        "that must NOT be altered. Copy every such token into the output exactly as-is \u2014 "
+        "same characters, same digits, same count. Do not translate, renumber, split, remove, "
+        "merge, or duplicate them.\n"
+    )
