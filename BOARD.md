@@ -48,7 +48,7 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: assigned
+  status: merged
   priority: high
   depends_on: []
   brief: .ccx/tasks/T-1.md
@@ -56,6 +56,8 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-1
   branch: ccx/T-1
   started_at: "2026-04-18T06:41:11Z"
+  finished_at: "2026-04-18T07:05:10Z"
+  exit_status: approved
   notes: |
     Roadmap #2. Sum token usage returned by litellm.completion across all
     calls (batched + per-entry), resolve per-1M pricing via
@@ -77,7 +79,7 @@ concurrency.
       - CHANGELOG.md
       - pyproject.toml
     exclude: []
-  status: assigned
+  status: merged
   priority: high
   depends_on: []
   brief: .ccx/tasks/T-2.md
@@ -85,6 +87,8 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-2
   branch: ccx/T-2
   started_at: "2026-04-18T07:06:35Z"
+  finished_at: "2026-04-18T07:26:30Z"
+  exit_status: approved
   notes: |
     Roadmap #1. Add a progress-event hook on the processor (emit per
     batch / per file — library stays UI-agnostic) and wire it to
@@ -103,7 +107,7 @@ concurrency.
       - tests/test_batched_processing.py
       - CHANGELOG.md
     exclude: []
-  status: assigned
+  status: merged
   priority: normal
   depends_on: []
   brief: .ccx/tasks/T-3.md
@@ -111,6 +115,8 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-3
   branch: ccx/T-3
   started_at: "2026-04-18T08:03:41Z"
+  finished_at: "2026-04-18T08:09:40Z"
+  exit_status: approved
   notes: |
     Roadmap #4. The v0.3 real-world test produced 34 false-positive
     warnings because code blocks legitimately round-trip unchanged and
@@ -130,7 +136,7 @@ concurrency.
       - tests/test_placeholder.py
       - CHANGELOG.md
     exclude: []
-  status: assigned
+  status: merged
   priority: high
   depends_on: []
   brief: .ccx/tasks/T-4.md
@@ -138,6 +144,8 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-4
   branch: ccx/T-4
   started_at: "2026-04-18T07:28:36Z"
+  finished_at: "2026-04-18T08:03:20Z"
+  exit_status: approved
   notes: |
     Roadmap #5 + #6 foundation. New module `placeholder.py` that replaces
     configurable source patterns with opaque tokens before the LLM sees
@@ -162,7 +170,7 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: assigned
+  status: merged
   priority: normal
   depends_on: [T-4]
   brief: .ccx/tasks/T-5.md
@@ -170,6 +178,8 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-5
   branch: ccx/T-5
   started_at: "2026-04-18T08:10:13Z"
+  finished_at: "2026-04-18T08:25:50Z"
+  exit_status: approved
   notes: |
     Roadmap #5. Add `--glossary-mode=placeholder|instruction` (default
     `instruction` for back-compat in v0.4, flip to `placeholder` in
@@ -192,7 +202,7 @@ concurrency.
       - tests/test_batched_processing.py
       - CHANGELOG.md
     exclude: []
-  status: assigned
+  status: merged
   priority: normal
   depends_on: [T-4]
   brief: .ccx/tasks/T-6.md
@@ -200,6 +210,9 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-6
   branch: ccx/T-6
   started_at: "2026-04-18T08:26:57Z"
+  finished_at: "2026-04-18T10:22:10Z"
+  exit_status: approved
+  exit_notes: "human-approved via Discord despite cap-hit at review 20/20 with 2 P2 findings fixed post-final-review"
   notes: |
     Roadmap #6. Register placeholder patterns for `{#anchor-id}` and
     inline raw HTML attribute strings (`class="bare"` etc.) — protecting
@@ -223,7 +236,7 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: assigned
+  status: merged
   priority: normal
   depends_on: [T-4]
   brief: .ccx/tasks/T-7.md
@@ -231,6 +244,8 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-7
   branch: ccx/T-7
   started_at: "2026-04-18T10:25:24Z"
+  finished_at: "2026-04-18T11:49:30Z"
+  exit_status: approved
   notes: |
     Roadmap #9. Split into two modes: `translate` (cross-language,
     today's behaviour) and `refine` (same-language clarity/grammar
@@ -256,7 +271,7 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: assigned
+  status: merged
   priority: low
   depends_on: [T-1]
   brief: .ccx/tasks/T-8.md
@@ -264,6 +279,8 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-8
   branch: ccx/T-8
   started_at: "2026-04-18T11:50:24Z"
+  finished_at: "2026-04-18T12:16:40Z"
+  exit_status: approved
   notes: |
     Roadmap #3. Expose `--batch-concurrency N` that allows N batches
     within a single file to fly in parallel after the first 1–2
@@ -286,7 +303,7 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: assigned
+  status: merged
   priority: low
   depends_on: [T-5, T-6, T-7]
   brief: .ccx/tasks/T-9.md
@@ -294,6 +311,8 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-9
   branch: ccx/T-9
   started_at: "2026-04-18T12:16:57Z"
+  finished_at: "2026-04-18T13:02:30Z"
+  exit_status: approved
   notes: |
     Roadmap #7. `target_langs: list[str]`. One batched call per source
     block returns {block_id: {lang: translation}}. Shared source-side
@@ -316,7 +335,7 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: assigned
+  status: merged
   priority: low
   depends_on: []
   brief: .ccx/tasks/T-10.md
@@ -324,6 +343,8 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-10
   branch: ccx/T-10
   started_at: "2026-04-18T13:02:40Z"
+  finished_at: "2026-04-18T13:48:50Z"
+  exit_status: approved
   notes: |
     Roadmap #6b. Opt-in `--translate-paths` flag. Filenames become
     their own "block type" tracked in a separate `_paths.po` per
