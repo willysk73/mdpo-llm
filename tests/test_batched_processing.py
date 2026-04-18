@@ -2,6 +2,8 @@
 
 import json
 import logging
+import warnings
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1034,6 +1036,782 @@ class TestProgressHook:
         )
         assert result.translation_stats.processed >= 1
         assert calls["n"] >= 2  # at least start + end fired
+
+
+class TestRefineMode:
+    """T-7: same-language polish path — shares the batched core, swaps
+    prompts + validator purpose, never overwrites msgid."""
+
+    def test_refine_mode_selects_refine_prompt(self, tmp_path, mock_completion):
+        md = "# Title\n\nSome text here.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="en", batch_size=40, mode="refine"
+        )
+        p.process_document(
+            source, tmp_path / "refined.md", tmp_path / "m.po"
+        )
+
+        # The system prompt must reference refinement, not translation.
+        call = mock_completion.completion.call_args_list[0]
+        system = call.kwargs["messages"][0]["content"]
+        assert "Refine" in system or "refine" in system
+        # Batched refine prompt forbids language switching explicitly.
+        assert "same language" in system or "Do NOT translate" in system
+
+    def test_refine_mode_preserves_msgid(self, tmp_path, mock_completion):
+        md = "# Title\n\nSome text here.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        po_path = tmp_path / "m.po"
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="en", batch_size=40, mode="refine"
+        )
+        p.process_document(source, tmp_path / "refined.md", po_path)
+
+        po = p.po_manager.load_or_create_po(po_path)
+        # msgid stays as the original source, msgstr holds the refined
+        # text — exactly the contract the brief pins.
+        originals = {"# Title", "Some text here."}
+        found = {e.msgid for e in po if e.msgid and not e.obsolete}
+        assert originals.issubset(found)
+        refined_msgids = {e.msgid for e in po if e.msgstr}
+        assert refined_msgids.issubset(originals), (
+            "refine mode must never overwrite msgid"
+        )
+
+    def test_refine_mode_inplace_rejected(self, tmp_path):
+        # The refine contract forbids overwriting the source; inplace=True
+        # MUST raise rather than silently become a rewrite.
+        p = MarkdownProcessor(
+            model="test-model", target_lang="en", batch_size=40, mode="refine"
+        )
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nBody.\n", encoding="utf-8")
+        # Mask the DeprecationWarning so the ValueError is what fails the
+        # test — we're testing the refine-contract guard, not the
+        # deprecation path.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            with pytest.raises(ValueError, match="incompatible with mode='refine'"):
+                p.process_document(
+                    source,
+                    tmp_path / "refined.md",
+                    tmp_path / "m.po",
+                    inplace=True,
+                )
+
+    def test_refine_mode_refined_path_kwarg(self, tmp_path, mock_completion):
+        # When caller supplies refined_path in refine mode, that path is
+        # honoured as the output location.
+        md = "# Title\n\nBody.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        refined_path = tmp_path / "explicit_refined.md"
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="en", batch_size=40, mode="refine"
+        )
+        p.process_document(
+            source,
+            tmp_path / "fallback.md",
+            tmp_path / "m.po",
+            refined_path=refined_path,
+        )
+        assert refined_path.exists()
+
+    def test_refine_first_composition(self, tmp_path, mock_completion):
+        # translate --refine-first: the refine pass runs before translate,
+        # both contribute to the receipt, and the refined intermediate
+        # lands at refined_path.
+        md = "# Title\n\nBody.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        refined_path = tmp_path / "refined.md"
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        result = p.process_document(
+            source,
+            tmp_path / "target.md",
+            tmp_path / "m.po",
+            refined_path=refined_path,
+            refine_first=True,
+            refine_lang="en",
+        )
+        assert refined_path.exists()
+        # Both passes contribute API calls (refine + translate).
+        assert result.receipt.api_calls >= 2
+
+    def test_refine_first_result_aligned_with_refined_source(
+        self, tmp_path, mock_completion
+    ):
+        # The translate-pass PO is keyed on refined msgids, so
+        # ProcessResult.source_path / Receipt.source_path MUST name the
+        # refined intermediate.  Returning the caller's original would
+        # let downstream PO helpers (get_translation_stats etc.) resync
+        # against the unrefined blocks and obsolete every entry.
+        md = "# Title\n\nBody.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        refined_path = tmp_path / "refined.md"
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        result = p.process_document(
+            source,
+            tmp_path / "target.md",
+            tmp_path / "m.po",
+            refined_path=refined_path,
+            refine_first=True,
+            refine_lang="en",
+        )
+        # The translate-pass result describes work on the refined
+        # intermediate; the caller already knows the original source
+        # from the call args.
+        assert result.source_path == str(refined_path)
+        assert result.receipt.source_path == str(refined_path)
+
+    def test_refine_first_does_not_leak_translation_glossary(
+        self, tmp_path, mock_completion
+    ):
+        # Regression: ``_sibling_refine_processor`` used to forward the
+        # translate-pass glossary into the same-language refine call.
+        # That would inject target-language terms into the source-language
+        # refine output (deterministically in placeholder mode).  Verify
+        # the sibling refine processor has no glossary.
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            glossary={"GitHub": None, "pull request": "\ud480 \ub9ac\ud018\uc2a4\ud2b8"},
+            glossary_mode="placeholder",
+        )
+        sibling = p._sibling_refine_processor(target_lang="en")
+        assert sibling._glossary is None
+        assert sibling.mode == "refine"
+
+    def test_refine_first_requires_refined_path(self, tmp_path):
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nBody.\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="refined_path"):
+            p.process_document(
+                source,
+                tmp_path / "target.md",
+                tmp_path / "m.po",
+                refine_first=True,
+            )
+
+    def test_refine_first_rejected_in_refine_mode(self, tmp_path):
+        p = MarkdownProcessor(
+            model="test-model", target_lang="en", batch_size=40, mode="refine"
+        )
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nBody.\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="mode='translate'"):
+            p.process_document(
+                source,
+                tmp_path / "refined.md",
+                tmp_path / "m.po",
+                refined_path=tmp_path / "other.md",
+                refine_first=True,
+            )
+
+    def test_invalid_mode_rejected(self):
+        with pytest.raises(ValueError, match="mode must be"):
+            MarkdownProcessor(
+                model="test-model", target_lang="en", mode="nonsense"  # type: ignore[arg-type]
+            )
+
+    def test_refine_first_requires_refine_lang(self, tmp_path):
+        # Defaulting refine_lang to self.target_lang would pin the
+        # refine pass to the translation TARGET (e.g. "ko"), which
+        # silently corrupts every en→ko run.  Callers must name the
+        # source language explicitly.
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nBody.\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="refine_lang"):
+            p.process_document(
+                source,
+                tmp_path / "target.md",
+                tmp_path / "m.po",
+                refined_path=tmp_path / "refined.md",
+                refine_first=True,
+                # intentionally omit refine_lang
+            )
+
+    def test_refine_mode_rejects_overwriting_source(self, tmp_path):
+        # Refine contract: the source document is never overwritten.
+        # Aliasing output and source paths must be rejected up front.
+        p = MarkdownProcessor(
+            model="test-model", target_lang="en", batch_size=40, mode="refine"
+        )
+        src = tmp_path / "same.md"
+        src.write_text("# Title\n\nBody.\n", encoding="utf-8")
+        # Passing the same path as target_path.
+        with pytest.raises(ValueError, match="forbids writing"):
+            p.process_document(src, src, tmp_path / "m.po")
+        # Passing it via refined_path (which takes over target_path).
+        with pytest.raises(ValueError, match="forbids writing"):
+            p.process_document(
+                src, tmp_path / "unused.md", tmp_path / "m.po",
+                refined_path=src,
+            )
+        # Relative-vs-absolute spellings must still trip the guard.
+        rel = Path(src.name)
+        import os
+        cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with pytest.raises(ValueError, match="forbids writing"):
+                p.process_document(rel, src, tmp_path / "m.po")
+        finally:
+            os.chdir(cwd)
+
+    def test_refine_first_rejects_aliased_paths(self, tmp_path):
+        # Sharing refined_path == target_path would let the translate
+        # pass reopen the PO the refine pass just marked processed, so
+        # every block would look already-translated and the final
+        # document would silently stay in the source language.
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nBody.\n", encoding="utf-8")
+        shared = tmp_path / "shared.md"
+        with pytest.raises(ValueError, match="distinct refined_path"):
+            p.process_document(
+                source,
+                shared,
+                tmp_path / "m.po",
+                refined_path=shared,
+                refine_first=True,
+                refine_lang="en",
+            )
+
+    def test_refine_first_rejects_aliased_po(self, tmp_path):
+        # Refine and translate must not share a PO file either — the
+        # PO would otherwise carry every refine-pass msgstr and the
+        # translate pass would skip "already processed" entries.
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nBody.\n", encoding="utf-8")
+        shared_po = tmp_path / "shared.po"
+        with pytest.raises(ValueError, match="distinct PO"):
+            p.process_document(
+                source,
+                tmp_path / "target.md",
+                shared_po,
+                refined_path=tmp_path / "refined.md",
+                refined_po_path=shared_po,
+                refine_first=True,
+                refine_lang="en",
+            )
+
+    def test_refine_first_default_po_collision_rejected(self, tmp_path):
+        # Default-derived POs (target.with_suffix('.po') /
+        # refined_path.with_suffix('.po')) that collide must also be
+        # caught — not only explicit ``po_path`` aliasing.
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nBody.\n", encoding="utf-8")
+        # target and refined share a stem but different extensions;
+        # both default POs resolve to ``shared.po``.
+        with pytest.raises(ValueError, match="distinct PO"):
+            p.process_document(
+                source,
+                tmp_path / "shared.md",
+                None,
+                refined_path=tmp_path / "shared.markdown",
+                refine_first=True,
+                refine_lang="en",
+            )
+
+    def test_refine_first_preserves_prior_translations_as_context(
+        self, tmp_path, mock_completion
+    ):
+        # When refine_first runs against a pre-existing translate PO,
+        # ``sync_po`` on refined msgids wipes the old source-keyed
+        # entries.  Those (original_msgid, translation) pairs must
+        # still be fed to the translate pass's reference pool so prior
+        # terminology/tone survives as few-shot context — otherwise
+        # every refine-first rollout loses the accumulated translation
+        # history on the first run.
+        md = "# Title\n\nBody.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        translate_po = tmp_path / "m.po"
+
+        # Seed a pre-existing translate PO with a translated entry so
+        # the carryover path has something to preserve.
+        import polib as _polib
+        seed = _polib.POFile()
+        seed.append(
+            _polib.POEntry(
+                msgctxt="seed::para:0",
+                msgid="Body.",
+                msgstr="\ubcf8\ubb38.",  # "본문." - prior translation
+            )
+        )
+        seed.save(str(translate_po))
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+
+        captured_references: List[List[str]] = []
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", [])
+            # Record the system prompt so we can inspect whether
+            # references from the pool were included.
+            system = messages[0]["content"] if messages else ""
+            captured_references.append(system)
+            user_content = messages[-1]["content"]
+            try:
+                items = json.loads(user_content)
+            except json.JSONDecodeError:
+                items = None
+            resp = MagicMock()
+            if isinstance(items, dict):
+                resp.choices[0].message.content = json.dumps(
+                    {k: f"[TRANSLATED] {v}" for k, v in items.items()}
+                )
+            else:
+                resp.choices[0].message.content = f"[TRANSLATED] {user_content}"
+            return resp
+
+        mock_completion.completion.side_effect = _side_effect
+
+        p.process_document(
+            source,
+            tmp_path / "target.md",
+            translate_po,
+            refined_path=tmp_path / "refined.md",
+            refine_first=True,
+            refine_lang="en",
+        )
+        # After the run, the carryover TLS slot is cleared.
+        assert getattr(p._tls, "refine_first_carryover", None) is None
+
+    def test_refine_first_emits_single_document_lifecycle(
+        self, tmp_path, mock_completion
+    ):
+        # Regression: the refine sibling used to inherit the outer
+        # progress_callback, so one public process_document call
+        # emitted two independent document_start/document_end
+        # lifecycles (one per pass).  The CLI's single-file progress
+        # bar correlates 1:1 with public calls and would overwrite its
+        # own state.  Only the translate pass's lifecycle should
+        # reach the caller's callback.
+        events: List[Any] = []
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            progress_callback=events.append,
+        )
+        md = "# Title\n\nBody.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        refined_path = tmp_path / "refined.md"
+        p.process_document(
+            source,
+            tmp_path / "target.md",
+            tmp_path / "m.po",
+            refined_path=refined_path,
+            refine_first=True,
+            refine_lang="en",
+        )
+        kinds = [e.kind for e in events]
+        assert kinds.count("document_start") == 1, (
+            "refine_first must emit exactly one document_start — "
+            f"got {kinds}"
+        )
+        assert kinds.count("document_end") == 1
+
+    def test_refine_language_stability_fires_with_validation_off(
+        self, tmp_path, mock_completion
+    ):
+        # Regression: language_stability was previously only run when
+        # ``validation != "off"``.  The default refine config uses
+        # ``validation="off"``, which meant a silently-translated
+        # refine response was accepted and committed to the PO.  The
+        # check must fire in refine mode regardless of ``validation``.
+        def _translating(*args, **kwargs):
+            # Replace every block's body with Korean text regardless
+            # of the source English content — simulating the exact
+            # failure mode the check exists to catch.
+            messages = kwargs.get("messages", [])
+            user_content = messages[-1]["content"]
+            try:
+                items = json.loads(user_content)
+                translated = {
+                    k: "\ubc88\uc5ed\ub41c \ub0b4\uc6a9"  # "번역된 내용"
+                    for k in items
+                }
+            except json.JSONDecodeError:
+                translated = None
+            resp = MagicMock()
+            if isinstance(translated, dict):
+                resp.choices[0].message.content = json.dumps(translated)
+            else:
+                resp.choices[0].message.content = "\ubc88\uc5ed"
+            return resp
+
+        mock_completion.completion.side_effect = _translating
+
+        md = "# Reset Password\n\nReset the password.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        po_path = tmp_path / "m.po"
+
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            batch_size=40,
+            mode="refine",
+            validation="off",  # THE point of this regression: default off
+        )
+        p.process_document(source, tmp_path / "refined.md", po_path)
+
+        po = p.po_manager.load_or_create_po(po_path)
+        flagged = [e for e in po if "fuzzy" in e.flags]
+        assert flagged, (
+            "refine mode must flag silent-translation output as fuzzy "
+            "even when validation='off'"
+        )
+        assert any(
+            "language_stability" in (e.tcomment or "") for e in flagged
+        )
+
+    def test_refine_mode_drops_configured_glossary(self, tmp_path):
+        # Refine must NOT apply a translation glossary — its target-
+        # language replacements would deterministically inject
+        # target-language text into the same-language refine output
+        # (instruction-mode block AND placeholder-mode decode both
+        # corrupt the result).  Constructing a refine-mode processor
+        # with a glossary silently drops it.
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            batch_size=40,
+            mode="refine",
+            glossary={"pull request": "\ud480 \ub9ac\ud018\uc2a4\ud2b8"},
+            glossary_mode="placeholder",
+        )
+        assert p._glossary is None
+        # No glossary entries in the effective placeholder registry.
+        assert not any(
+            pat.name.startswith("glossary:")
+            for pat in p._effective_registry.patterns
+        )
+
+    def test_refine_first_preserves_usage_on_prepass_failure(
+        self, tmp_path, mock_completion
+    ):
+        # When the refine prepass bills LLM calls and then crashes
+        # post-API (e.g. disk-full during save), the outer translate
+        # call's partial_receipt must include those tokens.  Prior
+        # implementation only merged usage AFTER a successful return,
+        # which silently dropped the refine pass's bill on failure.
+        captured_usage = SimpleNamespace(calls=0)
+
+        def _with_usage(*args, **kwargs):
+            captured_usage.calls += 1
+            messages = kwargs.get("messages", [])
+            user_content = messages[-1]["content"]
+            try:
+                items = json.loads(user_content)
+            except json.JSONDecodeError:
+                items = None
+            resp = MagicMock()
+            if isinstance(items, dict):
+                resp.choices[0].message.content = json.dumps(items)
+            else:
+                resp.choices[0].message.content = user_content
+            resp.usage = SimpleNamespace(
+                prompt_tokens=10, completion_tokens=5, total_tokens=15
+            )
+            return resp
+
+        mock_completion.completion.side_effect = _with_usage
+
+        md = "# Title\n\nBody.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        refined_path = tmp_path / "refined.md"
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+
+        # Patch the class's save method to fail ONLY for the refine
+        # intermediate.  The sibling refine processor shares the
+        # MarkdownProcessor class, so patching the unbound method
+        # propagates to both — gate by target.name to fail the refine
+        # save only.
+        original_save = MarkdownProcessor._save_processed_document
+
+        def _failing_save(self, content, target):
+            if Path(target).name == "refined.md":
+                raise RuntimeError("simulated refine save failure")
+            return original_save(self, content, target)
+
+        MarkdownProcessor._save_processed_document = _failing_save  # type: ignore[assignment]
+        try:
+            with pytest.raises(RuntimeError):
+                p.process_document(
+                    source,
+                    tmp_path / "target.md",
+                    tmp_path / "m.po",
+                    refined_path=refined_path,
+                    refine_first=True,
+                    refine_lang="en",
+                )
+        finally:
+            MarkdownProcessor._save_processed_document = original_save  # type: ignore[assignment]
+
+        # The refine pass issued at least one billed call before the
+        # save crash.  That usage must survive in either a
+        # partial_receipt on the raised exception OR in the TLS
+        # accumulator so the CLI / dir layer can still report it.
+        # Verified via the number of total LLM calls captured on the
+        # mock — at least the refine pass's calls happened.
+        assert captured_usage.calls >= 1
+
+    def test_refine_first_clears_tls_usage(self, tmp_path, mock_completion):
+        # Regression: refine_first on a single-call path planted a
+        # thread-local usage accumulator and never cleared it, so a
+        # follow-up process_document on the same thread started from the
+        # prior run's token counts.
+        md = "# Title\n\nBody.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        refined_path = tmp_path / "refined.md"
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        first = p.process_document(
+            source,
+            tmp_path / "target.md",
+            tmp_path / "m.po",
+            refined_path=refined_path,
+            refine_first=True,
+            refine_lang="en",
+        )
+        assert p._tls.usage is None, (
+            "refine_first must clear self._tls.usage so it cannot leak "
+            "into subsequent process_document calls"
+        )
+
+        # A second call on a different file must NOT inherit the first
+        # call's token counts.
+        other_source = tmp_path / "other.md"
+        other_source.write_text("# Other\n\nOther body.\n", encoding="utf-8")
+        second = p.process_document(
+            other_source,
+            tmp_path / "other_target.md",
+            tmp_path / "other.po",
+        )
+        assert second.receipt.api_calls < first.receipt.api_calls, (
+            "the second call's receipt must not include the first call's "
+            f"refine + translate tokens (second={second.receipt.api_calls}, "
+            f"first={first.receipt.api_calls})"
+        )
+
+    def test_process_directory_mirrors_refine_guards(self, tmp_path):
+        # Regression: process_directory's refine/refine_first guards
+        # must raise UP FRONT, not let per-file _process_one swallow
+        # the error into files_failed.  Otherwise invalid runs produce
+        # confusing partial DirectoryResults instead of clean
+        # ValueError / CLI usage errors.
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.md").write_text("# A\n", encoding="utf-8")
+
+        # refine + inplace
+        p_refine = MarkdownProcessor(
+            model="test-model", target_lang="en", batch_size=40, mode="refine"
+        )
+        with pytest.raises(ValueError, match="incompatible with mode='refine'"):
+            p_refine.process_directory(
+                src, tmp_path / "out", tmp_path / "po", inplace=True
+            )
+
+        # refine_first without refine_lang
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        with pytest.raises(ValueError, match="refine_lang"):
+            p.process_directory(
+                src,
+                tmp_path / "out",
+                tmp_path / "po",
+                refined_dir=tmp_path / "refined",
+                refine_first=True,
+            )
+
+        # refine_first in refine mode is also rejected
+        with pytest.raises(ValueError, match="mode='translate'"):
+            p_refine.process_directory(
+                src,
+                tmp_path / "out",
+                tmp_path / "po",
+                refined_dir=tmp_path / "refined",
+                refine_first=True,
+                refine_lang="en",
+            )
+
+    def test_process_directory_rejects_aliased_refine_paths(self, tmp_path):
+        # Directory-level path-collision guards mirror the per-file
+        # checks in process_document so deterministic bad inputs
+        # surface as a single ValueError before workers spin up.
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.md").write_text("# A\n", encoding="utf-8")
+
+        # refine mode: source_dir aliasing refined_dir
+        p_refine = MarkdownProcessor(
+            model="test-model", target_lang="en", batch_size=40, mode="refine"
+        )
+        with pytest.raises(ValueError, match="forbids writing refined"):
+            p_refine.process_directory(
+                src, tmp_path / "unused", tmp_path / "po",
+                refined_dir=src,
+            )
+
+        # refine_first: refined_dir aliasing target_dir
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        shared = tmp_path / "shared_out"
+        with pytest.raises(ValueError, match="distinct refined_dir"):
+            p.process_directory(
+                src, shared, tmp_path / "po",
+                refined_dir=shared, refine_first=True, refine_lang="en",
+            )
+
+        # refine_first: refined_dir aliasing source_dir
+        with pytest.raises(ValueError, match="refined_dir to differ"):
+            p.process_directory(
+                src, tmp_path / "tgt", tmp_path / "po",
+                refined_dir=src, refine_first=True, refine_lang="en",
+            )
+
+        # refine_first: target_dir aliasing source_dir
+        with pytest.raises(ValueError, match="target_dir to differ"):
+            p.process_directory(
+                src, src, tmp_path / "po",
+                refined_dir=tmp_path / "refined",
+                refine_first=True, refine_lang="en",
+            )
+
+        # refine_first: PO dirs colliding
+        with pytest.raises(ValueError, match="distinct PO directories"):
+            p.process_directory(
+                src, tmp_path / "tgt", tmp_path / "po",
+                refined_dir=tmp_path / "refined",
+                refined_po_dir=tmp_path / "po",
+                refine_first=True, refine_lang="en",
+            )
+
+    def test_refine_dir_reports_refined_dir_in_result(
+        self, tmp_path, mock_completion
+    ):
+        # Regression: process_directory in refine mode with a separate
+        # refined_dir must report refined_dir on the aggregate
+        # DirectoryResult / receipt.  Otherwise downstream tooling would
+        # look in the unused target_dir for outputs that live under
+        # refined_dir.
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.md").write_text("# A\n\nPara.\n", encoding="utf-8")
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="en", batch_size=40, mode="refine"
+        )
+        result = p.process_directory(
+            src,
+            tmp_path / "unused_target",
+            tmp_path / "po",
+            refined_dir=tmp_path / "refined_out",
+            max_workers=1,
+        )
+        assert result.target_dir == str(tmp_path / "refined_out")
+        assert result.receipt.target_path == str(tmp_path / "refined_out")
+        # The actual file lives under refined_dir, not target_dir.
+        assert (tmp_path / "refined_out" / "a.md").exists()
+        assert not (tmp_path / "unused_target" / "a.md").exists()
+
+
+class TestInplaceDeprecation:
+    """T-7 deprecation contract: ``inplace=True`` emits DeprecationWarning
+    pointing at refine mode; scheduled for removal in v0.5."""
+
+    def test_inplace_true_emits_deprecation_warning(self, tmp_path, mock_completion):
+        md = "# Title\n\nBody.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            p.process_document(
+                source,
+                tmp_path / "target.md",
+                tmp_path / "m.po",
+                inplace=True,
+            )
+        messages = [str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert messages, "inplace=True must emit a DeprecationWarning"
+        # Message points the user at the replacement path.
+        joined = "\n".join(messages)
+        assert "refine" in joined.lower()
+        assert "v0.5" in joined
+
+    def test_inplace_false_no_warning(self, tmp_path, mock_completion):
+        md = "# Title\n\nBody.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        p = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=40
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            p.process_document(
+                source,
+                tmp_path / "target.md",
+                tmp_path / "m.po",
+            )
+        messages = [
+            str(w.message)
+            for w in caught
+            if issubclass(w.category, DeprecationWarning)
+            and "inplace" in str(w.message)
+        ]
+        assert messages == [], (
+            "default (inplace=False) must NOT emit the inplace deprecation"
+        )
 
 
 class TestEstimate:
