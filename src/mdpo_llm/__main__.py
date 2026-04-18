@@ -623,6 +623,153 @@ def cmd_refine_dir(args: argparse.Namespace) -> int:
     return 1 if result.files_failed else 0
 
 
+def _parse_langs_csv(value: str) -> list[str]:
+    """Split a comma-separated language list; drop blanks and duplicates
+    while preserving caller order.
+
+    Used by ``translate-multi`` so operators can write
+    ``--langs ko,ja,zh-CN`` without caring about spaces around commas.
+    """
+    out: list[str] = []
+    seen: set = set()
+    for raw in value.split(","):
+        lang = raw.strip()
+        if not lang:
+            continue
+        if lang in seen:
+            continue
+        seen.add(lang)
+        out.append(lang)
+    return out
+
+
+def cmd_translate_multi(args: argparse.Namespace) -> int:
+    langs = _parse_langs_csv(args.langs)
+    if not langs:
+        print(
+            "error: --langs must contain at least one locale.",
+            file=sys.stderr,
+        )
+        return 2
+    target_template: str = args.target_template
+    if "{lang}" not in target_template:
+        print(
+            "error: --target-template must contain the literal substring "
+            "'{lang}' — it is expanded per-locale (e.g. out/{lang}/source.md).",
+            file=sys.stderr,
+        )
+        return 2
+    po_template: Optional[str] = getattr(args, "po_template", None)
+    if po_template is not None and "{lang}" not in po_template:
+        print(
+            "error: --po-template must contain the literal substring "
+            "'{lang}' when supplied.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Path templates are user input — an unmatched brace or an extra
+    # placeholder like ``{version}`` would otherwise bubble up from
+    # str.format as a raw KeyError / ValueError traceback instead of a
+    # clean usage error.  Only ``{lang}`` is supported and the CLI
+    # already validated the literal substring above; anything else is
+    # rejected here with a specific error message.
+    try:
+        target_paths: Dict[str, Path] = {
+            lang: Path(target_template.format(lang=lang)) for lang in langs
+        }
+    except (KeyError, ValueError, IndexError) as exc:
+        print(
+            "error: --target-template contains unsupported format "
+            f"expressions ({exc}). Only the literal placeholder "
+            "'{lang}' is supported; any other brace expression must be "
+            "removed or escaped.",
+            file=sys.stderr,
+        )
+        return 2
+    po_paths: Optional[Dict[str, Path]] = None
+    if po_template:
+        try:
+            po_paths = {
+                lang: Path(po_template.format(lang=lang)) for lang in langs
+            }
+        except (KeyError, ValueError, IndexError) as exc:
+            print(
+                "error: --po-template contains unsupported format "
+                f"expressions ({exc}). Only the literal placeholder "
+                "'{lang}' is supported; any other brace expression must be "
+                "removed or escaped.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # target_lang is ignored by process_document_multi but the
+    # processor constructor still requires a locale; use the first lang
+    # as a harmless placeholder so the validator helpers still resolve.
+    setattr(args, "target", getattr(args, "target", None) or langs[0])
+
+    hook, closer = _make_progress_hook(args, kind="file")
+    processor = _build_processor(args, progress_callback=hook)
+    json_receipt = getattr(args, "json_receipt", None)
+    try:
+        try:
+            result = processor.process_document_multi(
+                Path(args.source),
+                target_langs=langs,
+                target_paths=target_paths,
+                po_paths=po_paths,
+            )
+        except ValueError as exc:
+            if closer is not None:
+                closer.close()
+            return _handle_usage_error(exc)
+        except BaseException as exc:
+            if closer is not None:
+                closer.close()
+            partial = getattr(exc, "partial_receipt", None)
+            if partial is not None:
+                if hasattr(partial, "render"):
+                    print(partial.render(), file=sys.stderr)
+                if json_receipt is not None:
+                    _write_receipt_json(partial, json_receipt)
+            raise
+    finally:
+        if closer is not None:
+            closer.close()
+
+    summary: Dict[str, Any] = {
+        "source_path": result["source_path"],
+        "target_langs": result["target_langs"],
+        "by_lang": {
+            lang: {
+                "target_path": pr["target_path"],
+                "po_path": pr["po_path"],
+                "blocks_count": pr["blocks_count"],
+                "translation_stats": pr["translation_stats"].to_dict()
+                if hasattr(pr["translation_stats"], "to_dict")
+                else pr["translation_stats"],
+                "coverage": pr["coverage"].to_dict()
+                if hasattr(pr["coverage"], "to_dict")
+                else pr["coverage"],
+            }
+            for lang, pr in result["by_lang"].items()
+        },
+    }
+    _print_result(summary)
+    receipt = result["receipt"]
+    if hasattr(receipt, "render"):
+        print(receipt.render(), file=sys.stderr)
+    if json_receipt is not None:
+        _write_receipt_json(receipt, json_receipt)
+
+    any_failed = any(
+        pr["translation_stats"]["failed"]
+        or pr["translation_stats"]["validation_failed"]
+        for pr in result["by_lang"].values()
+    )
+    return 1 if any_failed else 0
+
+
 def cmd_estimate(args: argparse.Namespace) -> int:
     processor = _build_processor(args)
     estimate = processor.estimate(
@@ -774,6 +921,87 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-workers", type=int, default=4, help="Concurrent file workers."
     )
     p_rfd.set_defaults(func=cmd_refine_dir)
+
+    p_multi = sub.add_parser(
+        "translate-multi",
+        help=(
+            "Translate a single markdown file into MULTIPLE target "
+            "languages in one batched call."
+        ),
+    )
+    _add_shared_flags(p_multi)
+    p_multi.add_argument(
+        "--langs",
+        required=True,
+        help=(
+            "Comma-separated BCP 47 locales (e.g. 'ko,ja,zh-CN'). "
+            "Duplicates dropped, order preserved."
+        ),
+    )
+    p_multi.add_argument(
+        "--target-template",
+        required=True,
+        help=(
+            "Per-locale output markdown path template containing the "
+            "literal substring '{lang}', e.g. 'out/{lang}/README.md'."
+        ),
+    )
+    p_multi.add_argument(
+        "--po-template",
+        default=None,
+        help=(
+            "Optional per-locale PO path template containing '{lang}'. "
+            "Defaults to the target template with a '.po' suffix."
+        ),
+    )
+    p_multi.add_argument(
+        "--validation",
+        choices=["off", "conservative", "strict"],
+        default="off",
+        help="Post-translation structural validation.",
+    )
+    p_multi.add_argument(
+        "--glossary",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a JSON glossary file. Per-locale entries in the "
+            "file are resolved for the FIRST lang in --langs only; "
+            "callers with stronger per-locale needs should run "
+            "single-target 'translate' per lang instead."
+        ),
+    )
+    p_multi.add_argument(
+        "--glossary-mode",
+        choices=["instruction", "placeholder"],
+        default="instruction",
+        help="How to feed glossary terms to the LLM (see 'translate').",
+    )
+    p_multi.add_argument(
+        "--extra-instructions",
+        type=str,
+        default=None,
+        help="Additional prompt instructions (tone, domain, audience).",
+    )
+    p_multi.add_argument(
+        "--prompt-cache",
+        action="store_true",
+        help="Mark the stable system prefix as cacheable.",
+    )
+    p_multi.add_argument(
+        "--json-receipt",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Also write the run receipt (tokens, cost, duration) as JSON to PATH.",
+    )
+    p_multi.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the progress bar even on a TTY.",
+    )
+    p_multi.add_argument("source", help="Source markdown file.")
+    p_multi.set_defaults(func=cmd_translate_multi)
 
     p_est = sub.add_parser("estimate", help="Estimate pending blocks and tokens (no API calls).")
     _add_estimate_flags(p_est)

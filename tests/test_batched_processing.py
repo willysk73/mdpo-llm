@@ -2458,3 +2458,859 @@ class TestEstimate:
         assert est["batches"] >= 1
         # No API call should have been made.
         assert mock_completion.completion.call_count == 0
+
+
+def _multi_side_effect_factory(langs):
+    """Build a ``litellm.completion`` side_effect for the multi-target path.
+
+    Detects a JSON-object user payload and returns a nested-dict response
+    ``{block_id: {lang: f'[TRANSLATED:{lang}] {source}'}}`` for every
+    provided language.  Plain-string user payloads (per-lang fallback calls)
+    get the single-target sentinel so fallback tests still round-trip.
+    """
+
+    def _side_effect(*args, **kwargs):
+        messages = kwargs.get("messages", args[0] if args else [])
+        user_content = ""
+        for msg in reversed(messages):
+            if msg["role"] == "user":
+                user_content = msg["content"]
+                break
+        parsed = None
+        if isinstance(user_content, str) and user_content.strip().startswith("{"):
+            try:
+                parsed = json.loads(user_content)
+            except json.JSONDecodeError:
+                parsed = None
+        resp = MagicMock()
+        if isinstance(parsed, dict):
+            out = {
+                k: {lang: f"[TRANSLATED:{lang}] {v}" for lang in langs}
+                for k, v in parsed.items()
+            }
+            resp.choices[0].message.content = json.dumps(out, ensure_ascii=False)
+        else:
+            resp.choices[0].message.content = f"[TRANSLATED:fallback] {user_content}"
+        resp.usage.prompt_tokens = 11
+        resp.usage.completion_tokens = 5
+        return resp
+
+    return _side_effect
+
+
+class TestMultiTargetProcessing:
+    def test_single_call_produces_all_langs(
+        self, tmp_path, mock_completion
+    ):
+        mock_completion.completion.side_effect = _multi_side_effect_factory(
+            ["ko", "ja"]
+        )
+        md = "# Title\n\nParagraph one.\n\nParagraph two.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        target_paths = {
+            "ko": tmp_path / "ko" / "source.md",
+            "ja": tmp_path / "ja" / "source.md",
+        }
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        result = p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths=target_paths,
+        )
+        # One LLM call should cover every block for both langs.
+        assert mock_completion.completion.call_count == 1
+        assert result["target_langs"] == ["ko", "ja"]
+        assert set(result["by_lang"].keys()) == {"ko", "ja"}
+        ko_out = target_paths["ko"].read_text(encoding="utf-8")
+        ja_out = target_paths["ja"].read_text(encoding="utf-8")
+        assert "[TRANSLATED:ko]" in ko_out
+        assert "[TRANSLATED:ja]" in ja_out
+        # Receipt shared across langs; per-lang ProcessResult has none.
+        assert result["receipt"] is not None
+        for pr in result["by_lang"].values():
+            assert pr["receipt"] is None
+
+    def test_default_po_path_per_lang(self, tmp_path, mock_completion):
+        mock_completion.completion.side_effect = _multi_side_effect_factory(
+            ["ko", "ja"]
+        )
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        target_paths = {
+            "ko": tmp_path / "ko.md",
+            "ja": tmp_path / "ja.md",
+        }
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        result = p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths=target_paths,
+        )
+        assert Path(result["by_lang"]["ko"]["po_path"]).name == "ko.po"
+        assert Path(result["by_lang"]["ja"]["po_path"]).name == "ja.po"
+
+    def test_rejects_refine_mode(self, tmp_path, mock_completion):
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(
+            model="test-model", target_lang="en", batch_size=40, mode="refine"
+        )
+        with pytest.raises(ValueError, match="mode='translate'"):
+            p.process_document_multi(
+                source,
+                target_langs=["ko", "ja"],
+                target_paths={
+                    "ko": tmp_path / "ko.md",
+                    "ja": tmp_path / "ja.md",
+                },
+            )
+
+    def test_rejects_empty_target_langs(self, tmp_path, mock_completion):
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        with pytest.raises(ValueError, match="target_langs"):
+            p.process_document_multi(
+                source, target_langs=[], target_paths={}
+            )
+
+    def test_rejects_missing_target_path_for_lang(
+        self, tmp_path, mock_completion
+    ):
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        with pytest.raises(ValueError, match="target_paths missing"):
+            p.process_document_multi(
+                source,
+                target_langs=["ko", "ja"],
+                target_paths={"ko": tmp_path / "ko.md"},
+            )
+
+    def test_rejects_duplicate_target_paths(
+        self, tmp_path, mock_completion
+    ):
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        shared = tmp_path / "shared.md"
+        with pytest.raises(ValueError, match="distinct paths"):
+            p.process_document_multi(
+                source,
+                target_langs=["ko", "ja"],
+                target_paths={"ko": shared, "ja": shared},
+            )
+
+    def test_rejects_target_equal_to_source(self, tmp_path, mock_completion):
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        with pytest.raises(ValueError, match="source path"):
+            p.process_document_multi(
+                source,
+                target_langs=["ko", "ja"],
+                target_paths={"ko": source, "ja": tmp_path / "ja.md"},
+            )
+
+    def test_dedupes_duplicate_target_langs(self, tmp_path, mock_completion):
+        mock_completion.completion.side_effect = _multi_side_effect_factory(
+            ["ko"]
+        )
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        result = p.process_document_multi(
+            source,
+            target_langs=["ko", "ko"],
+            target_paths={"ko": tmp_path / "ko.md"},
+        )
+        assert result["target_langs"] == ["ko"]
+
+    def test_partial_response_falls_back_per_lang(
+        self, tmp_path, mock_completion
+    ):
+        """Missing 'ja' in the multi-response triggers per-lang fallback."""
+        # Return multi-target dict but omit "ja" everywhere.  The processor
+        # should issue per-lang single-target fallback calls for JA while
+        # committing KO directly.
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            parsed = None
+            if (
+                isinstance(user_content, str)
+                and user_content.strip().startswith("{")
+            ):
+                try:
+                    parsed = json.loads(user_content)
+                except json.JSONDecodeError:
+                    parsed = None
+            resp = MagicMock()
+            if isinstance(parsed, dict):
+                # Multi-call: omit "ja" entirely so it drops into
+                # per-lang fallback.
+                out = {k: {"ko": f"[TRANSLATED:ko] {v}"} for k, v in parsed.items()}
+                resp.choices[0].message.content = json.dumps(
+                    out, ensure_ascii=False
+                )
+            else:
+                # Per-lang fallback (plain user string).
+                resp.choices[0].message.content = (
+                    f"[TRANSLATED:fallback] {user_content}"
+                )
+            resp.usage.prompt_tokens = 7
+            resp.usage.completion_tokens = 3
+            return resp
+
+        mock_completion.completion.side_effect = _side_effect
+        md = "# T\n\nP1.\n\nP2.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        target_paths = {
+            "ko": tmp_path / "ko.md",
+            "ja": tmp_path / "ja.md",
+        }
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        result = p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths=target_paths,
+        )
+        # KO committed via multi-call; JA committed via per-lang fallback.
+        ko_out = target_paths["ko"].read_text(encoding="utf-8")
+        ja_out = target_paths["ja"].read_text(encoding="utf-8")
+        assert "[TRANSLATED:ko]" in ko_out
+        assert "[TRANSLATED:fallback]" in ja_out
+        # One multi-call plus N per-lang fallback calls.
+        assert mock_completion.completion.call_count >= 2
+        assert result["by_lang"]["ja"]["translation_stats"]["processed"] >= 3
+
+    def test_skips_blocks_fully_done_across_all_langs(
+        self, tmp_path, mock_completion
+    ):
+        """Second run with no source changes makes zero LLM calls."""
+        mock_completion.completion.side_effect = _multi_side_effect_factory(
+            ["ko", "ja"]
+        )
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        target_paths = {
+            "ko": tmp_path / "ko.md",
+            "ja": tmp_path / "ja.md",
+        }
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths=target_paths,
+        )
+        first = mock_completion.completion.call_count
+        p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths=target_paths,
+        )
+        # No pending blocks => no LLM calls on the re-run.
+        assert mock_completion.completion.call_count == first
+
+    def test_receipt_billed_once_for_multi_target(
+        self, tmp_path, mock_completion
+    ):
+        mock_completion.completion.side_effect = _multi_side_effect_factory(
+            ["ko", "ja", "zh"]
+        )
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        target_paths = {
+            "ko": tmp_path / "ko.md",
+            "ja": tmp_path / "ja.md",
+            "zh": tmp_path / "zh.md",
+        }
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        result = p.process_document_multi(
+            source,
+            target_langs=["ko", "ja", "zh"],
+            target_paths=target_paths,
+        )
+        # Single LLM call.
+        assert mock_completion.completion.call_count == 1
+        receipt = result["receipt"]
+        # One call's usage, NOT tripled.
+        assert receipt["api_calls"] == 1
+        assert receipt["input_tokens"] == 11
+        assert receipt["output_tokens"] == 5
+        # target_lang names every locale for auditability.
+        assert receipt["target_lang"] == "ko,ja,zh"
+
+    def test_rejects_target_colliding_with_another_langs_po(
+        self, tmp_path, mock_completion
+    ):
+        """A target markdown path aliasing a PO path MUST raise up front —
+        otherwise the save loop deterministically clobbers one with the
+        other.
+        """
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        shared = tmp_path / "shared.out"
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        with pytest.raises(ValueError, match="resolve to the same file"):
+            p.process_document_multi(
+                source,
+                target_langs=["ko", "ja"],
+                target_paths={
+                    "ko": shared,
+                    "ja": tmp_path / "ja.md",
+                },
+                po_paths={
+                    "ko": tmp_path / "ko.po",
+                    "ja": shared,  # ja's PO aliases ko's target
+                },
+            )
+
+    def test_fallback_uses_per_lang_glossary_resolution(
+        self, tmp_path, mock_completion
+    ):
+        """Per-lang fallback must resolve locale-keyed glossary entries
+        against the CALL's target lang, not the processor's
+        constructor-time ``target_lang``.
+        """
+        gloss_path = tmp_path / "glossary.json"
+        gloss_path.write_text(
+            json.dumps({"widget": {"ko": "위젯", "ja": "ウィジェット"}}),
+            encoding="utf-8",
+        )
+
+        # Multi-response is empty, forcing every block into per-lang
+        # fallback so we can inspect the system prompt sent for each lang.
+        prompts_seen: list = []
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            system = ""
+            user_content = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    content = msg["content"]
+                    if isinstance(content, list):
+                        system = "".join(
+                            part.get("text", "") for part in content
+                        )
+                    else:
+                        system = content
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+            prompts_seen.append(system)
+            parsed = None
+            if (
+                isinstance(user_content, str)
+                and user_content.strip().startswith("{")
+            ):
+                try:
+                    parsed = json.loads(user_content)
+                except json.JSONDecodeError:
+                    parsed = None
+            resp = MagicMock()
+            if isinstance(parsed, dict):
+                resp.choices[0].message.content = "{}"
+            else:
+                resp.choices[0].message.content = f"[TRANSLATED] {user_content}"
+            resp.usage.prompt_tokens = 3
+            resp.usage.completion_tokens = 1
+            return resp
+
+        mock_completion.completion.side_effect = _side_effect
+
+        md = "# widget demo\n\nThis uses a widget today.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            glossary_path=gloss_path,
+        )
+        p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths={
+                "ko": tmp_path / "ko.md",
+                "ja": tmp_path / "ja.md",
+            },
+        )
+
+        ko_prompts = [s for s in prompts_seen if "**ko**" in s]
+        ja_prompts = [s for s in prompts_seen if "**ja**" in s]
+        assert ko_prompts, "expected at least one fallback prompt targeting ko"
+        assert ja_prompts, "expected at least one fallback prompt targeting ja"
+        for s in ko_prompts:
+            assert "위젯" in s
+            assert "ウィジェット" not in s
+        for s in ja_prompts:
+            assert "ウィジェット" in s
+            assert "위젯" not in s
+
+    def test_batch_prompt_carries_per_lang_glossary_blocks(
+        self, tmp_path, mock_completion
+    ):
+        """Multi-target batch prompt labels glossary blocks per lang so
+        locale-specific replacements cannot cross into the wrong lang.
+        """
+        gloss_path = tmp_path / "glossary.json"
+        gloss_path.write_text(
+            json.dumps({"widget": {"ko": "위젯", "ja": "ウィジェット"}}),
+            encoding="utf-8",
+        )
+
+        captured_system: list = []
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            system_content = ""
+            user_content = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    content = msg["content"]
+                    if isinstance(content, list):
+                        system_content = "".join(
+                            part.get("text", "") for part in content
+                        )
+                    else:
+                        system_content = content
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+            captured_system.append(system_content)
+            parsed = None
+            if (
+                isinstance(user_content, str)
+                and user_content.strip().startswith("{")
+            ):
+                try:
+                    parsed = json.loads(user_content)
+                except json.JSONDecodeError:
+                    parsed = None
+            resp = MagicMock()
+            if isinstance(parsed, dict):
+                out = {
+                    k: {
+                        "ko": f"[TRANSLATED:ko] {v}",
+                        "ja": f"[TRANSLATED:ja] {v}",
+                    }
+                    for k, v in parsed.items()
+                }
+                resp.choices[0].message.content = json.dumps(
+                    out, ensure_ascii=False
+                )
+            else:
+                resp.choices[0].message.content = f"[TRANSLATED] {user_content}"
+            resp.usage.prompt_tokens = 5
+            resp.usage.completion_tokens = 2
+            return resp
+
+        mock_completion.completion.side_effect = _side_effect
+
+        md = "# widget demo\n\nThe widget ships today.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            glossary_path=gloss_path,
+        )
+        p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths={
+                "ko": tmp_path / "ko.md",
+                "ja": tmp_path / "ja.md",
+            },
+        )
+        assert captured_system, "no LLM calls were captured"
+        batch_prompt = captured_system[0]
+        assert "Glossary (ko)" in batch_prompt
+        assert "Glossary (ja)" in batch_prompt
+        assert "위젯" in batch_prompt
+        assert "ウィジェット" in batch_prompt
+
+    def test_rejects_placeholder_glossary_mode_multi_target(
+        self, tmp_path, mock_completion
+    ):
+        """Placeholder-mode glossary bakes target-lang replacements at encode
+        time; multi-target can't fan that out without corrupting at least
+        one language, so the call must refuse up front.
+        """
+        md = "# T\n\nThe widget ships.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            glossary={"widget": "위젯"},
+            glossary_mode="placeholder",
+        )
+        with pytest.raises(ValueError, match="glossary_mode='placeholder'"):
+            p.process_document_multi(
+                source,
+                target_langs=["ko", "ja"],
+                target_paths={
+                    "ko": tmp_path / "ko.md",
+                    "ja": tmp_path / "ja.md",
+                },
+            )
+
+    def test_rejects_placeholder_when_file_has_only_unmatched_locale_keys(
+        self, tmp_path, mock_completion
+    ):
+        """A locale-keyed glossary file whose entries don't resolve for the
+        constructor-time target_lang still configures a glossary source —
+        the multi-target call must refuse rather than silently drop it.
+        """
+        gloss_path = tmp_path / "glossary.json"
+        gloss_path.write_text(
+            json.dumps({"term": {"ko": "A", "ja": "B"}}),
+            encoding="utf-8",
+        )
+        md = "# T\n\nThe term ships.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        # target_lang='en' leaves self._glossary['term'] == None, which
+        # is falsy-looking at entry level; the guard must still trip.
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            batch_size=40,
+            glossary_path=gloss_path,
+            glossary_mode="placeholder",
+        )
+        with pytest.raises(ValueError, match="glossary_mode='placeholder'"):
+            p.process_document_multi(
+                source,
+                target_langs=["ko", "ja"],
+                target_paths={
+                    "ko": tmp_path / "ko.md",
+                    "ja": tmp_path / "ja.md",
+                },
+            )
+
+    def test_any_pending_order_matches_source_order(
+        self, tmp_path, mock_completion
+    ):
+        """When langs have disjoint pending subsets, the merged
+        ``any_pending_ordered`` MUST walk source-document order so the
+        section-aware grouper and reference-pool seeding still see
+        blocks in the same sequence regardless of which lang supplied
+        them.
+        """
+        mock_completion.completion.side_effect = _multi_side_effect_factory(
+            ["ko", "ja"]
+        )
+        md = "# A\n\nP1.\n\nP2.\n\nP3.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        target_paths = {
+            "ko": tmp_path / "ko.md",
+            "ja": tmp_path / "ja.md",
+        }
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        # First pass — both langs get everything translated.
+        p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths=target_paths,
+        )
+
+        # Hand-craft an uneven state: clear ja's msgstr for the heading
+        # only (so ja needs block 0), and clear ko's msgstr for P3 only
+        # (so ko needs last block). Source order is heading, P1, P2, P3.
+        import polib as _polib
+        ja_po = _polib.pofile(str(target_paths["ja"].with_suffix(".po")))
+        ko_po = _polib.pofile(str(target_paths["ko"].with_suffix(".po")))
+        ja_entries = [e for e in ja_po if not e.obsolete]
+        ko_entries = [e for e in ko_po if not e.obsolete]
+        ja_entries[0].msgstr = ""  # clear heading in ja
+        ko_entries[-1].msgstr = ""  # clear last block in ko
+        ja_po.save(str(target_paths["ja"].with_suffix(".po")), newline="\n")
+        ko_po.save(str(target_paths["ko"].with_suffix(".po")), newline="\n")
+
+        captured_user: list = []
+
+        def _record(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    captured_user.append(msg["content"])
+                    break
+            parsed = None
+            content = captured_user[-1] if captured_user else ""
+            if (
+                isinstance(content, str)
+                and content.strip().startswith("{")
+            ):
+                try:
+                    parsed = json.loads(content)
+                except json.JSONDecodeError:
+                    parsed = None
+            resp = MagicMock()
+            if isinstance(parsed, dict):
+                out = {
+                    k: {
+                        "ko": f"[TRANSLATED:ko] {v}",
+                        "ja": f"[TRANSLATED:ja] {v}",
+                    }
+                    for k, v in parsed.items()
+                }
+                resp.choices[0].message.content = json.dumps(
+                    out, ensure_ascii=False
+                )
+            else:
+                resp.choices[0].message.content = f"[TRANSLATED] {content}"
+            resp.usage.prompt_tokens = 3
+            resp.usage.completion_tokens = 1
+            return resp
+
+        mock_completion.completion.side_effect = _record
+        mock_completion.completion.reset_mock()
+        p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths=target_paths,
+        )
+        # Exactly one batch call covering both pending blocks.
+        assert captured_user, "no user payload captured"
+        payload = json.loads(captured_user[0])
+        ordered_ctxs = list(payload.keys())
+        # Heading must precede P3 in the batch, matching source order —
+        # without the source-order fix, ko's P3 would land first.
+        heading_ctxs = [c for c in ordered_ctxs if "heading" in c]
+        para_ctxs = [c for c in ordered_ctxs if "para" in c]
+        assert heading_ctxs, f"no heading ctx in {ordered_ctxs}"
+        assert para_ctxs, f"no para ctx in {ordered_ctxs}"
+        assert ordered_ctxs.index(heading_ctxs[0]) < ordered_ctxs.index(
+            para_ctxs[-1]
+        )
+
+    def test_warns_when_batch_concurrency_requested(
+        self, tmp_path, mock_completion, caplog
+    ):
+        """batch_concurrency>1 is not yet honoured in multi-target; users who
+        opted in MUST see a loud warning so they know the flag was ignored.
+        """
+        mock_completion.completion.side_effect = _multi_side_effect_factory(
+            ["ko", "ja"]
+        )
+        md = "# T\n\nP.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            batch_concurrency=4,
+        )
+        with caplog.at_level(logging.WARNING, logger="mdpo_llm.processor"):
+            p.process_document_multi(
+                source,
+                target_langs=["ko", "ja"],
+                target_paths={
+                    "ko": tmp_path / "ko.md",
+                    "ja": tmp_path / "ja.md",
+                },
+            )
+        assert any(
+            "batch_concurrency" in rec.message.lower()
+            for rec in caplog.records
+        )
+
+    def test_batch_size_zero_skips_batcher(
+        self, tmp_path, mock_completion
+    ):
+        """``batch_size=0`` MUST opt out of the JSON batch wire for
+        multi-target too: every block flows through per-lang
+        single-target calls, same escape hatch as single-target.
+        """
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            # Assert no JSON-object payload reaches the model.
+            assert not user_content.strip().startswith("{"), (
+                "batch_size=0 should skip the batch wire entirely"
+            )
+            resp = MagicMock()
+            resp.choices[0].message.content = f"[TRANSLATED] {user_content}"
+            resp.usage.prompt_tokens = 2
+            resp.usage.completion_tokens = 1
+            return resp
+
+        mock_completion.completion.side_effect = _side_effect
+        md = "# T\n\nP1.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=0)
+        result = p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths={
+                "ko": tmp_path / "ko.md",
+                "ja": tmp_path / "ja.md",
+            },
+        )
+        # Only per-entry calls — zero batched calls.
+        for lang in ("ko", "ja"):
+            stats = result["by_lang"][lang]["translation_stats"]
+            assert stats["batched_calls"] == 0
+            assert stats["per_entry_calls"] >= 1
+
+    def test_validation_uses_per_lang_glossary(
+        self, tmp_path, mock_completion
+    ):
+        """When validation is enabled, a ja/zh commit is measured against
+        ja/zh's glossary mapping — not the constructor target_lang's.
+        """
+        gloss_path = tmp_path / "glossary.json"
+        gloss_path.write_text(
+            json.dumps({"widget": {"ko": "위젯", "ja": "ウィジェット"}}),
+            encoding="utf-8",
+        )
+
+        # Return batch response where KO contains 위젯 and JA contains
+        # ウィジェット, matching each locale's glossary.  If validation
+        # used ko's glossary for both, the ja entry would look like a
+        # missing-glossary-term fail.
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            parsed = None
+            if (
+                isinstance(user_content, str)
+                and user_content.strip().startswith("{")
+            ):
+                try:
+                    parsed = json.loads(user_content)
+                except json.JSONDecodeError:
+                    parsed = None
+            resp = MagicMock()
+            if isinstance(parsed, dict):
+                out = {
+                    k: {
+                        "ko": v.replace("widget", "위젯"),
+                        "ja": v.replace("widget", "ウィジェット"),
+                    }
+                    for k, v in parsed.items()
+                }
+                resp.choices[0].message.content = json.dumps(out, ensure_ascii=False)
+            else:
+                resp.choices[0].message.content = f"[TRANSLATED] {user_content}"
+            resp.usage.prompt_tokens = 4
+            resp.usage.completion_tokens = 2
+            return resp
+
+        mock_completion.completion.side_effect = _side_effect
+
+        md = "# widget demo\n\nThe widget ships soon.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            glossary_path=gloss_path,
+            validation="strict",
+        )
+        result = p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths={
+                "ko": tmp_path / "ko.md",
+                "ja": tmp_path / "ja.md",
+            },
+        )
+        # Neither lang should have validation_failed entries — each is
+        # validated against its own locale-specific glossary mapping.
+        assert result["by_lang"]["ko"]["translation_stats"]["validation_failed"] == 0
+        assert result["by_lang"]["ja"]["translation_stats"]["validation_failed"] == 0
+
+    def test_per_lang_stats_report_per_lang_fallback_only(
+        self, tmp_path, mock_completion
+    ):
+        """A fallback call triggered by a missing 'ja' entry must NOT be
+        counted under 'ko' in the per-lang stats.
+        """
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            for msg in reversed(messages):
+                if msg["role"] == "user":
+                    user_content = msg["content"]
+                    break
+            parsed = None
+            if (
+                isinstance(user_content, str)
+                and user_content.strip().startswith("{")
+            ):
+                try:
+                    parsed = json.loads(user_content)
+                except json.JSONDecodeError:
+                    parsed = None
+            resp = MagicMock()
+            if isinstance(parsed, dict):
+                # Full KO coverage, no JA — forces JA fallback only.
+                out = {k: {"ko": f"[TRANSLATED:ko] {v}"} for k, v in parsed.items()}
+                resp.choices[0].message.content = json.dumps(
+                    out, ensure_ascii=False
+                )
+            else:
+                resp.choices[0].message.content = f"[TRANSLATED:ja] {user_content}"
+            resp.usage.prompt_tokens = 7
+            resp.usage.completion_tokens = 3
+            return resp
+
+        mock_completion.completion.side_effect = _side_effect
+        md = "# T\n\nP1.\n\nP2.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        target_paths = {
+            "ko": tmp_path / "ko.md",
+            "ja": tmp_path / "ja.md",
+        }
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        result = p.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths=target_paths,
+        )
+        ko_stats = result["by_lang"]["ko"]["translation_stats"]
+        ja_stats = result["by_lang"]["ja"]["translation_stats"]
+        # Only JA triggered per-entry fallback calls.
+        assert ko_stats["per_entry_calls"] == 0
+        assert ja_stats["per_entry_calls"] >= 1
+        # batched_calls is shared across langs (same call served both).
+        assert ko_stats["batched_calls"] == ja_stats["batched_calls"]
+        assert ko_stats["batched_calls"] >= 1

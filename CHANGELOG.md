@@ -3,6 +3,72 @@
 ## Unreleased
 
 ### Added
+- **`processor.py` — `process_document_multi` / multi-target translation
+  (experimental)**: new method on `MarkdownProcessor` that translates a
+  single Markdown source into multiple target languages in a single
+  batched LLM call per source group. Source-side decomposition
+  (placeholder substitution, glossary matching, reference lookup) runs
+  ONCE per block regardless of `len(target_langs)`, so the input-token
+  bill is amortised across every target while only output tokens grow
+  with the fan-out. Each language has its own per-lang PO file and
+  per-lang reference pool seeded from that PO; translations do not
+  cross languages. Per-lang fallback kicks in when the model returns
+  partial per-lang coverage — any lang present commits directly, and
+  any lang absent for a given block drops into an independent
+  single-target per-entry call, so PO files are never left
+  half-populated. Rejects `mode="refine"` (same-language by contract)
+  and does not support `inplace=True`. Returns a dict with `by_lang`
+  (per-lang `ProcessResult`, `receipt=None`), a top-level shared
+  `Receipt` (billed once across every lang; `target_lang` names the
+  comma-joined locale list for auditability), `source_path`, and
+  `target_langs`. Distinctness guards reject duplicate target/PO
+  paths across langs and reject any alias with the source path up
+  front.
+- **`batch.py` — `MultiTargetBatchTranslator`**: new class that wraps
+  `BatchTranslator`'s partitioning / bisection logic but validates
+  per-block responses as `{lang: translation}` dicts. Partial per-lang
+  coverage is preserved — any lang that came back with a well-typed
+  string is kept, and blocks whose value is not a dict (or a dict with
+  no valid per-lang strings) drop into bisection. Deduplicates /
+  validates `target_langs` up front; empty / non-string entries raise.
+- **`prompts.py` — `BATCH_MULTI_TRANSLATE_SYSTEM_TEMPLATE` /
+  `BATCH_MULTI_TRANSLATE_INSTRUCTION`**: new prompt templates for the
+  multi-target wire. Input is the usual `{key: source}` JSON; output
+  is `{key: {lang: translation}}` with every key present exactly
+  once, every per-block value containing exactly the target locales,
+  and the same placeholder / code-block / interpolation-token rules
+  as the single-target batch prompt.
+- **CLI — `translate-multi` subcommand**: `mdpo-llm translate-multi
+  SOURCE --target-template '{lang}/README.md' --langs ko,ja,zh-CN
+  --model gpt-4o` drives the multi-target path with the standard
+  batching / glossary / validation / receipt flags reused from
+  `translate`. `--target-template` and `--po-template` (optional)
+  both require the literal substring `{lang}` so the per-lang path
+  is explicit; the CLI fails up front with a usage error otherwise.
+  `--json-receipt` dumps the shared receipt.
+- **`__init__.py`**: `BatchTranslator` and `MultiTargetBatchTranslator`
+  exported at the package root for callers that wire their own
+  message construction.
+- **Tests** — `tests/test_batch.py::TestMultiTargetBatchTranslator`
+  covers happy-path fan-out, empty input, empty / non-string
+  `target_langs` rejection, dedup + order preservation, partial
+  coverage (kept as-is), non-dict value (bisected), malformed JSON
+  (bisected), single-entry failure returning `{}`, partitioning by
+  entry count, and extra langs in the response being dropped.
+  `tests/test_batched_processing.py::TestMultiTargetProcessing`
+  covers the single-call-produces-all-langs invariant, default PO
+  path derivation per lang, refine-mode rejection, empty /
+  duplicate / colliding path rejection, source-path aliasing,
+  duplicate lang dedup, the per-lang fallback path when the
+  multi-response is partial, the re-run-no-op path after a clean
+  first pass, and the billed-once receipt (one `api_calls`, locales
+  joined in `target_lang`).
+
+  The human-runnable "canonical-seeded" baseline is already
+  expressible via the existing single-target `process_document`
+  repeated per lang — no new code is required to compare the two
+  approaches after merge.
+
 - **`processor.py` — `batch_concurrency` kwarg / `--batch-concurrency N`
   CLI flag (experimental)**: `MarkdownProcessor` accepts a new
   `batch_concurrency: int = 1` kwarg that lets multiple section-aware
