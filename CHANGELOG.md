@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Fixed
+- **`processor.py` — untranslated-warning false positives**: the
+  "LLM returned untranslated output" check fired on every code block
+  because rule 3 of the translation instruction tells the model to keep
+  code as-is, so `output == source` is the expected outcome. A single
+  real-world v0.3 run produced 34 spurious warnings and buried genuine
+  prose regressions. The warning now skips entries whose block type is
+  `code` in both the sequential and batched paths; non-code block types
+  still warn as before.
+
+### Changed
+- **`prompts.py` — `BATCH_TRANSLATE_INSTRUCTION` rule 1**: tightened from
+  "No prose, no explanations, no Markdown code fences" to an explicit
+  "response MUST start with `{` and end with `}`; no ```json fences, no
+  surrounding backticks, no language tag, no preamble or epilogue".
+  Models occasionally wrapped their JSON reply in fences under the old
+  phrasing, which triggered the batch parser's bisection fallback; the
+  sharper wording removes the ambiguity.
+
 ### Added
 - **`placeholder.py` — `PlaceholderRegistry` / `PlaceholderMap` /
   `check_round_trip`**: shared-core placeholder substitution framework.
