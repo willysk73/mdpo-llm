@@ -3,6 +3,27 @@
 ## Unreleased
 
 ### Added
+- **`processor.py` — `ProgressEvent` / `progress_callback`**: new
+  `MarkdownProcessor` kwarg for a UI-agnostic progress hook. The
+  callable receives a frozen `ProgressEvent(kind, path, index, total,
+  status)` at `document_start` / `document_progress` / `document_end`
+  (per document, per batch in batched mode or per pending entry in
+  sequential mode) and `directory_start` / `file_start` / `file_end` /
+  `directory_end` (for `process_directory`). Callback exceptions are
+  logged and swallowed so a broken UI can't abort a translation.
+  Events are emitted from worker threads in the directory path.
+- **CLI — rich progress bar**: `translate` renders a batch bar for the
+  document; `translate-dir` renders a file-count bar across the run.
+  Auto-suppressed when stderr is not a TTY, when `-v` turns on
+  structured logging, when `MDPO_NO_PROGRESS` is set, or via the new
+  `--no-progress` flag. `rich>=13.0` is a new optional dependency
+  (`pip install mdpo-llm[progress]`); when it isn't installed the bar
+  silently disables without affecting core functionality.
+- **Tests** — `tests/test_batched_processing.py::TestProgressHook`
+  covers document events (batched and sequential paths), directory
+  events (start/end + per-file status), the no-op re-run path, the
+  exception-still-closes-document contract, and the
+  callback-exception-is-swallowed contract.
 - **`results.py` — `Receipt`**: per-run token/cost/duration summary with
   fields `model`, `target_lang`, `source_path`, `target_path`, `po_path`,
   `input_tokens`, `output_tokens`, `total_tokens`, `api_calls`,

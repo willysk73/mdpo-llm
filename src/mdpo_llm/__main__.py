@@ -12,12 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from . import __version__
-from .processor import MarkdownProcessor
+from .processor import MarkdownProcessor, ProgressEvent
 
 
 def _add_shared_flags(parser: argparse.ArgumentParser) -> None:
@@ -90,6 +91,15 @@ def _add_translate_flags(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help="Also write the run receipt (tokens, cost, duration) as JSON to PATH.",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help=(
+            "Disable the progress bar even on a TTY. Progress is also "
+            "auto-suppressed when stderr is not a TTY, under -v, or when "
+            "MDPO_NO_PROGRESS is set."
+        ),
+    )
 
 
 def _add_estimate_flags(parser: argparse.ArgumentParser) -> None:
@@ -107,7 +117,10 @@ def _add_estimate_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _build_processor(args: argparse.Namespace) -> MarkdownProcessor:
+def _build_processor(
+    args: argparse.Namespace,
+    progress_callback: Optional[Callable[[ProgressEvent], None]] = None,
+) -> MarkdownProcessor:
     return MarkdownProcessor(
         model=args.model,
         target_lang=args.target,
@@ -118,7 +131,170 @@ def _build_processor(args: argparse.Namespace) -> MarkdownProcessor:
         extra_instructions=getattr(args, "extra_instructions", None),
         glossary_path=getattr(args, "glossary", None),
         enable_prompt_cache=getattr(args, "prompt_cache", False),
+        progress_callback=progress_callback,
     )
+
+
+def _progress_enabled(args: argparse.Namespace) -> bool:
+    """Return True when a progress bar should render.
+
+    Suppressed on non-TTY (CI, redirected output), when ``-v`` turns on
+    structured logging (logs would interleave and scramble the bar),
+    when ``NO_COLOR`` / ``MDPO_NO_PROGRESS`` are set (standard opt-outs),
+    and when the user passed ``--no-progress``.
+    """
+    if getattr(args, "verbose", False):
+        return False
+    if getattr(args, "no_progress", False):
+        return False
+    if os.environ.get("MDPO_NO_PROGRESS"):
+        return False
+    try:
+        return sys.stderr.isatty()
+    except Exception:
+        return False
+
+
+class _RichFileProgress:
+    """Progress hook for single-document ``translate``.
+
+    One rich ``Progress`` with a single task tracking the document's
+    batches / entries. Opens on ``document_start`` and closes on
+    ``document_end`` (also on uncaught exceptions via the outer CLI
+    ``finally`` — see :func:`_with_progress`).
+
+    Rendered on stderr so it cannot corrupt the JSON result on stdout
+    when callers redirect / pipe the command output.
+    """
+
+    def __init__(self) -> None:
+        from rich.console import Console
+        from rich.progress import (
+            BarColumn,
+            Progress,
+            SpinnerColumn,
+            TextColumn,
+            TimeElapsedColumn,
+        )
+
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            transient=False,
+            console=Console(stderr=True),
+        )
+        self._task_id: Optional[int] = None
+        self._started = False
+
+    def __call__(self, event: ProgressEvent) -> None:
+        if event.kind == "document_start":
+            if not self._started:
+                self._progress.start()
+                self._started = True
+            desc = Path(event.path).name if event.path else "translate"
+            self._task_id = self._progress.add_task(
+                desc, total=max(event.total or 0, 1)
+            )
+            # Zero-work documents still render a filled bar so the user
+            # sees "nothing to do" rather than a stuck empty bar.
+            if not event.total:
+                self._progress.update(self._task_id, completed=1)
+        elif event.kind == "document_progress" and self._task_id is not None:
+            self._progress.update(
+                self._task_id, completed=event.index, total=event.total
+            )
+        elif event.kind == "document_end":
+            self.close()
+
+    def close(self) -> None:
+        if self._started:
+            self._progress.stop()
+            self._started = False
+
+
+class _RichDirectoryProgress:
+    """Progress hook for ``translate-dir``.
+
+    One bar for overall file completion; per-file document/batch events
+    are ignored (too noisy across concurrent workers). Rendered on
+    stderr so it cannot corrupt the JSON result on stdout when callers
+    redirect / pipe the command output.
+    """
+
+    def __init__(self) -> None:
+        from rich.console import Console
+        from rich.progress import (
+            BarColumn,
+            Progress,
+            SpinnerColumn,
+            TextColumn,
+            TimeElapsedColumn,
+        )
+
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]files"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TextColumn("{task.fields[current]}"),
+            transient=False,
+            console=Console(stderr=True),
+        )
+        self._task_id: Optional[int] = None
+        self._started = False
+
+    def __call__(self, event: ProgressEvent) -> None:
+        if event.kind == "directory_start":
+            if not self._started:
+                self._progress.start()
+                self._started = True
+            self._task_id = self._progress.add_task(
+                "files", total=max(event.total or 0, 1), current=""
+            )
+            if not event.total:
+                self._progress.update(self._task_id, completed=1)
+        elif event.kind == "file_start" and self._task_id is not None:
+            name = Path(event.path).name if event.path else ""
+            self._progress.update(self._task_id, current=name)
+        elif event.kind == "file_end" and self._task_id is not None:
+            # rich.progress is thread-safe: ``advance`` takes an internal
+            # lock, so concurrent worker callbacks are safe to ``advance``
+            # the shared task.
+            self._progress.advance(self._task_id, 1)
+        elif event.kind == "directory_end":
+            self.close()
+
+    def close(self) -> None:
+        if self._started:
+            self._progress.stop()
+            self._started = False
+
+
+def _make_progress_hook(
+    args: argparse.Namespace, kind: str
+) -> tuple[Optional[Callable[[ProgressEvent], None]], Optional[Any]]:
+    """Return ``(callback, closer)`` for the active CLI command.
+
+    Returns ``(None, None)`` when progress is disabled or ``rich`` isn't
+    installed. ``closer`` is an object with ``.close()`` — the CLI calls
+    it in a ``finally`` so an interrupted run still leaves a clean
+    terminal (rich leaves cursor state dirty otherwise).
+    """
+    if not _progress_enabled(args):
+        return None, None
+    try:
+        if kind == "directory":
+            hook = _RichDirectoryProgress()
+        else:
+            hook = _RichFileProgress()
+    except ImportError:
+        # rich is an optional dep — progress silently disabled.
+        return None, None
+    return hook, hook
 
 
 def _print_result(obj: Any) -> None:
@@ -155,25 +331,37 @@ def _emit_receipt(result: Any, json_receipt_path: Optional[Path]) -> None:
 
 
 def cmd_translate(args: argparse.Namespace) -> int:
-    processor = _build_processor(args)
+    hook, closer = _make_progress_hook(args, kind="file")
+    processor = _build_processor(args, progress_callback=hook)
     json_receipt = getattr(args, "json_receipt", None)
     try:
-        result = processor.process_document(
-            Path(args.source),
-            Path(args.target_file),
-            Path(args.po) if args.po else None,
-            inplace=args.inplace,
-        )
-    except BaseException as exc:
-        # Even a mid-run failure may have billed tokens; surface what we
-        # have so the operator / CI sees the real cost of the failed run.
-        partial = getattr(exc, "partial_receipt", None)
-        if partial is not None:
-            if hasattr(partial, "render"):
-                print(partial.render(), file=sys.stderr)
-            if json_receipt is not None:
-                _write_receipt_json(partial, json_receipt)
-        raise
+        try:
+            result = processor.process_document(
+                Path(args.source),
+                Path(args.target_file),
+                Path(args.po) if args.po else None,
+                inplace=args.inplace,
+            )
+        except BaseException as exc:
+            # Stop the live progress renderer BEFORE emitting the
+            # partial-receipt block. While rich is active it still owns
+            # the cursor and would overwrite / interleave the receipt on
+            # a TTY — exactly in the failure case it is meant to help
+            # with. Closing twice is a no-op.
+            if closer is not None:
+                closer.close()
+            # Even a mid-run failure may have billed tokens; surface what we
+            # have so the operator / CI sees the real cost of the failed run.
+            partial = getattr(exc, "partial_receipt", None)
+            if partial is not None:
+                if hasattr(partial, "render"):
+                    print(partial.render(), file=sys.stderr)
+                if json_receipt is not None:
+                    _write_receipt_json(partial, json_receipt)
+            raise
+    finally:
+        if closer is not None:
+            closer.close()
     _print_result(result)
     _emit_receipt(result, json_receipt)
     stats = result.translation_stats
@@ -181,25 +369,34 @@ def cmd_translate(args: argparse.Namespace) -> int:
 
 
 def cmd_translate_dir(args: argparse.Namespace) -> int:
-    processor = _build_processor(args)
+    hook, closer = _make_progress_hook(args, kind="directory")
+    processor = _build_processor(args, progress_callback=hook)
     json_receipt = getattr(args, "json_receipt", None)
     try:
-        result = processor.process_directory(
-            Path(args.source_dir),
-            Path(args.target_dir),
-            Path(args.po_dir) if args.po_dir else None,
-            glob=args.glob,
-            inplace=args.inplace,
-            max_workers=args.max_workers,
-        )
-    except BaseException as exc:
-        partial = getattr(exc, "partial_receipt", None)
-        if partial is not None:
-            if hasattr(partial, "render"):
-                print(partial.render(), file=sys.stderr)
-            if json_receipt is not None:
-                _write_receipt_json(partial, json_receipt)
-        raise
+        try:
+            result = processor.process_directory(
+                Path(args.source_dir),
+                Path(args.target_dir),
+                Path(args.po_dir) if args.po_dir else None,
+                glob=args.glob,
+                inplace=args.inplace,
+                max_workers=args.max_workers,
+            )
+        except BaseException as exc:
+            # Stop the bar before the partial-receipt print; see
+            # ``cmd_translate`` for the rationale.
+            if closer is not None:
+                closer.close()
+            partial = getattr(exc, "partial_receipt", None)
+            if partial is not None:
+                if hasattr(partial, "render"):
+                    print(partial.render(), file=sys.stderr)
+                if json_receipt is not None:
+                    _write_receipt_json(partial, json_receipt)
+            raise
+    finally:
+        if closer is not None:
+            closer.close()
     summary: Dict[str, Any] = {
         "source_dir": result.source_dir,
         "target_dir": result.target_dir,
