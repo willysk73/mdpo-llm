@@ -1,6 +1,7 @@
 """Integration tests for the batched processing path in MarkdownProcessor."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -245,6 +246,319 @@ class TestValidationGate:
         po = p.po_manager.load_or_create_po(po_path)
         # At least one entry should be flagged fuzzy by the validator.
         assert any("fuzzy" in e.flags for e in po)
+
+
+class TestReceipt:
+    """Receipt dataclass is populated on ProcessResult / DirectoryResult."""
+
+    def test_receipt_attached_with_model_and_target(
+        self, tmp_path, mock_completion, batch_processor
+    ):
+        md = "# T\n\nPara.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        result = batch_processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        receipt = result.receipt
+        assert receipt is not None
+        assert receipt.model == "test-model"
+        assert receipt.target_lang == "ko"
+        assert receipt.source_path == str(source)
+        assert receipt.target_path == str(tmp_path / "target.md")
+        assert receipt.po_path == str(tmp_path / "m.po")
+        # At least one LLM call for the batch.
+        assert receipt.api_calls >= 1
+        # Wall clock is monotonic and non-negative.
+        assert receipt.duration_seconds >= 0.0
+
+    def test_receipt_tokens_summed_from_usage(self, tmp_path, mock_completion):
+        """Token counts from ``response.usage`` accumulate across calls."""
+
+        def _with_usage(*args, **kwargs):
+            messages = kwargs.get("messages", [])
+            user_content = messages[-1]["content"]
+            try:
+                items = json.loads(user_content)
+            except json.JSONDecodeError:
+                items = None
+            mock_response = MagicMock()
+            if isinstance(items, dict):
+                translated = {k: f"[TRANSLATED] {v}" for k, v in items.items()}
+                mock_response.choices[0].message.content = json.dumps(translated)
+            else:
+                mock_response.choices[0].message.content = f"[TRANSLATED] {user_content}"
+            mock_response.usage = SimpleNamespace(
+                prompt_tokens=100, completion_tokens=50, total_tokens=150
+            )
+            return mock_response
+
+        mock_completion.completion.side_effect = _with_usage
+
+        md = "# T\n\nA.\n\nB.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        result = p.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+        receipt = result.receipt
+        # Each call contributes 100/50 → totals are a non-zero multiple.
+        assert receipt.input_tokens == 100 * receipt.api_calls
+        assert receipt.output_tokens == 50 * receipt.api_calls
+        assert receipt.total_tokens == receipt.input_tokens + receipt.output_tokens
+
+    def test_receipt_unpriced_model_reports_none_costs(
+        self, tmp_path, mock_completion, batch_processor
+    ):
+        """Unknown models fall through to ``None`` costs rather than ``$0``."""
+        md = "# T\n\nPara.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        result = batch_processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        receipt = result.receipt
+        # ``test-model`` isn't in ``litellm.model_cost``.
+        assert receipt.input_cost_per_1m_usd is None
+        assert receipt.output_cost_per_1m_usd is None
+        assert receipt.total_cost_usd is None
+        # Rendering still works and uses the em-dash fallback.
+        rendered = receipt.render()
+        assert "—" in rendered
+
+    def test_receipt_render_contains_paths_and_tokens(
+        self, tmp_path, mock_completion, batch_processor
+    ):
+        md = "# T\n\nPara.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        result = batch_processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        rendered = result.receipt.render()
+        assert "Translation receipt" in rendered
+        assert "test-model" in rendered
+        assert "ko" in rendered
+        assert str(source) in rendered
+
+    def test_save_po_failure_still_carries_partial_receipt(
+        self, tmp_path, mock_completion
+    ):
+        """A save_po failure happens after LLM calls; the exception must
+        still carry a partial Receipt so the billed cost is visible."""
+
+        def _with_usage(*args, **kwargs):
+            messages = kwargs.get("messages", [])
+            user_content = messages[-1]["content"]
+            try:
+                items = json.loads(user_content)
+            except json.JSONDecodeError:
+                items = None
+            resp = MagicMock()
+            if isinstance(items, dict):
+                translated = {k: f"[TRANSLATED] {v}" for k, v in items.items()}
+                resp.choices[0].message.content = json.dumps(translated)
+            else:
+                resp.choices[0].message.content = f"[TRANSLATED] {user_content}"
+            resp.usage = SimpleNamespace(
+                prompt_tokens=8, completion_tokens=4, total_tokens=12
+            )
+            return resp
+
+        mock_completion.completion.side_effect = _with_usage
+
+        md = "# T\n\nPara.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+
+        original_save = p.po_manager.save_po
+
+        def _boom_save(po_file, po_path):
+            raise OSError("simulated disk full")
+
+        # Patch the class method via a side-step: the processor creates a
+        # fresh POManager inside process_document, so patch the class.
+        from mdpo_llm.manager import POManager as PM
+
+        original_pm_save = PM.save_po
+        PM.save_po = lambda self, po_file, po_path: _boom_save(po_file, po_path)  # type: ignore[assignment]
+        try:
+            with pytest.raises(OSError) as excinfo:
+                p.process_document(
+                    source, tmp_path / "target.md", tmp_path / "m.po"
+                )
+        finally:
+            PM.save_po = original_pm_save  # type: ignore[assignment]
+
+        partial = getattr(excinfo.value, "partial_receipt", None)
+        assert partial is not None, (
+            "save_po failure after billed LLM calls must surface partial_receipt"
+        )
+        assert partial.api_calls >= 1
+        assert partial.input_tokens >= 8
+        assert partial.output_tokens >= 4
+
+    def test_pre_api_failure_omits_partial_receipt(
+        self, tmp_path, mock_completion, batch_processor
+    ):
+        """A failure before any LLM call must NOT attach a zero-usage
+        partial_receipt — that would mislead operators into believing
+        tokens were billed."""
+        missing = tmp_path / "does-not-exist.md"
+        with pytest.raises(FileNotFoundError) as excinfo:
+            batch_processor.process_document(
+                missing, tmp_path / "target.md", tmp_path / "m.po"
+            )
+        # No receipt attribute — zero-usage receipts are NOT emitted on
+        # pre-API failures.
+        assert getattr(excinfo.value, "partial_receipt", None) is None
+
+    def test_single_file_exception_carries_partial_receipt(
+        self, tmp_path, mock_completion
+    ):
+        """A post-API failure attaches a partial Receipt to the exception
+        so single-file CLI callers can still surface billed tokens."""
+
+        def _with_usage(*args, **kwargs):
+            messages = kwargs.get("messages", [])
+            user_content = messages[-1]["content"]
+            try:
+                items = json.loads(user_content)
+            except json.JSONDecodeError:
+                items = None
+            mock_response = MagicMock()
+            if isinstance(items, dict):
+                translated = {k: f"[TRANSLATED] {v}" for k, v in items.items()}
+                mock_response.choices[0].message.content = json.dumps(translated)
+            else:
+                mock_response.choices[0].message.content = f"[TRANSLATED] {user_content}"
+            mock_response.usage = SimpleNamespace(
+                prompt_tokens=12, completion_tokens=7, total_tokens=19
+            )
+            return mock_response
+
+        mock_completion.completion.side_effect = _with_usage
+
+        md = "# T\n\nPara.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+
+        def _boom(content, target):
+            raise RuntimeError("simulated post-API failure")
+
+        p._save_processed_document = _boom  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError) as excinfo:
+            p.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+
+        partial = getattr(excinfo.value, "partial_receipt", None)
+        assert partial is not None, "exception should carry partial_receipt"
+        assert partial.api_calls >= 1
+        assert partial.input_tokens >= 12
+        assert partial.output_tokens >= 7
+        assert partial.model == "test-model"
+        assert partial.source_path == str(source)
+
+    def test_directory_receipt_preserves_usage_on_worker_exception(
+        self, tmp_path, mock_completion
+    ):
+        """When a worker raises after issuing LLM calls, its tokens still
+        flow into the directory-level receipt.  Dropping them would make
+        ``translate-dir`` silently under-report billed usage whenever
+        reconstruction / save fails."""
+
+        def _with_usage(*args, **kwargs):
+            messages = kwargs.get("messages", [])
+            user_content = messages[-1]["content"]
+            try:
+                items = json.loads(user_content)
+            except json.JSONDecodeError:
+                items = None
+            mock_response = MagicMock()
+            if isinstance(items, dict):
+                translated = {k: f"[TRANSLATED] {v}" for k, v in items.items()}
+                mock_response.choices[0].message.content = json.dumps(translated)
+            else:
+                mock_response.choices[0].message.content = f"[TRANSLATED] {user_content}"
+            mock_response.usage = SimpleNamespace(
+                prompt_tokens=10, completion_tokens=5, total_tokens=15
+            )
+            return mock_response
+
+        mock_completion.completion.side_effect = _with_usage
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "ok.md").write_text("# Title\n\nPara.\n", encoding="utf-8")
+        (src / "boom.md").write_text("# Title\n\nPara.\n", encoding="utf-8")
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+
+        # Force the save step to fail ONLY for boom.md, after LLM calls have
+        # already been made and billed.  This mirrors the real-world case
+        # Codex flagged: post-API failure dropping its receipt on the floor.
+        original_save = p._save_processed_document
+
+        def _failing_save(content, target):
+            if target.name == "boom.md":
+                raise RuntimeError("simulated save failure")
+            return original_save(content, target)
+
+        p._save_processed_document = _failing_save  # type: ignore[method-assign]
+
+        result = p.process_directory(
+            src, tmp_path / "out", tmp_path / "po", max_workers=1
+        )
+        # One file failed, one succeeded.
+        assert result.files_failed == 1
+        # Aggregate receipt includes BOTH workers' tokens, not just the
+        # successful one's.  Each batch call books 10/5 tokens and both
+        # files issue at least one call before the failure point.
+        assert result.receipt.api_calls >= 2
+        assert result.receipt.input_tokens >= 20
+        assert result.receipt.output_tokens >= 10
+
+    def test_directory_result_aggregates_tokens(self, tmp_path, mock_completion):
+        """DirectoryResult.receipt sums usage across files."""
+
+        def _with_usage(*args, **kwargs):
+            messages = kwargs.get("messages", [])
+            user_content = messages[-1]["content"]
+            try:
+                items = json.loads(user_content)
+            except json.JSONDecodeError:
+                items = None
+            mock_response = MagicMock()
+            if isinstance(items, dict):
+                translated = {k: f"[TRANSLATED] {v}" for k, v in items.items()}
+                mock_response.choices[0].message.content = json.dumps(translated)
+            else:
+                mock_response.choices[0].message.content = f"[TRANSLATED] {user_content}"
+            mock_response.usage = SimpleNamespace(
+                prompt_tokens=10, completion_tokens=5, total_tokens=15
+            )
+            return mock_response
+
+        mock_completion.completion.side_effect = _with_usage
+
+        src = tmp_path / "src"
+        src.mkdir()
+        for name in ("a.md", "b.md"):
+            (src / name).write_text("# H\n\nPara.\n", encoding="utf-8")
+
+        p = MarkdownProcessor(model="test-model", target_lang="ko", batch_size=40)
+        result = p.process_directory(
+            src, tmp_path / "out", tmp_path / "po", max_workers=1
+        )
+        receipt = result.receipt
+        assert receipt is not None
+        # Two files, each at least one call → aggregate has both.
+        per_file_totals = [r.receipt.input_tokens for r in result.results if hasattr(r, "receipt")]
+        assert sum(per_file_totals) == receipt.input_tokens
+        assert receipt.api_calls == sum(r.receipt.api_calls for r in result.results)
 
 
 class TestEstimate:

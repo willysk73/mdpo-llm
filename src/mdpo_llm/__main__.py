@@ -14,7 +14,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from . import __version__
 from .processor import MarkdownProcessor
@@ -83,6 +83,13 @@ def _add_translate_flags(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="After translating, copy msgstr back to msgid.",
     )
+    parser.add_argument(
+        "--json-receipt",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Also write the run receipt (tokens, cost, duration) as JSON to PATH.",
+    )
 
 
 def _add_estimate_flags(parser: argparse.ArgumentParser) -> None:
@@ -120,29 +127,79 @@ def _print_result(obj: Any) -> None:
     print(json.dumps(obj, indent=2, ensure_ascii=False, default=str))
 
 
+def _write_receipt_json(receipt: Any, path: Path) -> None:
+    """Dump a receipt dataclass / dict to ``path`` as JSON."""
+    payload = receipt.to_dict() if hasattr(receipt, "to_dict") else dict(receipt)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+
+
+def _emit_receipt(result: Any, json_receipt_path: Optional[Path]) -> None:
+    """Print the human-readable receipt block and optionally dump JSON.
+
+    No-op when ``result`` has no ``receipt`` attribute / the receipt is
+    ``None`` (e.g. legacy callers that bypass the standard processor flow).
+    """
+    receipt = getattr(result, "receipt", None) if not isinstance(result, dict) else result.get("receipt")
+    if receipt is None:
+        return
+    # ``receipt`` is a ``Receipt`` instance, but hasattr("render") keeps this
+    # resilient to pure-dict round-trips (e.g. after ``json.loads``).
+    if hasattr(receipt, "render"):
+        print(receipt.render(), file=sys.stderr)
+    if json_receipt_path is not None:
+        _write_receipt_json(receipt, json_receipt_path)
+
+
 def cmd_translate(args: argparse.Namespace) -> int:
     processor = _build_processor(args)
-    result = processor.process_document(
-        Path(args.source),
-        Path(args.target_file),
-        Path(args.po) if args.po else None,
-        inplace=args.inplace,
-    )
+    json_receipt = getattr(args, "json_receipt", None)
+    try:
+        result = processor.process_document(
+            Path(args.source),
+            Path(args.target_file),
+            Path(args.po) if args.po else None,
+            inplace=args.inplace,
+        )
+    except BaseException as exc:
+        # Even a mid-run failure may have billed tokens; surface what we
+        # have so the operator / CI sees the real cost of the failed run.
+        partial = getattr(exc, "partial_receipt", None)
+        if partial is not None:
+            if hasattr(partial, "render"):
+                print(partial.render(), file=sys.stderr)
+            if json_receipt is not None:
+                _write_receipt_json(partial, json_receipt)
+        raise
     _print_result(result)
+    _emit_receipt(result, json_receipt)
     stats = result.translation_stats
     return 1 if (stats.failed or stats.validation_failed) else 0
 
 
 def cmd_translate_dir(args: argparse.Namespace) -> int:
     processor = _build_processor(args)
-    result = processor.process_directory(
-        Path(args.source_dir),
-        Path(args.target_dir),
-        Path(args.po_dir) if args.po_dir else None,
-        glob=args.glob,
-        inplace=args.inplace,
-        max_workers=args.max_workers,
-    )
+    json_receipt = getattr(args, "json_receipt", None)
+    try:
+        result = processor.process_directory(
+            Path(args.source_dir),
+            Path(args.target_dir),
+            Path(args.po_dir) if args.po_dir else None,
+            glob=args.glob,
+            inplace=args.inplace,
+            max_workers=args.max_workers,
+        )
+    except BaseException as exc:
+        partial = getattr(exc, "partial_receipt", None)
+        if partial is not None:
+            if hasattr(partial, "render"):
+                print(partial.render(), file=sys.stderr)
+            if json_receipt is not None:
+                _write_receipt_json(partial, json_receipt)
+        raise
     summary: Dict[str, Any] = {
         "source_dir": result.source_dir,
         "target_dir": result.target_dir,
@@ -152,6 +209,7 @@ def cmd_translate_dir(args: argparse.Namespace) -> int:
         "files_skipped": result.files_skipped,
     }
     _print_result(summary)
+    _emit_receipt(result, json_receipt)
     return 1 if result.files_failed else 0
 
 
