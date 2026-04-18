@@ -20,11 +20,12 @@ import polib
 from .batch import BatchTranslator
 from .manager import POManager
 from .parser import BlockParser
+from .placeholder import PlaceholderMap, PlaceholderRegistry, check_round_trip
 from .prompts import Prompts
 from .reconstructor import DocumentReconstructor
 from .reference_pool import ReferencePool
 from .results import BatchStats, Coverage, DirectoryResult, ProcessResult, Receipt
-from .validator import validate as validate_translation
+from .validator import ValidationIssue, validate as validate_translation
 
 
 ValidationMode = Literal["off", "conservative", "strict"]
@@ -176,6 +177,7 @@ class MarkdownProcessor:
         validation: ValidationMode = "off",
         enable_prompt_cache: bool = False,
         progress_callback: Optional[ProgressCallback] = None,
+        placeholders: Optional[PlaceholderRegistry] = None,
         **litellm_kwargs,
     ):
         """
@@ -212,6 +214,14 @@ class MarkdownProcessor:
                 shared UI state must handle thread-safety themselves. A
                 callback that raises is logged and suppressed so progress
                 rendering never breaks the actual work.
+            placeholders: Optional :class:`PlaceholderRegistry` whose patterns
+                are substituted with opaque ``\u27e6P:N\u27e7`` tokens before
+                each source block is sent to the LLM and restored afterwards.
+                When provided, the post-translation validator additionally
+                runs a round-trip check — any mapped token that is missing,
+                duplicated, or unexpected in the output fails the entry.
+                ``None`` (default) disables the feature; an empty registry
+                is a pass-through. T-4 ships no built-in patterns.
             **litellm_kwargs: Extra keyword arguments forwarded to
                 ``litellm.completion()``.
         """
@@ -229,6 +239,7 @@ class MarkdownProcessor:
         self.validation: ValidationMode = validation
         self.enable_prompt_cache = enable_prompt_cache
         self._progress_callback = progress_callback
+        self._placeholders = placeholders
         self._litellm_kwargs = litellm_kwargs
         # Thread-local hand-off slot so ``process_directory`` can expose each
         # worker's accumulator to ``process_document`` without changing that
@@ -314,7 +325,13 @@ class MarkdownProcessor:
 
     # ----- per-entry messaging -----
 
-    def _build_messages(self, source_text: str, reference_pairs=None):
+    def _build_messages(
+        self,
+        source_text: str,
+        reference_pairs=None,
+        *,
+        glossary_source: Optional[str] = None,
+    ):
         instruction = Prompts.TRANSLATE_INSTRUCTION
         if self._extra_instructions:
             instruction += "\n" + self._extra_instructions
@@ -323,7 +340,16 @@ class MarkdownProcessor:
             instruction=instruction,
         )
 
-        glossary_block = self._format_glossary(source_text)
+        # Glossary detection runs on the raw, unencoded source so a term
+        # sitting inside a protected span (e.g. a URL or anchor that a
+        # pattern turned into ``\u27e6P:N\u27e6``) still triggers the
+        # glossary block.  ``glossary_source`` defaults to ``source_text``
+        # so callers that don't encode stay identical to the pre-T-4 path,
+        # which keeps sequential and batched processing consistent for
+        # the same input.
+        glossary_block = self._format_glossary(
+            glossary_source if glossary_source is not None else source_text
+        )
         if glossary_block:
             system_content += "\n\n" + glossary_block
 
@@ -387,22 +413,72 @@ class MarkdownProcessor:
             return "response_format" in params
         return False
 
+    # ----- placeholder pipeline -----
+
+    def _encode_source(self, text: str) -> Tuple[str, Optional[PlaceholderMap]]:
+        """Apply the placeholder registry to ``text`` if one is configured.
+
+        Returns ``(encoded, mapping)``. Mapping is ``None`` when no
+        registry was supplied, or an empty :class:`PlaceholderMap` when
+        the registry produced no matches — callers can rely on
+        ``bool(mapping)`` to distinguish a no-op from an active
+        encoding.
+        """
+        if self._placeholders is None:
+            return text, None
+        encoded, mapping = self._placeholders.encode(text)
+        return encoded, mapping
+
+    def _decode_translation(
+        self, text: str, mapping: Optional[PlaceholderMap]
+    ) -> str:
+        """Restore tokens in ``text`` using ``mapping``.
+
+        ``None`` or an empty mapping is a no-op, so callers can stay
+        placeholder-oblivious when no registry is configured.
+        """
+        if not mapping:
+            return text
+        return PlaceholderRegistry.decode(text, mapping)
+
     def _call_llm(
         self,
         source_text: str,
         reference_pairs=None,
         usage: Optional[_UsageAccumulator] = None,
     ):
-        messages = self._build_messages(source_text, reference_pairs)
+        encoded_source, mapping = self._encode_source(source_text)
+        messages = self._build_messages(
+            encoded_source,
+            reference_pairs,
+            glossary_source=source_text,
+        )
         response = litellm.completion(
             model=self.model, messages=messages, **self._litellm_kwargs
         )
         if usage is not None:
             usage.record(response)
-        result = response.choices[0].message.content
+        raw = response.choices[0].message.content
+        # Run ``post_process`` BEFORE decoding so the round-trip check,
+        # which reads ``last_encoded_response`` below, sees the final
+        # text that will be committed to the PO entry.  If a caller's
+        # hook edits a protected span (normalises URLs, strips
+        # punctuation, etc.) after decode, the change would otherwise
+        # slip past validation and corrupt the preserved content.  When
+        # placeholders are active the hook sees ``\u27e6P:N\u27e7``
+        # tokens — callers who want the decoded form should apply their
+        # transform outside the pipeline.
         if self._post_process:
-            result = self._post_process(result)
-        return result
+            raw = self._post_process(raw)
+        # Stash the post-processed encoded response + mapping so
+        # ``_apply_validation`` (same thread, same pipeline step) runs
+        # the round-trip check against the exact text that will be
+        # decoded and stored.  Cleared inside ``_apply_validation`` so a
+        # later per-entry call on the same thread never inherits stale
+        # context.
+        self._tls.last_encoded_response = raw
+        self._tls.last_placeholder_map = mapping
+        return self._decode_translation(raw, mapping)
 
     # ----- batch messaging -----
 
@@ -1014,11 +1090,24 @@ class MarkdownProcessor:
         inplace: bool,
         usage: Optional[_UsageAccumulator] = None,
     ) -> None:
-        items: Dict[str, str] = {e.msgctxt: e.msgid for e in group}
         entry_by_ctx: Dict[str, polib.POEntry] = {e.msgctxt: e for e in group}
 
-        references = self._collect_references(items.values(), pool)
-        glossary_block = self._collect_glossary_block(items.values())
+        # Reference lookup and glossary matching operate on human-readable
+        # source text — encoding would obscure the substrings they compare
+        # against — so collect them from ``entry.msgid`` before encoding
+        # swaps pattern matches for opaque tokens.
+        raw_sources = [e.msgid for e in group]
+        references = self._collect_references(raw_sources, pool)
+        glossary_block = self._collect_glossary_block(raw_sources)
+
+        # Encode each item once; stash per-ctx maps so we can decode the
+        # batched response and run the round-trip check per entry below.
+        items: Dict[str, str] = {}
+        mappings: Dict[str, Optional[PlaceholderMap]] = {}
+        for e in group:
+            encoded, mapping = self._encode_source(e.msgid)
+            items[e.msgctxt] = encoded
+            mappings[e.msgctxt] = mapping
 
         base_caller = self._make_batch_caller(references, glossary_block, usage=usage)
 
@@ -1049,9 +1138,18 @@ class MarkdownProcessor:
 
         for ctx, entry in entry_by_ctx.items():
             processed: Optional[str] = None
+            mapping = mappings.get(ctx)
             if ctx in translated:
                 raw = translated[ctx]
-                processed = self._post_process(raw) if self._post_process else raw
+                # Run ``post_process`` BEFORE decoding so a hook cannot
+                # silently rewrite a restored protected span — the stash
+                # below must contain the exact text that will be stored.
+                # Matches the ordering used in ``_call_llm``.
+                if self._post_process:
+                    raw = self._post_process(raw)
+                self._tls.last_encoded_response = raw
+                self._tls.last_placeholder_map = mapping
+                processed = self._decode_translation(raw, mapping)
             else:
                 stats["per_entry_calls"] += 1
                 similar = pool.find_similar(entry.msgid)
@@ -1126,26 +1224,56 @@ class MarkdownProcessor:
     ) -> bool:
         """Run the validator (if enabled) and mark failures fuzzy.
 
+        When the placeholder registry is active, the round-trip check fires
+        regardless of ``self.validation`` — a missing/duplicated/unexpected
+        token is always a structural fail.  Other structural checks still
+        respect the ``validation`` mode.
+
         Returns ``True`` when the caller should treat the entry as processed,
         ``False`` when validation failed hard enough that the entry stays in
         a failed state (for batched callers that want to count it).
         """
-        if self.validation == "off":
-            return True
+        # Consume the stash set by ``_call_llm`` / ``_translate_group``.
+        # Clearing unconditionally stops a later per-entry call on the same
+        # thread from inheriting the previous entry's mapping.
+        encoded_response = getattr(self._tls, "last_encoded_response", None)
+        mapping = getattr(self._tls, "last_placeholder_map", None)
+        self._tls.last_encoded_response = None
+        self._tls.last_placeholder_map = None
 
-        result = validate_translation(
-            entry.msgid,
-            processed,
-            target_lang=self.target_lang,
-            glossary=self._glossary,
-            mode=self.validation,
-        )
-        if result.ok:
-            if stats is not None:
+        issues: List[ValidationIssue] = []
+
+        # Round-trip runs on the pre-decode response so it can see tokens.
+        # Structural checks below run on ``processed`` (the decoded,
+        # post-processed translation) because pattern authors are allowed
+        # to protect spans that include Markdown syntax — fenced blocks,
+        # inline code, headings — and the encoded text has those glyphs
+        # swapped for tokens, which would defeat fence / heading / inline
+        # code counts.
+        if mapping and encoded_response is not None:
+            reason = check_round_trip(encoded_response, mapping)
+            if reason:
+                issues.append(
+                    ValidationIssue("placeholder_roundtrip", reason)
+                )
+
+        if self.validation != "off":
+            result = validate_translation(
+                entry.msgid,
+                processed,
+                target_lang=self.target_lang,
+                glossary=self._glossary,
+                mode=self.validation,
+            )
+            issues.extend(result.issues)
+
+        if not issues:
+            if self.validation != "off" and stats is not None:
                 stats["validated"] = stats.get("validated", 0) + 1
             return True
 
-        reason = f"validator: {result.reasons()}"
+        reasons_joined = "; ".join(f"{i.check}: {i.detail}" for i in issues)
+        reason = f"validator: {reasons_joined}"
         existing = entry.tcomment or ""
         entry.tcomment = f"{existing}\n{reason}".strip() if existing else reason
         if "fuzzy" not in entry.flags:
