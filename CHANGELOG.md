@@ -22,6 +22,25 @@
   sharper wording removes the ambiguity.
 
 ### Added
+- **`processor.py` — `glossary_mode` kwarg / `--glossary-mode` CLI flag**:
+  selects how glossary terms are fed to the LLM. `"instruction"`
+  (default, v0.4 back-compat) keeps the existing prompt-block flow.
+  `"placeholder"` substitutes each matching term with an opaque
+  `⟦P:N⟧` token pre-call and restores the target-language form (or the
+  original term for do-not-translate entries) post-call, reusing the
+  T-4 placeholder machinery so the round-trip check automatically flags
+  any dropped glossary token. Matching is case-sensitive
+  word-boundary (`\bterm\b`); trailing morphology (e.g. `"APIs"`
+  matching `"API"`) is deliberately NOT matched — false-negatives are
+  preferred over mid-word false-positives. Terms whose first or last
+  character isn't a word character (`.NET`, `C++`) are skipped for the
+  same reason. v0.5 will flip the default to `"placeholder"`.
+- **`placeholder.py` — `Placeholder.replacement` field**: optional
+  override consumed by `PlaceholderRegistry.decode`. When set, decode
+  restores the token to this string instead of `original`; the glossary
+  placeholder path uses it to emit the target-language form on
+  restore. Defaults to `None` so pre-existing callers keep an identity
+  decode.
 - **`placeholder.py` — `PlaceholderRegistry` / `PlaceholderMap` /
   `check_round_trip`**: shared-core placeholder substitution framework.
   Callers register named regex patterns; the processor replaces every

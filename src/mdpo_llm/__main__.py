@@ -69,6 +69,19 @@ def _add_translate_flags(parser: argparse.ArgumentParser) -> None:
         help="Path to a JSON glossary file.",
     )
     parser.add_argument(
+        "--glossary-mode",
+        choices=["instruction", "placeholder"],
+        default="instruction",
+        help=(
+            "How to feed glossary terms to the LLM. 'instruction' "
+            "(default) appends a glossary block to the system prompt. "
+            "'placeholder' substitutes each term with an opaque "
+            "\u27e6P:N\u27e7 token pre-call and restores the "
+            "target-language form (or the original term for "
+            "do-not-translate entries) post-call."
+        ),
+    )
+    parser.add_argument(
         "--extra-instructions",
         type=str,
         default=None,
@@ -130,6 +143,7 @@ def _build_processor(
         max_reference_pairs=args.max_reference_pairs,
         extra_instructions=getattr(args, "extra_instructions", None),
         glossary_path=getattr(args, "glossary", None),
+        glossary_mode=getattr(args, "glossary_mode", "instruction"),
         enable_prompt_cache=getattr(args, "prompt_cache", False),
         progress_callback=progress_callback,
     )
