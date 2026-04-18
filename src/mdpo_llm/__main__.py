@@ -491,6 +491,7 @@ def cmd_translate_dir(args: argparse.Namespace) -> int:
                 refined_po_dir=(
                     Path(refined_po_dir) if refined_po_dir else None
                 ),
+                translate_paths=getattr(args, "translate_paths", False),
             )
         except ValueError as exc:
             if closer is not None:
@@ -876,6 +877,22 @@ def build_parser() -> argparse.ArgumentParser:
             "BCP 47 locale the refine pass should preserve "
             "(the SOURCE language, e.g. 'en'). REQUIRED with "
             "--refine-first; no default."
+        ),
+    )
+    p_dir.add_argument(
+        "--translate-paths",
+        action="store_true",
+        help=(
+            "Opt-in. Translate filesystem path segments (directory names "
+            "and markdown file stems) so the target tree uses localized "
+            "filenames. Segments are tracked in a dedicated '_paths.po' "
+            "catalog under --po-dir (or target_dir when --po-dir is "
+            "omitted) and a 'path_map.json' source→target relative-path "
+            "map is written alongside the translated tree for downstream "
+            "link rewriters / sitemaps / CI. Link text and URLs inside "
+            "translated Markdown are NOT rewritten — that is a separate "
+            "cross-reference problem and solving it here would break "
+            "every translated document's internal anchors."
         ),
     )
     p_dir.set_defaults(func=cmd_translate_dir)

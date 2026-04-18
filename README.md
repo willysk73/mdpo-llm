@@ -110,6 +110,29 @@ print(f"{result['files_skipped']} files unchanged")
 
 The directory structure is mirrored into `target_dir`. Each file gets its own PO file and its own reference pool. By default, PO files are placed next to the target files; pass `po_dir` to store them separately.
 
+#### Optional: translate filenames too (`--translate-paths`)
+
+By default `process_directory` mirrors the source tree 1:1, so a document at `docs/guide/intro.md` ends up at `docs_ko/guide/intro.md`. Opting into `--translate-paths` (CLI) or `translate_paths=True` (API) additionally translates the filesystem path segments themselves — directory names and markdown file stems — so the target tree uses localized filenames:
+
+```bash
+python -m mdpo_llm translate-dir docs/ docs_ko/ \
+    --model gpt-4o \
+    --target ko \
+    --po-dir po/ \
+    --translate-paths
+```
+
+What this produces:
+
+- **`_paths.po`** — a dedicated catalog under `--po-dir` (or `target_dir` when `--po-dir` is omitted) that stores one entry per distinct source segment. Segment translations flow through the same LLM pipeline as content blocks, so caching, glossary configuration, and token receipts behave the same way. Re-running the command hits cache on unchanged segments and spends zero API calls on them.
+- **`path_map.json`** — a JSON map `{ "source/relative.md": "translated/relative.md", ... }` written at the root of the translated tree. Downstream tooling (link rewriters, sitemap generators, CI jobs) can read this file to resolve the source ↔ target pairing without re-running the translator.
+- **Sanitized, deterministic slugs** — LLM output is NFC-normalised, whitespace is collapsed, and characters reserved on Windows / POSIX filesystems (`/\\<>:"|?*` plus control bytes) are stripped. If two sibling source files end up with the same translated slug, `-2` / `-3` disambiguators are appended in alphabetical source order so the output is reproducible. File extensions are preserved verbatim. Dotfile segments (`.github`, `.well-known`) pass through unchanged so CI and web-infrastructure paths don't silently break.
+- **PO files stay keyed on the SOURCE path.** Per-file `.po` outputs under `--po-dir` are still laid out using the source-relative path, so incremental re-runs hit the same PO cache even when the target filename moves between runs.
+
+What it explicitly does NOT do:
+
+- **Link rewriting is out of scope.** Markdown link text and URLs inside translated content are not modified — auto-rewriting them would invalidate every document's internal anchors and cross-references. `path_map.json` is published so downstream tooling can do that rewrite deterministically in a subsequent pass.
+
 ### 3. Use any provider
 
 LiteLLM supports 100+ providers. Just change the model string:

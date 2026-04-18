@@ -3,7 +3,82 @@ Markdown block parser for translation workflow.
 """
 
 import re
+import unicodedata
 from typing import Any, Dict, List
+
+
+# Control characters (``\x00-\x1f`` and ``\x7f``) plus characters that are
+# reserved on common filesystems (Windows NTFS forbids ``<>:"|?*``; every
+# POSIX FS forbids ``/``; backslash collides with Windows separators).  These
+# are stripped from path segments so translated slugs are safe to write
+# regardless of the operator's platform.
+_PATH_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f<>:\"/\\|?*]")
+
+# Runs of whitespace (including non-breaking space) collapse to a single
+# ``-`` so translated segments with multi-word output still produce one
+# coherent slug rather than exposing raw spaces in paths.
+_PATH_WHITESPACE_RE = re.compile(r"\s+", re.UNICODE)
+
+# Windows reserved device names.  Any file whose stem matches one of these
+# (case-insensitively, ignoring trailing extensions) fails to open on
+# NTFS regardless of the containing directory.  The serial / parallel
+# port names are ``COM1``–``COM9`` and ``LPT1``–``LPT9`` — ``COM0`` and
+# ``LPT0`` are NOT reserved by Windows, so including them here would
+# needlessly rewrite valid ``COM0.md`` / ``LPT0.md`` translations.
+# The translated / fallback slug is suffixed with ``_`` when it would
+# otherwise collide with one of these names so the path stays writable
+# on every platform mdpo-llm supports.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def slugify_path_segment(text: str) -> str:
+    """Sanitize ``text`` into a single filesystem-safe path segment.
+
+    Used by the ``--translate-paths`` flow so the LLM-produced filename /
+    directory name can be written to disk regardless of platform. Rules:
+
+    - NFC-normalise so composed vs decomposed Unicode forms collapse to
+      the same bytes on disk (important on macOS HFS+/APFS which store
+      decomposed, while Linux ext4 stores whatever you give it).
+    - Collapse runs of whitespace into ``-``.
+    - Strip characters that are unsafe on Windows NTFS / POSIX (``/``,
+      ``\\``, ``<>:"|?*``, control bytes).
+    - Collapse runs of ``-`` and strip leading / trailing separators.
+    - Strip leading ``.`` so we never accidentally produce a dotfile /
+      hidden directory from a translation.
+    - Fall back to ``""`` when nothing survives; the caller decides
+      whether to substitute the original source segment.
+
+    Non-ASCII characters (Korean, Japanese, Chinese, accented Latin) are
+    preserved — modern filesystems handle them, and forcing ASCII would
+    defeat the whole point of translating the filename.
+    """
+    if not text:
+        return ""
+    normalised = unicodedata.normalize("NFC", text)
+    collapsed = _PATH_WHITESPACE_RE.sub("-", normalised.strip())
+    cleaned = _PATH_UNSAFE_RE.sub("", collapsed)
+    cleaned = re.sub(r"-{2,}", "-", cleaned)
+    cleaned = cleaned.strip("-. ")
+    # Windows NTFS rejects any file whose BASENAME STEM (without
+    # extension) equals one of the reserved DOS device names — e.g.
+    # ``CON.md`` fails to open even though the extension is benign.
+    # The check extends past a plain ``==`` match: Windows rejects
+    # ``CON.txt``, ``AUX.foo``, ``LPT1.bak``, and every other form that
+    # starts with a reserved name followed by a ``.`` suffix, because
+    # the stem-before-first-dot is what the kernel maps to the device.
+    # Split on the first ``.`` so every dotted form is caught, then
+    # suffix the reserved portion with ``_`` to keep the slug
+    # human-readable while making it writable on every platform.
+    if cleaned:
+        head, _sep, tail = cleaned.partition(".")
+        if head and head.upper() in _WINDOWS_RESERVED_NAMES:
+            cleaned = f"{head}_.{tail}" if _sep else f"{head}_"
+    return cleaned
 
 
 class BlockParser:
