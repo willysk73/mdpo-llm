@@ -192,11 +192,14 @@ concurrency.
       - tests/test_batched_processing.py
       - CHANGELOG.md
     exclude: []
-  status: pending
+  status: assigned
   priority: normal
   depends_on: [T-4]
   brief: .ccx/tasks/T-6.md
-  attempts: 0
+  attempts: 1
+  worktree: /home/will/Repositories/mdpo-llm-T-6
+  branch: ccx/T-6
+  started_at: "2026-04-18T08:26:57Z"
   notes: |
     Roadmap #6. Register placeholder patterns for `{#anchor-id}` and
     inline raw HTML attribute strings (`class="bare"` etc.) — protecting
