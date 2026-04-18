@@ -18,6 +18,11 @@ class Prompts:
         "6. Preserve interpolation tokens and placeholders as-is (e.g., `{{name}}`, `%s`, `${{var}}`).\n"
         "7. Widely-adopted technical terms (e.g., API, SDK, GPU) may remain in English "
         "if that is conventional in the target language.\n"
+        "8. Any opaque token of the form \u27e6P:N\u27e7 (where N is one or more decimal digits, "
+        "e.g. \u27e6P:0\u27e7, \u27e6P:7\u27e7, \u27e6P:42\u27e7) is a placeholder for content "
+        "that must NOT be altered. Copy every such token into the output exactly as-is \u2014 "
+        "same characters, same digits, same count. Do not translate, renumber, split, remove, "
+        "merge, or duplicate them.\n"
     )
 
     BATCH_TRANSLATE_SYSTEM_TEMPLATE = (
@@ -44,4 +49,9 @@ class Prompts:
         "7. Widely-adopted technical terms (API, SDK, GPU) may remain in English when conventional "
         "in the target language.\n"
         "8. Keep tone, register, and terminology consistent across all values.\n"
+        "9. Any opaque token of the form \u27e6P:N\u27e7 (where N is one or more decimal digits, "
+        "e.g. \u27e6P:0\u27e7, \u27e6P:7\u27e7, \u27e6P:42\u27e7) is a placeholder for content "
+        "that must NOT be altered. Copy every such token into the output exactly as-is \u2014 "
+        "same characters, same digits, same count. Do not translate, renumber, split, remove, "
+        "merge, or duplicate them.\n"
     )
