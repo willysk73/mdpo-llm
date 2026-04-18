@@ -316,11 +316,14 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: pending
+  status: assigned
   priority: low
   depends_on: []
   brief: .ccx/tasks/T-10.md
-  attempts: 0
+  attempts: 1
+  worktree: /home/will/Repositories/mdpo-llm-T-10
+  branch: ccx/T-10
+  started_at: "2026-04-18T13:02:40Z"
   notes: |
     Roadmap #6b. Opt-in `--translate-paths` flag. Filenames become
     their own "block type" tracked in a separate `_paths.po` per
