@@ -20,6 +20,7 @@ from .language import (
     contains_language,
     detect_languages,
 )
+from .placeholder import PlaceholderMap, check_round_trip
 
 Mode = Literal["conservative", "strict"]
 
@@ -86,22 +87,51 @@ def validate(
     target_lang: str,
     glossary: Optional[Dict[str, Optional[str]]] = None,
     mode: Mode = "conservative",
+    placeholder_map: Optional[PlaceholderMap] = None,
+    encoded_translation: Optional[str] = None,
 ) -> ValidationResult:
     """Validate ``translation`` against ``source``.
 
     Args:
         source: Original Markdown block.
-        translation: Translated Markdown block.
+        translation: Translated Markdown block, in its user-visible form
+            (after placeholder decoding and any post-processing).  All
+            structural checks run against this string.
         target_lang: BCP 47 locale of the translation.
         glossary: Glossary used during translation.  Terms mapped to ``None``
             are "do-not-translate" and must appear unchanged in the output.
         mode: ``"conservative"`` (default) runs cheap structural checks.
             ``"strict"`` additionally checks inline code count.
+        placeholder_map: Mapping produced by
+            :meth:`mdpo_llm.placeholder.PlaceholderRegistry.encode`.  When
+            supplied, a ``placeholder_roundtrip`` issue is raised if any
+            mapped token is missing, duplicated, or unexpected in
+            ``encoded_translation`` (or, if that argument is ``None``, in
+            ``translation``).
+        encoded_translation: Pre-decode LLM output (still containing
+            ``\u27e6P:N\u27e7`` tokens) for the round-trip check.  Structural
+            checks do NOT run against this string — patterns that cover
+            Markdown syntax (fenced code, inline code, headings) would
+            otherwise flag correct translations as fuzzy.
 
     Returns:
         ``ValidationResult`` with ``ok`` and a list of ``ValidationIssue``.
     """
     issues: List[ValidationIssue] = []
+
+    if placeholder_map is not None and placeholder_map:
+        if encoded_translation is None:
+            # Falling back to ``translation`` here would silently report
+            # every token as missing (decode has already run), so refuse
+            # to guess — external callers must thread through the raw
+            # LLM output.
+            raise ValueError(
+                "validate(): placeholder_map requires encoded_translation "
+                "(the pre-decode LLM output containing the tokens)."
+            )
+        reason = check_round_trip(encoded_translation, placeholder_map)
+        if reason:
+            issues.append(ValidationIssue("placeholder_roundtrip", reason))
 
     src_level = _heading_level(source)
     tgt_level = _heading_level(translation)

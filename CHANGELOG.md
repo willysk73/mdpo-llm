@@ -3,6 +3,46 @@
 ## Unreleased
 
 ### Added
+- **`placeholder.py` — `PlaceholderRegistry` / `PlaceholderMap` /
+  `check_round_trip`**: shared-core placeholder substitution framework.
+  Callers register named regex patterns; the processor replaces every
+  match with an opaque `⟦P:N⟧` token before the LLM sees the block and
+  restores the original content afterwards. T-4 ships the module with
+  zero built-in patterns — downstream tasks (T-5 glossary do-not-translate,
+  T-6 anchor preservation, T-7 refine) register their own. Pre-existing
+  `⟦P:N⟧` literals found in the source (e.g. documentation explaining the
+  token syntax) are recorded as identity entries with
+  `pattern_name == "__literal__"`: numbering skips their indices, decode
+  leaves them in place, and the round-trip check requires the LLM to
+  preserve them verbatim — duplicate literals in the source expect a
+  matching count in the output.
+- **`processor.py` — `placeholders` kwarg**: `MarkdownProcessor` accepts
+  an optional `PlaceholderRegistry`. When supplied, every source block is
+  encoded before the LLM call (both sequential and batched paths) and the
+  response is decoded before post-processing. Reference-pool lookups and
+  glossary matching still operate on the human-readable source text so
+  similarity and term detection stay effective. `None` (default) keeps
+  the pre-T-4 behaviour exactly.
+- **`prompts.py`**: both `TRANSLATE_INSTRUCTION` and
+  `BATCH_TRANSLATE_INSTRUCTION` gain a rule that any `⟦P:N⟧` token must
+  be copied through unchanged — no translation, renumbering, removal, or
+  duplication.
+- **`validator.py` — `placeholder_map` / `encoded_translation` kwargs**:
+  `validate()` accepts an optional `PlaceholderMap` plus the pre-decode
+  LLM output. Structural checks (heading level, fence count, inline
+  code count, glossary, target language) always run on the user-visible
+  decoded `translation` argument — this keeps patterns that cover
+  Markdown syntax (fences, inline code, headings) from falsely failing
+  the checks. Only the round-trip check consumes `encoded_translation`;
+  a missing, duplicated, or unexpected token is a structural fail
+  independent of `validation` mode.
+- **Tests** — `tests/test_placeholder.py` covers encode/decode
+  round-trip, overlap resolution (earliest-start, longest-on-tie,
+  nested-inner dropped, zero-width skipped), the round-trip checker's
+  three failure modes, registry API surface (pre-compiled vs string
+  regex, flags), validator integration, and processor wiring smoke
+  tests.
+
 - **`processor.py` — `ProgressEvent` / `progress_callback`**: new
   `MarkdownProcessor` kwarg for a UI-agnostic progress hook. The
   callable receives a frozen `ProgressEvent(kind, path, index, total,
