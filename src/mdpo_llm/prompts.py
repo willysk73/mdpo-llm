@@ -93,6 +93,48 @@ class Prompts:
         "{instruction}\n"
     )
 
+    BATCH_MULTI_TRANSLATE_SYSTEM_TEMPLATE = (
+        "You are an expert technical translator. "
+        "Translate a set of Markdown blocks into MULTIPLE target languages "
+        "in a single response.\n"
+        "Target languages (BCP 47): {langs}\n"
+        "Maintain a single consistent tone, register, and terminology WITHIN each language; "
+        "different languages may diverge where natural.\n\n"
+        "{instruction}\n"
+    )
+
+    BATCH_MULTI_TRANSLATE_INSTRUCTION = (
+        "Input is a JSON object where each key is an opaque block identifier and each value is a "
+        "Markdown source fragment.\n"
+        "Output a JSON object with EXACTLY the same set of top-level keys as the input.\n"
+        "Each output value is itself a JSON object whose keys are the target language codes "
+        "({langs}) and whose values are the translated Markdown for that block.\n\n"
+        "Strict rules:\n"
+        "1. Return ONLY a raw JSON object. The response MUST start with `{{` and end with `}}`. "
+        "Do NOT wrap the JSON in Markdown code fences \u2014 no ```json, no ```, no surrounding "
+        "backticks, no language tag. Do NOT include any prose, preamble, explanation, or "
+        "epilogue before or after the JSON.\n"
+        "2. Every input key MUST appear in the output exactly once \u2014 same order, same spelling.\n"
+        "3. Every per-block value MUST contain EXACTLY the listed target language codes as keys, "
+        "with no extras and no omissions.\n"
+        "4. Do NOT add, omit, merge, or rename keys at either nesting level. Do NOT collapse the "
+        "two-level object into a flat one.\n"
+        "5. Each leaf string is the translated Markdown for that block in that language, "
+        "preserving original structure (headings, list bullets, table pipes, code fences, "
+        "blockquote markers).\n"
+        "6. Translate prose only. Keep URLs, file paths, identifiers, interpolation tokens "
+        "(`{{{{name}}}}`, `%s`, `${{{{var}}}}`) unchanged.\n"
+        "7. In code blocks, keep code as-is; only translate comments and user-facing strings.\n"
+        "8. Widely-adopted technical terms (API, SDK, GPU) may remain in English when conventional "
+        "in the target language.\n"
+        "9. Keep tone, register, and terminology consistent across all values WITHIN each language.\n"
+        "10. Any opaque token of the form \u27e6P:N\u27e7 (where N is one or more decimal digits, "
+        "e.g. \u27e6P:0\u27e7, \u27e6P:7\u27e7, \u27e6P:42\u27e7) is a placeholder for content "
+        "that must NOT be altered. Copy every such token into every language's output exactly "
+        "as-is \u2014 same characters, same digits, same count. Do not translate, renumber, "
+        "split, remove, merge, or duplicate them.\n"
+    )
+
     BATCH_REFINE_INSTRUCTION = (
         "Input is a JSON object where each key is an opaque block identifier and each value is a "
         "Markdown source fragment.\n"

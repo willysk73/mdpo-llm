@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from mdpo_llm.batch import BatchTranslator
+from mdpo_llm.batch import BatchTranslator, MultiTargetBatchTranslator
 
 
 def _ok_caller(items):
@@ -122,6 +122,147 @@ def test_parse_response_rejects_array():
 def test_parse_response_none_for_empty():
     assert BatchTranslator._parse_response("") is None
     assert BatchTranslator._parse_response(None) is None
+
+
+def _multi_ok_caller(langs):
+    """Return a caller that fans out {k: {lang: f'{lang}:{v}'}} for each lang."""
+
+    def _caller(items):
+        out = {k: {lang: f"{lang}:{v}" for lang in langs} for k, v in items.items()}
+        return json.dumps(out)
+
+    return _caller
+
+
+class TestMultiTargetBatchTranslator:
+    def test_happy_path_two_langs(self):
+        items = {"a": "alpha", "b": "bravo"}
+        t = MultiTargetBatchTranslator(_multi_ok_caller(["ko", "ja"]), ["ko", "ja"])
+        out = t.translate(items)
+        assert out == {
+            "a": {"ko": "ko:alpha", "ja": "ja:alpha"},
+            "b": {"ko": "ko:bravo", "ja": "ja:bravo"},
+        }
+
+    def test_empty_input(self):
+        t = MultiTargetBatchTranslator(_multi_ok_caller(["ko"]), ["ko"])
+        assert t.translate({}) == {}
+
+    def test_rejects_empty_target_langs(self):
+        with pytest.raises(ValueError):
+            MultiTargetBatchTranslator(_multi_ok_caller(["ko"]), [])
+
+    def test_rejects_non_string_target_langs(self):
+        with pytest.raises(ValueError):
+            MultiTargetBatchTranslator(_multi_ok_caller(["ko"]), [123])  # type: ignore[list-item]
+        with pytest.raises(ValueError):
+            MultiTargetBatchTranslator(_multi_ok_caller(["ko"]), [""])
+
+    def test_dedupes_target_langs_preserves_order(self):
+        t = MultiTargetBatchTranslator(
+            _multi_ok_caller(["ko", "ja"]), ["ko", "ja", "ko"]
+        )
+        assert t.target_langs == ("ko", "ja")
+
+    def test_partial_lang_coverage_kept_as_is(self):
+        """Partial per-lang coverage is preserved for the caller to backfill.
+
+        Re-billing the fully-delivered langs just to retry a missing one
+        would waste tokens, so the translator keeps what the model
+        actually produced and lets the caller run a targeted per-lang
+        fallback for the missing lang only.
+        """
+
+        def _caller(items):
+            out = {}
+            for k, v in items.items():
+                # Omit "ja" for key "b" — a partial delivery.
+                if k == "b":
+                    out[k] = {"ko": f"ko:{v}"}
+                else:
+                    out[k] = {"ko": f"ko:{v}", "ja": f"ja:{v}"}
+            return json.dumps(out)
+
+        t = MultiTargetBatchTranslator(_caller, ["ko", "ja"])
+        out = t.translate({"a": "x", "b": "y", "c": "z"})
+        assert out["a"] == {"ko": "ko:x", "ja": "ja:x"}
+        assert out["c"] == {"ko": "ko:z", "ja": "ja:z"}
+        # "b" is preserved with partial coverage — only "ko" came back.
+        assert out["b"] == {"ko": "ko:y"}
+
+    def test_value_not_a_dict_treated_as_missing(self):
+        """A non-dict value for a key triggers the bisection fallback."""
+
+        def _caller(items):
+            out = {}
+            for k, v in items.items():
+                if k == "bad" and len(items) > 1:
+                    out[k] = "plain string"
+                else:
+                    out[k] = {"ko": f"ko:{v}", "ja": f"ja:{v}"}
+            return json.dumps(out)
+
+        t = MultiTargetBatchTranslator(_caller, ["ko", "ja"])
+        out = t.translate({"good": "x", "bad": "y"})
+        assert out["good"] == {"ko": "ko:x", "ja": "ja:x"}
+        # After bisection "bad" still returns a plain string single-entry,
+        # which is non-dict, so it drops out of the result.
+        assert "bad" not in out
+
+    def test_malformed_json_bisects_down_to_singletons(self):
+        call_count = {"n": 0}
+
+        def _caller(items):
+            call_count["n"] += 1
+            if len(items) > 1:
+                return "not valid json"
+            return json.dumps(
+                {k: {"ko": f"ko:{v}", "ja": f"ja:{v}"} for k, v in items.items()}
+            )
+
+        t = MultiTargetBatchTranslator(_caller, ["ko", "ja"])
+        items = {"a": "x", "b": "y", "c": "z", "d": "w"}
+        out = t.translate(items)
+        assert set(out.keys()) == set(items.keys())
+        # One failed call + bisection tree => several calls.
+        assert call_count["n"] >= 5
+
+    def test_single_entry_failure_returns_empty(self):
+        def _caller(items):
+            raise RuntimeError("boom")
+
+        t = MultiTargetBatchTranslator(_caller, ["ko", "ja"])
+        assert t.translate({"a": "x"}) == {}
+
+    def test_input_partitioned_by_entry_count(self):
+        calls = []
+
+        def _caller(items):
+            calls.append(list(items.keys()))
+            return json.dumps(
+                {k: {"ko": f"ko:{v}", "ja": f"ja:{v}"} for k, v in items.items()}
+            )
+
+        items = {f"k{i}": f"v{i}" for i in range(25)}
+        t = MultiTargetBatchTranslator(
+            _caller, ["ko", "ja"], max_entries=10, max_chars=10_000
+        )
+        out = t.translate(items)
+        assert set(out.keys()) == set(items.keys())
+        assert all(len(c) <= 10 for c in calls)
+        assert len(calls) >= 3
+
+    def test_extra_langs_in_response_are_dropped(self):
+        """Target locales = ko; extra locales in the response are ignored."""
+
+        def _caller(items):
+            return json.dumps(
+                {k: {"ko": f"ko:{v}", "ja": f"ja:{v}"} for k, v in items.items()}
+            )
+
+        t = MultiTargetBatchTranslator(_caller, ["ko"])
+        out = t.translate({"a": "x"})
+        assert out == {"a": {"ko": "ko:x"}}
 
 
 def test_non_string_value_treated_as_missing():
