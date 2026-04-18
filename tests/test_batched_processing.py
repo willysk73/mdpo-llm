@@ -292,6 +292,70 @@ class TestInplaceModeBatched:
                 assert entry.msgid == entry.msgstr
 
 
+class TestGlossaryPlaceholderMode:
+    """Glossary placeholder mode wires through the batched path too.
+
+    The batched call must see opaque ``\u27e6P:N\u27e7`` tokens in the user
+    payload and the decoded output must restore the target-language form
+    (or the original term for do-not-translate entries).  Placeholder mode
+    also suppresses the instruction-mode glossary block so the two paths
+    don't double-feed terms to the model.
+    """
+
+    def test_batched_substitutes_terms_and_restores(
+        self, tmp_path, mock_completion
+    ):
+        captured = {"calls": []}
+
+        def _echo(*args, **kwargs):
+            captured["calls"].append(kwargs.get("messages", []))
+            messages = kwargs.get("messages", [])
+            user = messages[-1]["content"]
+            parsed = json.loads(user) if user.strip().startswith("{") else None
+            resp = MagicMock()
+            if isinstance(parsed, dict):
+                # Preserve tokens verbatim so decode restores the target form.
+                resp.choices[0].message.content = json.dumps(
+                    parsed, ensure_ascii=False
+                )
+            else:
+                resp.choices[0].message.content = user
+            return resp
+
+        mock_completion.completion.side_effect = _echo
+
+        md = "# T\n\nVisit GitHub for the pull request process.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            glossary={
+                "GitHub": None,
+                "pull request": "\ud480 \ub9ac\ud018\uc2a4\ud2b8",
+            },
+            glossary_mode="placeholder",
+        )
+        p.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+
+        # System prompt lacks the instruction-mode glossary block.
+        first_call = captured["calls"][0]
+        system = first_call[0]["content"]
+        assert "Glossary" not in system
+
+        # User payload (JSON batch) does NOT contain the raw terms.
+        user = first_call[-1]["content"]
+        assert "GitHub" not in user
+        assert "pull request" not in user
+
+        # Target markdown has terms restored post-decode.
+        out = (tmp_path / "target.md").read_text(encoding="utf-8")
+        assert "GitHub" in out
+        assert "\ud480 \ub9ac\ud018\uc2a4\ud2b8" in out
+
+
 class TestSectionAwareChunking:
     def test_cross_section_boundary_triggers_split(self, tmp_path, mock_completion):
         """Two top-level sections with batch_size past the soft threshold should split."""

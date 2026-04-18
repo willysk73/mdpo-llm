@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ import polib
 from .batch import BatchTranslator
 from .manager import POManager
 from .parser import BlockParser
-from .placeholder import PlaceholderMap, PlaceholderRegistry, check_round_trip
+from .placeholder import Placeholder, PlaceholderMap, PlaceholderRegistry, check_round_trip
 from .prompts import Prompts
 from .reconstructor import DocumentReconstructor
 from .reference_pool import ReferencePool
@@ -29,6 +30,7 @@ from .validator import ValidationIssue, validate as validate_translation
 
 
 ValidationMode = Literal["off", "conservative", "strict"]
+GlossaryMode = Literal["instruction", "placeholder"]
 
 
 @dataclass(frozen=True)
@@ -178,6 +180,7 @@ class MarkdownProcessor:
         enable_prompt_cache: bool = False,
         progress_callback: Optional[ProgressCallback] = None,
         placeholders: Optional[PlaceholderRegistry] = None,
+        glossary_mode: GlossaryMode = "instruction",
         **litellm_kwargs,
     ):
         """
@@ -222,6 +225,20 @@ class MarkdownProcessor:
                 duplicated, or unexpected in the output fails the entry.
                 ``None`` (default) disables the feature; an empty registry
                 is a pass-through. T-4 ships no built-in patterns.
+            glossary_mode: How the configured glossary is fed to the LLM.
+                ``"instruction"`` (default, v0.4 back-compat) appends a
+                glossary block to the system prompt.  ``"placeholder"``
+                substitutes each matching term with an opaque
+                ``\u27e6P:N\u27e7`` token before the call and restores the
+                target-language form (or the original term for
+                do-not-translate entries) afterwards.  Matching uses
+                case-sensitive word-boundary regex (``\\bterm\\b``);
+                trailing morphology is NOT matched ("APIs" does not hit
+                "API") — a false-negative is preferred over a mid-word
+                false-positive.  Terms whose first or last character isn't
+                a word character (e.g. ``.NET``, ``C++``) are silently
+                skipped because the ``\\b`` anchors would reject them.
+                Ignored when no glossary is configured.
             **litellm_kwargs: Extra keyword arguments forwarded to
                 ``litellm.completion()``.
         """
@@ -240,6 +257,12 @@ class MarkdownProcessor:
         self.enable_prompt_cache = enable_prompt_cache
         self._progress_callback = progress_callback
         self._placeholders = placeholders
+        self.glossary_mode: GlossaryMode = glossary_mode
+        # Effective registry merges user-supplied patterns with glossary
+        # patterns when glossary_mode=="placeholder"; ``_encode_source``
+        # calls into this (not ``_placeholders`` directly) so every
+        # callsite picks up glossary substitutions consistently.
+        self._effective_registry = self._build_effective_registry(placeholders)
         self._litellm_kwargs = litellm_kwargs
         # Thread-local hand-off slot so ``process_directory`` can expose each
         # worker's accumulator to ``process_document`` without changing that
@@ -308,7 +331,11 @@ class MarkdownProcessor:
         return resolved or None
 
     def _format_glossary(self, source_text: str) -> str | None:
-        if not self._glossary:
+        # In placeholder mode the glossary is fed to the LLM as opaque
+        # tokens in the user message, so the instruction-mode block is
+        # redundant and would leak target-language terms that the model
+        # might echo outside the protected spans.
+        if not self._glossary or self.glossary_mode != "instruction":
             return None
 
         relevant = {k: v for k, v in self._glossary.items() if k in source_text}
@@ -416,18 +443,132 @@ class MarkdownProcessor:
     # ----- placeholder pipeline -----
 
     def _encode_source(self, text: str) -> Tuple[str, Optional[PlaceholderMap]]:
-        """Apply the placeholder registry to ``text`` if one is configured.
+        """Apply the effective placeholder registry to ``text`` if configured.
 
-        Returns ``(encoded, mapping)``. Mapping is ``None`` when no
-        registry was supplied, or an empty :class:`PlaceholderMap` when
-        the registry produced no matches — callers can rely on
-        ``bool(mapping)`` to distinguish a no-op from an active
-        encoding.
+        The effective registry is the user-supplied ``placeholders`` plus
+        glossary patterns in placeholder mode (see
+        :meth:`_build_effective_registry`).  Returns ``(encoded, mapping)``;
+        mapping is ``None`` when neither source of patterns is active, or
+        an empty :class:`PlaceholderMap` when the registry produced no
+        matches — callers can rely on ``bool(mapping)`` to distinguish a
+        no-op from an active encoding.
         """
-        if self._placeholders is None:
+        if self._effective_registry is None:
             return text, None
-        encoded, mapping = self._placeholders.encode(text)
+        encoded, mapping = self._effective_registry.encode(text)
+        mapping = self._apply_glossary_replacements(mapping)
         return encoded, mapping
+
+    def _build_effective_registry(
+        self, user_registry: Optional[PlaceholderRegistry]
+    ) -> Optional[PlaceholderRegistry]:
+        """Merge user patterns with glossary patterns for placeholder mode.
+
+        When ``glossary_mode == "placeholder"`` and a glossary is
+        configured, each glossary term is registered as a case-sensitive
+        word-boundary pattern (``\\bterm\\b``).  Encode will substitute
+        matches with opaque ``\u27e6P:N\u27e7`` tokens;
+        :meth:`_apply_glossary_replacements` then stamps each entry with
+        the target-language form so decode restores the translation
+        rather than the original source span.
+
+        **Morphology rule** — trailing morphology is NOT matched.
+        ``"APIs"`` does not hit a glossary term ``"API"`` because the
+        trailing ``'s'`` is a word character and breaks the trailing
+        ``\\b``.  The choice is deliberate: a false-negative (no match)
+        falls through to the LLM's normal translation path, while a
+        false-positive would corrupt neighbouring text mid-word — the
+        more expensive failure mode.
+
+        **Non-word-boundary terms** (``.NET``, ``C++``) are skipped by
+        :meth:`_compile_glossary_pattern` because ``\\b`` anchors would
+        reject the entire term; they fall through to the LLM, consistent
+        with the same prefer-false-negative rule.
+
+        User-registered patterns come first so a user's explicit pattern
+        wins over an inferred glossary pattern on overlap; longer
+        glossary terms beat shorter ones via the registry's
+        longest-match-on-tie rule (``"pull request"`` beats ``"pull"``).
+        """
+        need_glossary = bool(self._glossary) and self.glossary_mode == "placeholder"
+        if not need_glossary:
+            return user_registry
+        registry = PlaceholderRegistry()
+        if user_registry is not None:
+            for p in user_registry.patterns:
+                registry.register(p.name, p.regex)
+        # Sort longest-first so "pull request" gets registered before
+        # "pull"; the encode overlap resolver also prefers the longer
+        # match on tie, but keeping insertion order sorted is defensive.
+        terms = sorted(self._glossary.keys(), key=len, reverse=True)
+        for term in terms:
+            pattern = self._compile_glossary_pattern(term)
+            if pattern is None:
+                continue
+            registry.register(f"glossary:{term}", pattern)
+        return registry
+
+    @staticmethod
+    def _compile_glossary_pattern(term: str) -> Optional["re.Pattern[str]"]:
+        """Case-sensitive word-boundary regex for a glossary term.
+
+        Returns ``None`` when ``term`` starts or ends with a non-word
+        character because ``\\b`` anchors reject such a pattern at both
+        ends (``\\b.NET\\b`` never matches ``.NET``).  Skipped terms
+        silently fall through to the LLM's normal translation path —
+        the same prefer-false-negative principle that guides the
+        morphology rule.
+        """
+        if not term:
+            return None
+        if not (term[0].isalnum() or term[0] == "_"):
+            return None
+        if not (term[-1].isalnum() or term[-1] == "_"):
+            return None
+        return re.compile(rf"\b{re.escape(term)}\b")
+
+    def _apply_glossary_replacements(
+        self, mapping: PlaceholderMap
+    ) -> PlaceholderMap:
+        """Stamp glossary entries with their target-language replacement.
+
+        Pattern names of the form ``glossary:<term>`` are rewritten so
+        :meth:`PlaceholderRegistry.decode` restores the token to the
+        target-language form (``self._glossary[term]``) rather than the
+        original source span.  A ``None`` glossary value means "do not
+        translate" — the replacement falls back to the matched source
+        text so decode emits the term verbatim.
+
+        Non-glossary entries (user-registered patterns, pre-existing
+        literal tokens) are returned untouched so their identity-decode
+        behaviour is preserved.
+        """
+        if (
+            not mapping.items
+            or not self._glossary
+            or self.glossary_mode != "placeholder"
+        ):
+            return mapping
+        new_items: List[Placeholder] = []
+        changed = False
+        for p in mapping.items:
+            if not p.pattern_name.startswith("glossary:"):
+                new_items.append(p)
+                continue
+            target = self._glossary.get(p.original)
+            replacement = target if target is not None else p.original
+            new_items.append(
+                Placeholder(
+                    token=p.token,
+                    original=p.original,
+                    pattern_name=p.pattern_name,
+                    replacement=replacement,
+                )
+            )
+            changed = True
+        if not changed:
+            return mapping
+        return PlaceholderMap(items=new_items)
 
     def _decode_translation(
         self, text: str, mapping: Optional[PlaceholderMap]

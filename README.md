@@ -193,6 +193,41 @@ Only glossary terms that actually appear in each block are injected into the pro
 
 See [`examples/glossary.json`](examples/glossary.json) for a full example with brand names, technical terms, and per-locale translations.
 
+### Glossary mode: `instruction` vs `placeholder`
+
+`glossary_mode` (constructor kwarg, CLI `--glossary-mode`) controls how
+glossary terms reach the model:
+
+- `"instruction"` (default in v0.4, for back-compat): appends a glossary
+  block to the system prompt. The LLM sees the raw source text and is
+  asked to preserve or translate each term as specified.
+- `"placeholder"`: substitutes every glossary term with an opaque
+  `⟦P:N⟧` token **before** the call and restores the target-language
+  form (or the original term for do-not-translate entries)
+  **after** the call. The model never sees the terms, so it cannot
+  translate, renumber, or mangle them — and the round-trip check
+  automatically flags any dropped token.
+
+```python
+processor = MdpoLLM(
+    model="gpt-4",
+    target_lang="ko",
+    glossary={"GitHub": None, "pull request": "풀 리퀘스트"},
+    glossary_mode="placeholder",
+)
+```
+
+Matching is **case-sensitive word-boundary** (`\bterm\b`). Trailing
+morphology is NOT matched: `"APIs"` does not match a glossary term
+`"API"` because the trailing `s` breaks the word boundary. This is a
+deliberate false-negative — a mid-word false-positive would corrupt
+neighbouring text, while a missed match simply falls through to the
+LLM's normal translation path. Terms whose first or last character
+isn't a word character (e.g. `.NET`, `C++`) are silently skipped for
+the same reason; use `"instruction"` mode when those matter.
+
+v0.5 will flip the default to `"placeholder"`.
+
 ## Comparison
 
 | | mdpo-llm | mdpo | md-translator | llm-translator |
