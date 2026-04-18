@@ -162,11 +162,14 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: pending
+  status: assigned
   priority: normal
   depends_on: [T-4]
   brief: .ccx/tasks/T-5.md
-  attempts: 0
+  attempts: 1
+  worktree: /home/will/Repositories/mdpo-llm-T-5
+  branch: ccx/T-5
+  started_at: "2026-04-18T08:10:13Z"
   notes: |
     Roadmap #5. Add `--glossary-mode=placeholder|instruction` (default
     `instruction` for back-compat in v0.4, flip to `placeholder` in
