@@ -561,6 +561,181 @@ class TestReceipt:
         assert receipt.api_calls == sum(r.receipt.api_calls for r in result.results)
 
 
+class TestProgressHook:
+    """``progress_callback`` emits events suitable for driving a UI bar."""
+
+    def test_document_events_for_batched(
+        self, tmp_path, mock_completion
+    ):
+        events = []
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            progress_callback=events.append,
+        )
+        md = "# Title\n\nPara A.\n\nPara B.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+
+        kinds = [e.kind for e in events]
+        assert "document_start" in kinds
+        assert "document_progress" in kinds
+        assert "document_end" in kinds
+        # document_start precedes document_end.
+        assert kinds.index("document_start") < kinds.index("document_end")
+        # The start event carries ``total`` equal to the number of groups,
+        # and every progress event matches that total.
+        starts = [e for e in events if e.kind == "document_start"]
+        assert len(starts) == 1
+        assert starts[0].total is not None and starts[0].total >= 1
+        for ev in events:
+            if ev.kind == "document_progress":
+                assert ev.total == starts[0].total
+                assert 1 <= ev.index <= ev.total
+        # All document-kind events carry the source path string.
+        for ev in events:
+            if ev.kind.startswith("document_"):
+                assert ev.path == str(source)
+
+    def test_document_events_for_sequential(
+        self, tmp_path, mock_completion
+    ):
+        events = []
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=0,  # sequential path
+            progress_callback=events.append,
+        )
+        md = "# Title\n\nPara A.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        p.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
+
+        kinds = [e.kind for e in events]
+        assert kinds.count("document_start") == 1
+        assert kinds.count("document_end") == 1
+        # Sequential emits one progress tick per pending entry.
+        ticks = [e for e in events if e.kind == "document_progress"]
+        assert len(ticks) >= 1
+
+    def test_empty_rerun_emits_start_and_end(
+        self, tmp_path, mock_completion
+    ):
+        """A no-op re-run should still emit ``document_start`` and
+        ``document_end`` so the UI can close out bars cleanly."""
+        events = []
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            progress_callback=events.append,
+        )
+        md = "# T\n\nPara.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        po_path = tmp_path / "m.po"
+        p.process_document(source, tmp_path / "target.md", po_path)
+        events.clear()
+        # Re-run with unchanged source: every entry is already translated.
+        p.process_document(source, tmp_path / "target.md", po_path)
+
+        kinds = [e.kind for e in events]
+        assert "document_start" in kinds
+        assert "document_end" in kinds
+
+    def test_directory_events(self, tmp_path, mock_completion):
+        events = []
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            progress_callback=events.append,
+        )
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.md").write_text("# A\n\nPara.\n", encoding="utf-8")
+        (src / "b.md").write_text("# B\n\nPara.\n", encoding="utf-8")
+
+        p.process_directory(
+            src, tmp_path / "out", tmp_path / "po", max_workers=1
+        )
+
+        kinds = [e.kind for e in events]
+        assert kinds.count("directory_start") == 1
+        assert kinds.count("directory_end") == 1
+        # One start and end per file, regardless of order.
+        assert kinds.count("file_start") == 2
+        assert kinds.count("file_end") == 2
+        # file_end carries a status string.
+        for ev in events:
+            if ev.kind == "file_end":
+                assert ev.status in {"processed", "failed", "skipped"}
+
+    def test_exception_still_closes_document(
+        self, tmp_path, mock_completion
+    ):
+        """A failure after ``document_start`` must still emit
+        ``document_end`` so rich.progress doesn't leave its bar open."""
+
+        def _boom(content, target):
+            raise RuntimeError("post-save boom")
+
+        events = []
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            progress_callback=events.append,
+        )
+        p._save_processed_document = _boom  # type: ignore[method-assign]
+
+        md = "# T\n\nPara.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        with pytest.raises(RuntimeError):
+            p.process_document(
+                source, tmp_path / "target.md", tmp_path / "m.po"
+            )
+
+        kinds = [e.kind for e in events]
+        assert "document_start" in kinds
+        assert "document_end" in kinds
+        # ``document_end`` must be the FINAL event — a UI that keys off
+        # this event needs to close the bar only after save/rebuild
+        # either committed or raised, so a failed run cannot end up
+        # marked as "completed".
+        assert kinds[-1] == "document_end"
+
+    def test_callback_exception_is_swallowed(
+        self, tmp_path, mock_completion
+    ):
+        """A broken UI hook must never abort translation."""
+        calls = {"n": 0}
+
+        def _broken(event):
+            calls["n"] += 1
+            raise ValueError("ui exploded")
+
+        p = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=40,
+            progress_callback=_broken,
+        )
+        md = "# T\n\nPara.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        # Must NOT raise.
+        result = p.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        assert result.translation_stats.processed >= 1
+        assert calls["n"] >= 2  # at least start + end fired
+
+
 class TestEstimate:
     def test_estimate_returns_expected_keys(self, tmp_path, mock_completion):
         md = "# T\n\nPara one.\n\nPara two.\n"

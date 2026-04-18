@@ -8,6 +8,7 @@ import json
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -27,6 +28,27 @@ from .validator import validate as validate_translation
 
 
 ValidationMode = Literal["off", "conservative", "strict"]
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    """Lightweight event emitted by :class:`MarkdownProcessor` progress hook.
+
+    ``kind`` is one of ``"directory_start"``, ``"file_start"``,
+    ``"file_end"``, ``"directory_end"``, ``"document_start"``,
+    ``"document_progress"``, ``"document_end"``. Other fields are optional
+    and depend on ``kind``. The library is UI-agnostic — callers decide
+    how to render.
+    """
+
+    kind: str
+    path: Optional[str] = None
+    index: Optional[int] = None
+    total: Optional[int] = None
+    status: Optional[str] = None
+
+
+ProgressCallback = Callable[[ProgressEvent], None]
 
 
 class _UsageAccumulator:
@@ -153,6 +175,7 @@ class MarkdownProcessor:
         batch_max_chars: int = 8000,
         validation: ValidationMode = "off",
         enable_prompt_cache: bool = False,
+        progress_callback: Optional[ProgressCallback] = None,
         **litellm_kwargs,
     ):
         """
@@ -182,6 +205,13 @@ class MarkdownProcessor:
                 system prefix so providers that support prompt caching
                 (Anthropic native, OpenAI automatic) can reuse tokens across
                 batches and re-runs.
+            progress_callback: Optional one-argument callable invoked with a
+                :class:`ProgressEvent` at key points during
+                ``process_document`` / ``process_directory``. Emitted from
+                worker threads in the directory path, so callers that touch
+                shared UI state must handle thread-safety themselves. A
+                callback that raises is logged and suppressed so progress
+                rendering never breaks the actual work.
             **litellm_kwargs: Extra keyword arguments forwarded to
                 ``litellm.completion()``.
         """
@@ -198,11 +228,53 @@ class MarkdownProcessor:
         self.batch_max_chars = batch_max_chars
         self.validation: ValidationMode = validation
         self.enable_prompt_cache = enable_prompt_cache
+        self._progress_callback = progress_callback
         self._litellm_kwargs = litellm_kwargs
         # Thread-local hand-off slot so ``process_directory`` can expose each
         # worker's accumulator to ``process_document`` without changing that
         # method's public signature (which existing tests monkey-patch).
         self._tls = threading.local()
+
+    # ----- progress hook -----
+
+    def _emit_progress(self, **fields: Any) -> None:
+        """Invoke ``progress_callback`` if set; swallow exceptions.
+
+        A broken UI callback must never abort translation — if rendering
+        fails the actual API calls and PO writes should still complete.
+        """
+        cb = self._progress_callback
+        if cb is None:
+            return
+        try:
+            cb(ProgressEvent(**fields))
+        except Exception:
+            logger.exception("progress_callback raised; continuing")
+
+    def _collect_pending_entries(
+        self, po_file: polib.POFile
+    ) -> Tuple[List[polib.POEntry], int]:
+        """Return ``(pending, skipped_count)`` for a PO file.
+
+        Centralised so ``process_document`` can compute the progress
+        ``total`` once — and emit ``document_start`` / ``document_end``
+        around the whole per-document pipeline (rebuild + save included)
+        rather than around just the translation loop.
+        """
+        pending: List[polib.POEntry] = []
+        skipped = 0
+        for entry in po_file:
+            if entry.obsolete:
+                continue
+            block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
+            if block_type in self.SKIP_TYPES:
+                skipped += 1
+                continue
+            needs_translation = (not entry.msgstr) or ("fuzzy" in entry.flags)
+            if not needs_translation:
+                continue
+            pending.append(entry)
+        return pending, skipped
 
     # ----- glossary -----
 
@@ -417,6 +489,8 @@ class MarkdownProcessor:
 
         po_file = None
         po_saved = False
+        source_path_str = str(source_path)
+        document_started = False
         try:
             source = source_path.read_text(encoding="utf-8")
             source_lines = source.splitlines(keepends=True)
@@ -429,13 +503,44 @@ class MarkdownProcessor:
             )
             po_manager.sync_po(po_file, blocks, parser.context_id)
 
+            # Compute progress total up-front so ``document_start`` /
+            # ``document_end`` bracket the ENTIRE per-document pipeline
+            # (translation + reconstruction + inplace + save), not just
+            # the translation loop.  Emitting ``document_end`` from
+            # inside the inner helpers would mark failed runs as
+            # completed if rebuild / save / inplace raised after
+            # translation finished.
+            pending, initial_skipped = self._collect_pending_entries(po_file)
+            if self.batch_size and self.batch_size > 0:
+                progress_total = len(self._section_aware_groups(pending))
+            else:
+                progress_total = len(pending)
+            self._emit_progress(
+                kind="document_start",
+                path=source_path_str,
+                total=progress_total,
+            )
+            document_started = True
+
             if self.batch_size and self.batch_size > 0:
                 translation_stats = self._process_entries_batched(
-                    po_file, po_manager, inplace=inplace, usage=usage
+                    po_file,
+                    po_manager,
+                    inplace=inplace,
+                    usage=usage,
+                    source_path=source_path_str,
+                    pending=pending,
+                    initial_skipped=initial_skipped,
                 )
             else:
                 translation_stats = self._process_entries_sequential(
-                    po_file, po_manager, inplace=inplace, usage=usage
+                    po_file,
+                    po_manager,
+                    inplace=inplace,
+                    usage=usage,
+                    source_path=source_path_str,
+                    pending=pending,
+                    initial_skipped=initial_skipped,
                 )
 
             coverage_dict = reconstructor.get_process_coverage(
@@ -550,6 +655,15 @@ class MarkdownProcessor:
                         "PO save failed during error handling for %s", po_path
                     )
             raise
+        finally:
+            # Match every ``document_start`` with a ``document_end``
+            # AFTER rebuild / inplace / save have all either committed
+            # or raised.  UIs can then close their bars without
+            # mis-marking failed runs as completed.
+            if document_started:
+                self._emit_progress(
+                    kind="document_end", path=source_path_str
+                )
 
     def process_directory(
         self,
@@ -579,6 +693,12 @@ class MarkdownProcessor:
         # contributes its billed tokens to the directory-level receipt.
         worker_usages: List[_UsageAccumulator] = []
 
+        self._emit_progress(
+            kind="directory_start",
+            path=str(source_dir),
+            total=len(matched_files),
+        )
+
         def _process_one(source_file: Path):
             relative_path = source_file.relative_to(source_dir)
             target_path = target_dir / relative_path
@@ -594,6 +714,7 @@ class MarkdownProcessor:
             # afterwards prevents one worker's accumulator leaking into the
             # next task that lands on this thread.
             self._tls.usage = u
+            self._emit_progress(kind="file_start", path=str(source_file))
             try:
                 result = self.process_document(
                     source_file, target_path, po_path_file, inplace=inplace
@@ -604,44 +725,70 @@ class MarkdownProcessor:
             finally:
                 self._tls.usage = None
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_file = {
-                executor.submit(_process_one, sf): sf for sf in matched_files
-            }
-            for future in concurrent.futures.as_completed(future_to_file):
-                source_file = future_to_file[future]
-                try:
-                    result, worker_usage, worker_error = future.result()
-                except Exception:
-                    # _process_one swallows task exceptions into the tuple;
-                    # reaching here means the executor itself blew up.
-                    logger.exception("Worker crashed for %s", source_file)
-                    files_failed += 1
-                    results.append({"source_path": str(source_file), "error": True})
-                    continue
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers
+            ) as executor:
+                future_to_file = {
+                    executor.submit(_process_one, sf): sf for sf in matched_files
+                }
+                for future in concurrent.futures.as_completed(future_to_file):
+                    source_file = future_to_file[future]
+                    file_status = "failed"
+                    try:
+                        result, worker_usage, worker_error = future.result()
+                    except Exception:
+                        # _process_one swallows task exceptions into the tuple;
+                        # reaching here means the executor itself blew up.
+                        logger.exception("Worker crashed for %s", source_file)
+                        files_failed += 1
+                        results.append({"source_path": str(source_file), "error": True})
+                        self._emit_progress(
+                            kind="file_end",
+                            path=str(source_file),
+                            status=file_status,
+                        )
+                        continue
 
-                worker_usages.append(worker_usage)
+                    worker_usages.append(worker_usage)
 
-                if worker_error is not None:
-                    logger.exception(
-                        "Failed to process %s", source_file, exc_info=worker_error
+                    if worker_error is not None:
+                        logger.exception(
+                            "Failed to process %s", source_file, exc_info=worker_error
+                        )
+                        files_failed += 1
+                        results.append({"source_path": str(source_file), "error": True})
+                        self._emit_progress(
+                            kind="file_end",
+                            path=str(source_file),
+                            status=file_status,
+                        )
+                        continue
+
+                    results.append(result)
+
+                    stats = result.translation_stats
+                    if stats.failed > 0 or stats.validation_failed > 0:
+                        # Entry-level failures still count as a file-level
+                        # failure so automation can detect partial errors
+                        # via ``files_failed`` / the CLI exit code.
+                        files_failed += 1
+                        file_status = "failed"
+                    elif stats.processed == 0:
+                        files_skipped += 1
+                        file_status = "skipped"
+                    else:
+                        files_processed += 1
+                        file_status = "processed"
+                    self._emit_progress(
+                        kind="file_end",
+                        path=str(source_file),
+                        status=file_status,
                     )
-                    files_failed += 1
-                    results.append({"source_path": str(source_file), "error": True})
-                    continue
-
-                results.append(result)
-
-                stats = result.translation_stats
-                if stats.failed > 0 or stats.validation_failed > 0:
-                    # Entry-level failures still count as a file-level
-                    # failure so automation can detect partial errors
-                    # via ``files_failed`` / the CLI exit code.
-                    files_failed += 1
-                elif stats.processed == 0:
-                    files_skipped += 1
-                else:
-                    files_processed += 1
+        finally:
+            self._emit_progress(
+                kind="directory_end", path=str(source_dir)
+            )
 
         duration = time.monotonic() - start
         dir_usage = _UsageAccumulator()
@@ -688,25 +835,25 @@ class MarkdownProcessor:
         po_manager: POManager,
         inplace: bool = False,
         usage: Optional[_UsageAccumulator] = None,
+        source_path: Optional[str] = None,
+        pending: Optional[List[polib.POEntry]] = None,
+        initial_skipped: int = 0,
     ) -> Dict[str, int]:
         pool = ReferencePool(max_results=self.max_reference_pairs)
         pool.seed_from_po(po_file)
 
-        stats: Dict[str, int] = {"processed": 0, "failed": 0, "skipped": 0}
+        stats: Dict[str, int] = {
+            "processed": 0,
+            "failed": 0,
+            "skipped": initial_skipped,
+        }
 
-        for entry in po_file:
-            if entry.obsolete:
-                continue
+        if pending is None:
+            pending, _skipped = self._collect_pending_entries(po_file)
+            stats["skipped"] = _skipped
 
-            block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
-            if block_type in self.SKIP_TYPES:
-                stats["skipped"] += 1
-                continue
-
-            needs_translation = (not entry.msgstr) or ("fuzzy" in entry.flags)
-            if not needs_translation:
-                continue
-
+        total = len(pending)
+        for i, entry in enumerate(pending, start=1):
             similar = pool.find_similar(entry.msgid)
 
             try:
@@ -746,6 +893,13 @@ class MarkdownProcessor:
                     getattr(entry, "msgctxt", None), exc,
                 )
                 stats["failed"] += 1
+            finally:
+                self._emit_progress(
+                    kind="document_progress",
+                    path=source_path,
+                    index=i,
+                    total=total,
+                )
 
         return stats
 
@@ -757,6 +911,9 @@ class MarkdownProcessor:
         po_manager: POManager,
         inplace: bool = False,
         usage: Optional[_UsageAccumulator] = None,
+        source_path: Optional[str] = None,
+        pending: Optional[List[polib.POEntry]] = None,
+        initial_skipped: int = 0,
     ) -> Dict[str, int]:
         pool = ReferencePool(max_results=self.max_reference_pairs)
         pool.seed_from_po(po_file)
@@ -764,32 +921,31 @@ class MarkdownProcessor:
         stats: Dict[str, int] = {
             "processed": 0,
             "failed": 0,
-            "skipped": 0,
+            "skipped": initial_skipped,
             "batched_calls": 0,
             "per_entry_calls": 0,
             "validated": 0,
             "validation_failed": 0,
         }
 
-        pending: List[polib.POEntry] = []
-        for entry in po_file:
-            if entry.obsolete:
-                continue
-            block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
-            if block_type in self.SKIP_TYPES:
-                stats["skipped"] += 1
-                continue
-            needs_translation = (not entry.msgstr) or ("fuzzy" in entry.flags)
-            if not needs_translation:
-                continue
-            pending.append(entry)
+        if pending is None:
+            pending, _skipped = self._collect_pending_entries(po_file)
+            stats["skipped"] = _skipped
 
         if not pending:
             return stats
 
-        for group in self._section_aware_groups(pending):
+        groups = self._section_aware_groups(pending)
+        total = len(groups)
+        for i, group in enumerate(groups, start=1):
             self._translate_group(
                 group, po_manager, pool, stats, inplace=inplace, usage=usage
+            )
+            self._emit_progress(
+                kind="document_progress",
+                path=source_path,
+                index=i,
+                total=total,
             )
 
         return stats

@@ -19,6 +19,7 @@ mdpo-llm splits your Markdown into blocks, tracks each one in a PO file, and sen
 - **Typed result dataclasses** (`ProcessResult`, `Coverage`, `BatchStats`) with dict-style access for backward compatibility.
 - **Dry-run estimator** — `processor.estimate(src)` reports pending blocks and estimated tokens with zero API calls.
 - **Per-run receipt** — every `translate` / `translate-dir` run attaches a `Receipt` with total tokens, per-1M USD pricing, wall-clock duration, and API-call count. CLI prints a human-readable block to stderr; `--json-receipt PATH` dumps the same data as JSON for CI.
+- **Progress display** — `translate` / `translate-dir` render a live `rich` progress bar on a TTY (batches for a single file, file count for a directory). Auto-suppressed under `-v`, when stderr isn't a TTY, when `MDPO_NO_PROGRESS` is set, or via `--no-progress`. The library stays UI-agnostic: pass `progress_callback=` to `MdpoLLM(...)` to receive `ProgressEvent` dataclasses and render your own UI.
 
 v0.2 behaviour (one call per block) is preserved via `batch_size=0`.
 
@@ -220,6 +221,7 @@ MdpoLLM(
     post_process=None,         # Callable[[str], str] applied to every LLM response
     glossary=None,             # dict[str, str | None] — inline glossary
     glossary_path=None,        # path to JSON glossary file (multi-locale)
+    progress_callback=None,    # Callable[[ProgressEvent], None] — see "Progress hook"
     **litellm_kwargs,          # temperature, api_key, api_base, etc.
 )
 ```
@@ -247,6 +249,36 @@ Pricing is resolved from `litellm.model_cost`; models not listed there
 leave the cost fields `None` and render as `"—"`. From the CLI, pass
 `--json-receipt PATH` on `translate` / `translate-dir` to dump the same
 structure as JSON for downstream tooling.
+
+### Progress hook
+
+Pass `progress_callback=` to `MdpoLLM(...)` to observe translation
+progress from your own UI. The callable receives a `ProgressEvent`
+dataclass with `kind`, `path`, `index`, `total`, and `status` fields.
+Event kinds:
+
+- `document_start` / `document_progress` / `document_end` — one
+  document's work units (batches in batched mode, entries in sequential
+  mode). `total` is set on the start event and repeated on every
+  progress tick.
+- `directory_start` / `file_start` / `file_end` / `directory_end` —
+  fired by `process_directory`. `file_end.status` is `"processed"`,
+  `"failed"`, or `"skipped"`.
+
+```python
+def on_progress(event):
+    if event.kind == "document_progress":
+        print(f"{event.path}: {event.index}/{event.total}")
+
+processor = MdpoLLM(model="gpt-4", target_lang="ko", progress_callback=on_progress)
+```
+
+The library itself imports nothing from `rich` — install the optional
+`rich` extra (`pip install mdpo-llm[progress]`) if you want the built-in
+CLI progress bar. The CLI auto-suppresses the bar on non-TTY, under
+`-v`, via `--no-progress`, or when `MDPO_NO_PROGRESS` is set, so CI
+logs stay clean. Callbacks are invoked from worker threads in
+`process_directory`; handle thread-safety if they touch shared state.
 
 ### Prompts
 
