@@ -3,6 +3,33 @@
 ## Unreleased
 
 ### Added
+- **`processor.py` — `batch_concurrency` kwarg / `--batch-concurrency N`
+  CLI flag (experimental)**: `MarkdownProcessor` accepts a new
+  `batch_concurrency: int = 1` kwarg that lets multiple section-aware
+  batches from a single document fly in parallel. The first group is
+  always processed on the calling thread so the reference pool is
+  seeded before any worker reads from it; remaining groups are
+  submitted to a `ThreadPoolExecutor` of size `batch_concurrency`.
+  Worker-local stats and `_UsageAccumulator` instances are merged
+  into the shared receipt under a single lock so the user-visible
+  output (PO file, `BatchStats`, `Receipt`) matches the sequential
+  path. Defaults to `1` (off) — callers must opt in. Non-positive /
+  non-int values clamp to `1` so a typo degrades to the safe path
+  rather than raising deep inside the executor. Ignored when
+  `batch_size == 0` (sequential path) and when a document partitions
+  into a single group. Forwarded through
+  `_sibling_refine_processor` so `translate --refine-first` honours
+  the same concurrency budget across both passes.
+- **CLI — `--batch-concurrency N`**: forwarded via `_add_shared_flags`
+  so every batch-capable subcommand (`translate`, `translate-dir`,
+  `refine`, `refine-dir`, `estimate`) accepts the new flag.
+- **Tests** — `tests/test_batched_processing.py::TestBatchConcurrency`
+  covers the default (`batch_concurrency == 1` leaves the executor
+  untouched), the clamp on non-positive / non-int inputs, the
+  seed-first invariant (first LLM call runs alone before any worker
+  starts), genuine overlap on the parallel path, aggregation of
+  `batched_calls` / receipt tokens across workers, and the
+  single-group fall-through.
 - **`processor.py` — `mode` kwarg / `refine` path**: `MarkdownProcessor`
   gains a `mode: Literal["translate", "refine"]` constructor kwarg
   (default `"translate"`). Refine mode polishes Markdown in its **source
