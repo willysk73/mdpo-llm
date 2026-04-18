@@ -77,11 +77,14 @@ concurrency.
       - CHANGELOG.md
       - pyproject.toml
     exclude: []
-  status: pending
+  status: assigned
   priority: high
   depends_on: []
   brief: .ccx/tasks/T-2.md
-  attempts: 0
+  attempts: 1
+  worktree: /home/will/Repositories/mdpo-llm-T-2
+  branch: ccx/T-2
+  started_at: "2026-04-18T07:06:35Z"
   notes: |
     Roadmap #1. Add a progress-event hook on the processor (emit per
     batch / per file — library stays UI-agnostic) and wire it to
