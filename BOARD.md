@@ -127,11 +127,14 @@ concurrency.
       - tests/test_placeholder.py
       - CHANGELOG.md
     exclude: []
-  status: pending
+  status: assigned
   priority: high
   depends_on: []
   brief: .ccx/tasks/T-4.md
-  attempts: 0
+  attempts: 1
+  worktree: /home/will/Repositories/mdpo-llm-T-4
+  branch: ccx/T-4
+  started_at: "2026-04-18T07:28:36Z"
   notes: |
     Roadmap #5 + #6 foundation. New module `placeholder.py` that replaces
     configurable source patterns with opaque tokens before the LLM sees
