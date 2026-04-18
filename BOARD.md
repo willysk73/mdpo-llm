@@ -103,11 +103,14 @@ concurrency.
       - tests/test_batched_processing.py
       - CHANGELOG.md
     exclude: []
-  status: pending
+  status: assigned
   priority: normal
   depends_on: []
   brief: .ccx/tasks/T-3.md
-  attempts: 0
+  attempts: 1
+  worktree: /home/will/Repositories/mdpo-llm-T-3
+  branch: ccx/T-3
+  started_at: "2026-04-18T08:03:41Z"
   notes: |
     Roadmap #4. The v0.3 real-world test produced 34 false-positive
     warnings because code blocks legitimately round-trip unchanged and
