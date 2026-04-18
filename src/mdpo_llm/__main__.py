@@ -3,6 +3,8 @@
 Usage:
     python -m mdpo_llm translate SOURCE TARGET [options]
     python -m mdpo_llm translate-dir SOURCE_DIR TARGET_DIR [options]
+    python -m mdpo_llm refine SOURCE REFINED [options]
+    python -m mdpo_llm refine-dir SOURCE_DIR REFINED_DIR [options]
     python -m mdpo_llm estimate SOURCE [options]
     python -m mdpo_llm report SOURCE PO [options]
 """
@@ -48,13 +50,22 @@ def _add_shared_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_translate_flags(parser: argparse.ArgumentParser) -> None:
-    """Flags that only make sense when actually issuing translations."""
+def _add_translate_flags(
+    parser: argparse.ArgumentParser,
+    *,
+    target_help: str = "BCP 47 target locale (e.g. ko, ja, zh-CN).",
+) -> None:
+    """Flags that only make sense when actually issuing translations.
+
+    ``target_help`` lets the ``refine`` subcommands override the
+    ``--target`` blurb so users don't read it as "translate to this
+    locale" when the value actually names the source/preserved language.
+    """
     _add_shared_flags(parser)
     parser.add_argument(
         "--target",
         required=True,
-        help="BCP 47 target locale (e.g. ko, ja, zh-CN).",
+        help=target_help,
     )
     parser.add_argument(
         "--validation",
@@ -95,7 +106,12 @@ def _add_translate_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--inplace",
         action="store_true",
-        help="After translating, copy msgstr back to msgid.",
+        help=(
+            "[DEPRECATED — removed in v0.5] After translating, copy msgstr "
+            "back to msgid. Use the `refine` subcommand (or `translate "
+            "--refine-first`) instead to polish the source while keeping "
+            "the original msgid intact."
+        ),
     )
     parser.add_argument(
         "--json-receipt",
@@ -133,6 +149,8 @@ def _add_estimate_flags(parser: argparse.ArgumentParser) -> None:
 def _build_processor(
     args: argparse.Namespace,
     progress_callback: Optional[Callable[[ProgressEvent], None]] = None,
+    *,
+    mode: str = "translate",
 ) -> MarkdownProcessor:
     return MarkdownProcessor(
         model=args.model,
@@ -146,6 +164,7 @@ def _build_processor(
         glossary_mode=getattr(args, "glossary_mode", "instruction"),
         enable_prompt_cache=getattr(args, "prompt_cache", False),
         progress_callback=progress_callback,
+        mode=mode,
     )
 
 
@@ -344,10 +363,42 @@ def _emit_receipt(result: Any, json_receipt_path: Optional[Path]) -> None:
         _write_receipt_json(receipt, json_receipt_path)
 
 
+def _handle_usage_error(exc: ValueError) -> int:
+    """Convert a processor-layer usage ``ValueError`` into a CLI usage
+    error: stderr message + exit code 2.
+
+    The refine / refine-first preconditions in ``MarkdownProcessor``
+    surface as ``ValueError`` (aliased paths, inplace+refine,
+    refine_first without refine_lang, colliding PO paths, etc.).
+    Those are deterministic user-input errors, not runtime failures,
+    so the CLI reports them exactly like the pre-call argparse-style
+    usage messages rather than letting the traceback surface.
+    """
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+
+
 def cmd_translate(args: argparse.Namespace) -> int:
     hook, closer = _make_progress_hook(args, kind="file")
     processor = _build_processor(args, progress_callback=hook)
     json_receipt = getattr(args, "json_receipt", None)
+    refine_first = getattr(args, "refine_first", False)
+    refined_path = getattr(args, "refined_path", None)
+    refine_lang = getattr(args, "refine_lang", None)
+    refined_po_path = getattr(args, "refined_po_path", None)
+    if refine_first and refined_path is None:
+        print(
+            "error: --refine-first requires --refined-path PATH",
+            file=sys.stderr,
+        )
+        return 2
+    if refine_first and not refine_lang:
+        print(
+            "error: --refine-first requires --refine-lang LOCALE "
+            "(BCP 47 locale of the source document).",
+            file=sys.stderr,
+        )
+        return 2
     try:
         try:
             result = processor.process_document(
@@ -355,7 +406,17 @@ def cmd_translate(args: argparse.Namespace) -> int:
                 Path(args.target_file),
                 Path(args.po) if args.po else None,
                 inplace=args.inplace,
+                refined_path=Path(refined_path) if refined_path else None,
+                refine_first=refine_first,
+                refine_lang=refine_lang,
+                refined_po_path=(
+                    Path(refined_po_path) if refined_po_path else None
+                ),
             )
+        except ValueError as exc:
+            if closer is not None:
+                closer.close()
+            return _handle_usage_error(exc)
         except BaseException as exc:
             # Stop the live progress renderer BEFORE emitting the
             # partial-receipt block. While rich is active it still owns
@@ -386,6 +447,23 @@ def cmd_translate_dir(args: argparse.Namespace) -> int:
     hook, closer = _make_progress_hook(args, kind="directory")
     processor = _build_processor(args, progress_callback=hook)
     json_receipt = getattr(args, "json_receipt", None)
+    refine_first = getattr(args, "refine_first", False)
+    refined_dir = getattr(args, "refined_dir", None)
+    refine_lang = getattr(args, "refine_lang", None)
+    refined_po_dir = getattr(args, "refined_po_dir", None)
+    if refine_first and refined_dir is None:
+        print(
+            "error: --refine-first requires --refined-dir PATH",
+            file=sys.stderr,
+        )
+        return 2
+    if refine_first and not refine_lang:
+        print(
+            "error: --refine-first requires --refine-lang LOCALE "
+            "(BCP 47 locale of the source document).",
+            file=sys.stderr,
+        )
+        return 2
     try:
         try:
             result = processor.process_directory(
@@ -395,10 +473,119 @@ def cmd_translate_dir(args: argparse.Namespace) -> int:
                 glob=args.glob,
                 inplace=args.inplace,
                 max_workers=args.max_workers,
+                refined_dir=Path(refined_dir) if refined_dir else None,
+                refine_first=refine_first,
+                refine_lang=refine_lang,
+                refined_po_dir=(
+                    Path(refined_po_dir) if refined_po_dir else None
+                ),
             )
+        except ValueError as exc:
+            if closer is not None:
+                closer.close()
+            return _handle_usage_error(exc)
         except BaseException as exc:
             # Stop the bar before the partial-receipt print; see
             # ``cmd_translate`` for the rationale.
+            if closer is not None:
+                closer.close()
+            partial = getattr(exc, "partial_receipt", None)
+            if partial is not None:
+                if hasattr(partial, "render"):
+                    print(partial.render(), file=sys.stderr)
+                if json_receipt is not None:
+                    _write_receipt_json(partial, json_receipt)
+            raise
+    finally:
+        if closer is not None:
+            closer.close()
+    summary: Dict[str, Any] = {
+        "source_dir": result.source_dir,
+        "target_dir": result.target_dir,
+        "po_dir": result.po_dir,
+        "files_processed": result.files_processed,
+        "files_failed": result.files_failed,
+        "files_skipped": result.files_skipped,
+    }
+    _print_result(summary)
+    _emit_receipt(result, json_receipt)
+    return 1 if result.files_failed else 0
+
+
+def cmd_refine(args: argparse.Namespace) -> int:
+    if args.inplace:
+        # Refine mode forbids source/msgid overwrite by contract.  The
+        # processor raises ValueError on this combination; catch it at
+        # the CLI boundary so users get a clean usage error instead of
+        # a traceback.
+        print(
+            "error: --inplace is incompatible with `refine`. Refine "
+            "never overwrites the source document — the refined output "
+            "goes to REFINED_FILE. Drop --inplace.",
+            file=sys.stderr,
+        )
+        return 2
+    hook, closer = _make_progress_hook(args, kind="file")
+    processor = _build_processor(args, progress_callback=hook, mode="refine")
+    json_receipt = getattr(args, "json_receipt", None)
+    try:
+        try:
+            result = processor.process_document(
+                Path(args.source),
+                Path(args.refined_file),
+                Path(args.po) if args.po else None,
+                inplace=False,
+            )
+        except ValueError as exc:
+            if closer is not None:
+                closer.close()
+            return _handle_usage_error(exc)
+        except BaseException as exc:
+            if closer is not None:
+                closer.close()
+            partial = getattr(exc, "partial_receipt", None)
+            if partial is not None:
+                if hasattr(partial, "render"):
+                    print(partial.render(), file=sys.stderr)
+                if json_receipt is not None:
+                    _write_receipt_json(partial, json_receipt)
+            raise
+    finally:
+        if closer is not None:
+            closer.close()
+    _print_result(result)
+    _emit_receipt(result, json_receipt)
+    stats = result.translation_stats
+    return 1 if (stats.failed or stats.validation_failed) else 0
+
+
+def cmd_refine_dir(args: argparse.Namespace) -> int:
+    if args.inplace:
+        print(
+            "error: --inplace is incompatible with `refine-dir`. Refine "
+            "never overwrites the source — refined output goes under "
+            "REFINED_DIR. Drop --inplace.",
+            file=sys.stderr,
+        )
+        return 2
+    hook, closer = _make_progress_hook(args, kind="directory")
+    processor = _build_processor(args, progress_callback=hook, mode="refine")
+    json_receipt = getattr(args, "json_receipt", None)
+    try:
+        try:
+            result = processor.process_directory(
+                Path(args.source_dir),
+                Path(args.refined_dir),
+                Path(args.po_dir) if args.po_dir else None,
+                glob=args.glob,
+                inplace=False,
+                max_workers=args.max_workers,
+            )
+        except ValueError as exc:
+            if closer is not None:
+                closer.close()
+            return _handle_usage_error(exc)
+        except BaseException as exc:
             if closer is not None:
                 closer.close()
             partial = getattr(exc, "partial_receipt", None)
@@ -458,6 +645,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("source", help="Source markdown file.")
     p_tr.add_argument("target_file", help="Target markdown file.")
     p_tr.add_argument("--po", default=None, help="PO file path (default: target with .po).")
+    p_tr.add_argument(
+        "--refine-first",
+        action="store_true",
+        help=(
+            "Run a refine pass on the source before translating. Requires "
+            "--refined-path for the intermediate output."
+        ),
+    )
+    p_tr.add_argument(
+        "--refined-path",
+        default=None,
+        help="Intermediate refined markdown path used by --refine-first.",
+    )
+    p_tr.add_argument(
+        "--refined-po-path",
+        default=None,
+        help=(
+            "Refine-pass PO file path. Defaults to REFINED_PATH with a "
+            ".po suffix; override when the default PO would collide with "
+            "the translate-pass PO (e.g. TARGET and REFINED_PATH share a "
+            "stem but differ by extension like out.md / out.markdown)."
+        ),
+    )
+    p_tr.add_argument(
+        "--refine-lang",
+        default=None,
+        help=(
+            "BCP 47 locale the refine pass should preserve "
+            "(the SOURCE language of the document, e.g. 'en'). "
+            "REQUIRED with --refine-first; no default — using --target "
+            "would pin refine to the translate target and corrupt the run."
+        ),
+    )
     p_tr.set_defaults(func=cmd_translate)
 
     p_dir = sub.add_parser("translate-dir", help="Translate a directory tree.")
@@ -467,7 +687,81 @@ def build_parser() -> argparse.ArgumentParser:
     p_dir.add_argument("--po-dir", default=None, help="PO output directory.")
     p_dir.add_argument("--glob", default="**/*.md", help="Glob pattern for markdown files.")
     p_dir.add_argument("--max-workers", type=int, default=4, help="Concurrent file workers.")
+    p_dir.add_argument(
+        "--refine-first",
+        action="store_true",
+        help=(
+            "Run a refine pass on each source file before translating. "
+            "Requires --refined-dir."
+        ),
+    )
+    p_dir.add_argument(
+        "--refined-dir",
+        default=None,
+        help="Intermediate refined directory used by --refine-first.",
+    )
+    p_dir.add_argument(
+        "--refined-po-dir",
+        default=None,
+        help=(
+            "Refine-pass PO output directory. Defaults to refined-dir "
+            "alongside each file's .po; override when the default POs "
+            "would collide with the translate-pass POs (same stem, "
+            "different extensions)."
+        ),
+    )
+    p_dir.add_argument(
+        "--refine-lang",
+        default=None,
+        help=(
+            "BCP 47 locale the refine pass should preserve "
+            "(the SOURCE language, e.g. 'en'). REQUIRED with "
+            "--refine-first; no default."
+        ),
+    )
     p_dir.set_defaults(func=cmd_translate_dir)
+
+    p_rf = sub.add_parser(
+        "refine",
+        help="Polish a markdown file in its source language (no translation).",
+    )
+    _add_translate_flags(
+        p_rf,
+        target_help=(
+            "BCP 47 locale of the SOURCE document — the language the "
+            "refine pass MUST preserve (e.g. 'en', 'ja'). refine never "
+            "translates; any non-source locale here will produce "
+            "wrong-language output and trip language_stability."
+        ),
+    )
+    p_rf.add_argument("source", help="Source markdown file.")
+    p_rf.add_argument(
+        "refined_file", help="Refined markdown output (never overwrites source)."
+    )
+    p_rf.add_argument("--po", default=None, help="PO file path (default: refined with .po).")
+    p_rf.set_defaults(func=cmd_refine)
+
+    p_rfd = sub.add_parser(
+        "refine-dir",
+        help="Polish a directory tree in its source language (no translation).",
+    )
+    _add_translate_flags(
+        p_rfd,
+        target_help=(
+            "BCP 47 locale of the SOURCE documents — the language the "
+            "refine pass MUST preserve (e.g. 'en', 'ja'). refine never "
+            "translates; any non-source locale here will produce "
+            "wrong-language output and trip language_stability."
+        ),
+    )
+    p_rfd.add_argument("source_dir", help="Source directory.")
+    p_rfd.add_argument("refined_dir", help="Refined output directory.")
+    p_rfd.add_argument("--po-dir", default=None, help="PO output directory.")
+    p_rfd.add_argument("--glob", default="**/*.md", help="Glob pattern for markdown files.")
+    p_rfd.add_argument(
+        "--max-workers", type=int, default=4, help="Concurrent file workers."
+    )
+    p_rfd.set_defaults(func=cmd_refine_dir)
 
     p_est = sub.add_parser("estimate", help="Estimate pending blocks and tokens (no API calls).")
     _add_estimate_flags(p_est)

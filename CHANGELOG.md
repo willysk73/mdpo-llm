@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### Added
+- **`processor.py` — `mode` kwarg / `refine` path**: `MarkdownProcessor`
+  gains a `mode: Literal["translate", "refine"]` constructor kwarg
+  (default `"translate"`). Refine mode polishes Markdown in its **source
+  language** without translating or switching languages, reusing the
+  entire translate pipeline (parser, PO tracking, batching, reference
+  pool, placeholders) and swapping only the prompt template and
+  validator purpose. `refined_path` / `refined_dir` kwargs on
+  `process_document` / `process_directory` route the refined output to a
+  separate location; the PO `msgid` is NEVER overwritten — refined text
+  lands in `msgstr`. `inplace=True` combined with `mode="refine"` raises
+  (the contract forbids msgid overwrite).
+- **`processor.py` — `translate --refine-first` composition**: new
+  `refine_first=True` + `refined_path` kwargs on `process_document`
+  (and `refined_dir` on `process_directory`) run a refine pass before
+  translating. Tokens from both passes flow into the returned
+  `Receipt`. `refine_lang` picks the refine-pass language (defaults to
+  `target_lang` only when source==target).
+- **`prompts.py` — `REFINE_SYSTEM_TEMPLATE` / `REFINE_INSTRUCTION` /
+  `BATCH_REFINE_SYSTEM_TEMPLATE` / `BATCH_REFINE_INSTRUCTION`**: new
+  prompt templates for same-language polish. Both variants explicitly
+  forbid language switching, preserve Markdown structure, keep
+  `⟦P:N⟧` placeholders intact, and ban invention of new content.
+- **`validator.py` — `purpose` kwarg + `language_stability` check**:
+  `validate()` accepts `purpose: Literal["translate", "refine"]`
+  (default `"translate"`). Refine purpose drops the
+  `target_language` presence check (source language == target language
+  makes it meaningless) and adds `language_stability`, which fails
+  whenever `detect_languages(source) != detect_languages(output)` —
+  catching a model that silently switches languages mid-refinement.
+- **CLI — `refine` / `refine-dir` subcommands**: new same-language
+  polish entry points mirroring `translate` / `translate-dir` flags.
+  `translate` / `translate-dir` gain `--refine-first`,
+  `--refined-path` / `--refined-dir`, and `--refine-lang` for the
+  compose path. `--inplace` help text calls out deprecation and
+  points users at the refine alternative.
+- **Tests** — `tests/test_validator.py` covers the refine-purpose
+  branches (target-language check suppressed, `language_stability`
+  flagged on language drift, structural checks still run);
+  `tests/test_batched_processing.py::TestRefineMode` covers prompt
+  selection, msgid preservation, the `inplace`/`refine_first`
+  validation guards, and the compose receipt aggregation.
+
+### Deprecated
+- **`inplace=True` on `MarkdownProcessor.process_document` /
+  `process_directory`**: emits a `DeprecationWarning` pointing at refine
+  mode and `refined_path` / `translate --refine-first`. The flag is
+  slated for removal in v0.5. Callers who intentionally rewrote source
+  content after translating should switch to `mode="refine"` with a
+  separate `refined_path` — the refine contract captures the "polished
+  document" intent without clobbering the original.
+
 ### Fixed
 - **`processor.py` — untranslated-warning false positives**: the
   "LLM returned untranslated output" check fired on every code block

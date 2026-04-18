@@ -1,5 +1,7 @@
 """Tests for the post-translation validator."""
 
+import pytest
+
 from mdpo_llm.validator import validate
 
 
@@ -117,3 +119,140 @@ def test_strict_mode_checks_inline_code():
 def test_reasons_concatenates_issues():
     result = validate("## Section", "섹션", target_lang="ko")
     assert "heading_level" in result.reasons()
+
+
+def test_refine_purpose_skips_target_language_check():
+    # Refine is same-language: English source, English "refined" output
+    # must NOT trip the target-language check that translate-purpose
+    # validation runs.
+    result = validate(
+        "Reset the password",
+        "Reset your password",
+        target_lang="en",
+        purpose="refine",
+    )
+    assert result.ok
+    assert not any(i.check == "target_language" for i in result.issues)
+
+
+def test_refine_purpose_flags_language_drift():
+    # Refine output must stay in the source language.  An English source
+    # with a Korean output adds a script class — language_stability fail.
+    result = validate(
+        "Reset the password",
+        "비밀번호를 재설정하세요",
+        target_lang="en",
+        purpose="refine",
+    )
+    assert not result.ok
+    assert any(i.check == "language_stability" for i in result.issues)
+
+
+def test_refine_language_stability_allows_script_subset():
+    # Japanese source detects as both kana (``ja``) and CJK ideographs
+    # (``zh``).  A refined paragraph that drops kanji in favour of pure
+    # kana is a legitimate same-language rewrite and must NOT trip the
+    # check — same CJK family on both sides.
+    src = "こんにちは世界"  # hiragana + kanji → {'ja', 'zh'} → {cjk}
+    tgt = "こんにちは"  # hiragana only → {'ja'} → {cjk}
+    result = validate(src, tgt, target_lang="ja", purpose="refine")
+    assert result.ok
+    assert not any(i.check == "language_stability" for i in result.issues)
+
+
+def test_refine_language_stability_allows_kanji_plus_kana():
+    # Codex-reported regression: a kanji-only source detects as
+    # ``{'zh'}``; a legitimate refinement adding kana detects as
+    # ``{'ja', 'zh'}``.  Both resolve to the ``cjk`` family, so the
+    # check must NOT flag this.
+    src = "世界"  # kanji only → {'zh'} → {cjk}
+    tgt = "こんにちは世界"  # kana + kanji → {'ja', 'zh'} → {cjk}
+    result = validate(src, tgt, target_lang="ja", purpose="refine")
+    assert result.ok
+    assert not any(i.check == "language_stability" for i in result.issues)
+
+
+def test_refine_language_stability_catches_mixed_source_translation():
+    # Regression: if a mostly-English source contains a single
+    # foreign-script token, a subset rule would let a fully-Korean
+    # output pass because {'korean'} ⊆ {'latin','korean'}.  The
+    # dominant-family rule catches this — 'latin' dominates the
+    # source and the output must preserve it.
+    src = "Reset the password (비밀번호)"
+    tgt = "비밀번호를 재설정하세요"
+    result = validate(src, tgt, target_lang="en", purpose="refine")
+    assert not result.ok
+    assert any(i.check == "language_stability" for i in result.issues)
+
+
+def test_refine_language_stability_allows_minor_script_drop():
+    # A legitimate refinement that drops a rare foreign-script token
+    # while preserving the dominant Latin prose must still pass.
+    src = "Use the 漢 character in names."
+    tgt = "Use that character in names."
+    result = validate(src, tgt, target_lang="en", purpose="refine")
+    assert result.ok
+
+
+def test_refine_language_stability_flags_new_script():
+    # Adding a script class the source never contained (Korean hangul
+    # in an English refine) fails the stability check even though the
+    # source's script ("en") is also present in the output.
+    result = validate(
+        "Reset the password",
+        "Reset the password 비밀번호",
+        target_lang="en",
+        purpose="refine",
+    )
+    assert not result.ok
+    assert any(i.check == "language_stability" for i in result.issues)
+
+
+def test_refine_purpose_allows_verbatim_source():
+    # A clean source that the LLM returns verbatim is a valid refine
+    # outcome — no checks should fail.
+    result = validate(
+        "Reset the password",
+        "Reset the password",
+        target_lang="en",
+        purpose="refine",
+    )
+    assert result.ok
+
+
+def test_refine_purpose_structural_checks_still_run():
+    # Refine still enforces Markdown-structural invariants like heading
+    # level preservation — only the target-language check is suppressed.
+    result = validate(
+        "## Overview",
+        "### Overview",
+        target_lang="en",
+        purpose="refine",
+    )
+    assert not result.ok
+    assert any(i.check == "heading_level" for i in result.issues)
+
+
+def test_validator_rejects_unknown_purpose():
+    # A typo like ``purpose="translation"`` would previously fall
+    # through and silently suppress every semantic check — turn that
+    # into a loud failure at the public API boundary instead.
+    with pytest.raises(ValueError, match="purpose must be"):
+        validate(
+            "Hello",
+            "Hello",
+            target_lang="ko",
+            purpose="translation",  # type: ignore[arg-type]
+        )
+
+
+def test_translate_purpose_still_runs_target_language():
+    # Regression guard: translate is the default purpose and must keep
+    # firing the target-language check that refine drops.
+    result = validate(
+        "Reset the password",
+        "Reset the password",
+        target_lang="ko",
+    )
+    assert not result.ok
+    assert any(i.check == "target_language" for i in result.issues)

@@ -23,6 +23,7 @@ from .language import (
 from .placeholder import PlaceholderMap, check_round_trip
 
 Mode = Literal["conservative", "strict"]
+Purpose = Literal["translate", "refine"]
 
 
 _FENCE_RE = re.compile(r"^(```|~~~)", re.MULTILINE)
@@ -33,6 +34,49 @@ _WORD_RE = re.compile(r"[A-Za-z]+")
 # reliable signal that the block is prose rather than an identifier / product
 # name, which lets us flag pure-English echoes (e.g. "Reset the password")
 # without tripping on technical labels (e.g. "OpenAI API").
+# Group ``detect_languages`` primary subtags into script FAMILIES so
+# the refine-mode language-stability check tolerates intra-family
+# script shifts (e.g. Japanese kanji-only → kana+kanji) while still
+# catching gross family drift (Latin → Korean).  Japanese and Chinese
+# share CJK ideographs, so ``ja`` / ``zh`` collapse into a single
+# ``cjk`` bucket — a Japanese refinement that drops or adds kana
+# continues to register as the same family.  Korean hangul is its own
+# family; Latin-script locales (en/fr/de/es/…) all alias to ``en`` in
+# ``LANGUAGE_PATTERNS`` and therefore share the ``latin`` bucket.
+_SCRIPT_FAMILY: Dict[str, str] = {
+    "en": "latin",
+    "ja": "cjk",
+    "zh": "cjk",
+    "ko": "korean",
+}
+
+
+def _script_families(langs: "set[str]") -> "set[str]":
+    return {_SCRIPT_FAMILY[lang] for lang in langs if lang in _SCRIPT_FAMILY}
+
+
+def _dominant_script_family(text: str) -> Optional[str]:
+    """Return the script family whose characters cover the most of ``text``.
+
+    Counts character matches per ``LANGUAGE_PATTERNS`` primary subtag,
+    collapses counts into families (``ja`` + ``zh`` → ``cjk`` etc.),
+    and returns the family with the highest count.  Ties break
+    alphabetically (``cjk`` before ``latin``) so the result is stable.
+    ``None`` when no supported script is present in the text.
+    """
+    per_family: Dict[str, int] = {}
+    for lang, pattern in LANGUAGE_PATTERNS.items():
+        family = _SCRIPT_FAMILY.get(lang)
+        if family is None:
+            continue
+        count = len(pattern.findall(text))
+        if count:
+            per_family[family] = per_family.get(family, 0) + count
+    if not per_family:
+        return None
+    return max(per_family.items(), key=lambda kv: (kv[1], -ord(kv[0][0])))[0]
+
+
 _EN_PROSE_WORDS = frozenset({
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
     "have", "has", "had", "do", "does", "did", "of", "in", "on", "at",
@@ -80,6 +124,54 @@ def _looks_like_english_prose(text: str) -> bool:
     return False
 
 
+def check_language_stability(
+    source: str, translation: str
+) -> Optional[ValidationIssue]:
+    """Return a ``language_stability`` issue when the refined output
+    drifts from the source's dominant script family.
+
+    Exposed as a standalone helper so refine-mode callers can enforce
+    the same-language contract independent of ``validation``.  Two
+    rules apply:
+
+    1. Output must NOT introduce a script family absent from the
+       source — adding Korean hangul to a Latin-only source is drift.
+    2. Output MUST preserve the source's **dominant** script family
+       (the family whose characters cover the most of the source).
+       Subset preservation alone isn't enough: an English sentence
+       that already mentions one Korean term has
+       ``src_families == {'latin', 'korean'}``, and a fully-Korean
+       output would be a valid subset but clearly a silent
+       translation of the dominant Latin prose.
+
+    ``None`` when source or translation is empty or contains no
+    supported script — the rest of the validator still runs its
+    structural checks in that case.  See ``validate(purpose="refine")``
+    for the full check documentation (family collapsing, Latin-script
+    blind spot).
+    """
+    if not source.strip() or not translation.strip():
+        return None
+    src_families = _script_families(detect_languages(source))
+    tgt_families = _script_families(detect_languages(translation))
+    if not src_families or not tgt_families:
+        return None
+    if not tgt_families.issubset(src_families):
+        return ValidationIssue(
+            "language_stability",
+            f"output script families {sorted(tgt_families)} add scripts "
+            f"not present in source {sorted(src_families)}",
+        )
+    dominant = _dominant_script_family(source)
+    if dominant is not None and dominant not in tgt_families:
+        return ValidationIssue(
+            "language_stability",
+            f"output dropped the source's dominant script family "
+            f"{dominant!r}; output families {sorted(tgt_families)}",
+        )
+    return None
+
+
 def validate(
     source: str,
     translation: str,
@@ -89,6 +181,7 @@ def validate(
     mode: Mode = "conservative",
     placeholder_map: Optional[PlaceholderMap] = None,
     encoded_translation: Optional[str] = None,
+    purpose: Purpose = "translate",
 ) -> ValidationResult:
     """Validate ``translation`` against ``source``.
 
@@ -113,10 +206,35 @@ def validate(
             checks do NOT run against this string — patterns that cover
             Markdown syntax (fenced code, inline code, headings) would
             otherwise flag correct translations as fuzzy.
+        purpose: ``"translate"`` (default) runs the target-language-presence
+            check — the translation must contain characters of ``target_lang``
+            when the source is pure English.  ``"refine"`` drops that check
+            (refine is same-language, so the target language and source
+            language are identical) and instead runs a ``language_stability``
+            check: the output's script-family set must be a subset of the
+            source's.  ``ja``/``zh`` collapse into a single ``cjk`` family
+            so Japanese refinements that shift the kana/kanji mix (common
+            during editing) still pass; Korean hangul is its own family;
+            every Latin-script locale (en, fr, de, es, …) collapses to the
+            ``latin`` family.  The check therefore catches gross family
+            drift (Latin → Korean hangul) but treats cross-Latin drift
+            (en → fr) as a documented limitation — proper language ID is
+            out of scope for the script-based heuristic the rest of the
+            codebase uses.
 
     Returns:
         ``ValidationResult`` with ``ok`` and a list of ``ValidationIssue``.
     """
+    if purpose not in ("translate", "refine"):
+        # Silent fall-through would suppress BOTH the target-language
+        # check and the refine-specific language-stability check, so a
+        # caller typo (``purpose="translation"``) would start reporting
+        # every semantically broken output as ``ok=True``.  Fail loud
+        # at the public boundary instead.
+        raise ValueError(
+            f"purpose must be 'translate' or 'refine', got {purpose!r}"
+        )
+
     issues: List[ValidationIssue] = []
 
     if placeholder_map is not None and placeholder_map:
@@ -174,25 +292,40 @@ def validate(
     #      common English function word), which indicates the model returned
     #      the source untranslated.  Echoes of identifier-like labels such
     #      as "OpenAI API" are deliberately NOT flagged.
-    target_primary = _resolve_primary(target_lang)
-    if (
-        target_primary in LANGUAGE_PATTERNS
-        and target_primary != "en"
-        and source.strip()
-        and translation.strip()
-    ):
-        src_langs = detect_languages(source)
-        lacks_target_chars = not contains_language(translation, [target_lang])
-        differs = translation.strip() != source.strip()
-        is_prose_echo = not differs and _looks_like_english_prose(source)
+    #
+    # Refine is same-language by contract, so target-language-presence is
+    # meaningless (source == target).  Language-stability replaces it: the
+    # set of detected languages in the output must equal the set detected
+    # in the source, catching a model that silently translates during
+    # refinement.
+    if purpose == "translate":
+        target_primary = _resolve_primary(target_lang)
+        if (
+            target_primary in LANGUAGE_PATTERNS
+            and target_primary != "en"
+            and source.strip()
+            and translation.strip()
+        ):
+            src_langs = detect_languages(source)
+            lacks_target_chars = not contains_language(translation, [target_lang])
+            differs = translation.strip() != source.strip()
+            is_prose_echo = not differs and _looks_like_english_prose(source)
 
-        if src_langs == {"en"} and lacks_target_chars and (differs or is_prose_echo):
-            issues.append(
-                ValidationIssue(
-                    "target_language",
-                    f"expected {target_lang} characters, none found",
+            if src_langs == {"en"} and lacks_target_chars and (differs or is_prose_echo):
+                issues.append(
+                    ValidationIssue(
+                        "target_language",
+                        f"expected {target_lang} characters, none found",
+                    )
                 )
-            )
+    elif purpose == "refine":
+        # Share the exact same rule as the standalone
+        # ``check_language_stability`` helper used by refine-mode
+        # processors independently of ``validation`` — there must be
+        # one source of truth for the same-language contract.
+        stability = check_language_stability(source, translation)
+        if stability is not None:
+            issues.append(stability)
 
     if mode == "strict":
         src_inline = _count_inline_code(source)

@@ -9,6 +9,7 @@ import logging
 import re
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
@@ -35,11 +36,24 @@ from .prompts import Prompts
 from .reconstructor import DocumentReconstructor
 from .reference_pool import ReferencePool
 from .results import BatchStats, Coverage, DirectoryResult, ProcessResult, Receipt
-from .validator import ValidationIssue, validate as validate_translation
+from .validator import (
+    ValidationIssue,
+    check_language_stability,
+    validate as validate_translation,
+)
 
 
 ValidationMode = Literal["off", "conservative", "strict"]
 GlossaryMode = Literal["instruction", "placeholder"]
+Mode = Literal["translate", "refine"]
+
+
+_INPLACE_DEPRECATION_MESSAGE = (
+    "`inplace=True` is deprecated and will be removed in v0.5. "
+    "Use `mode='refine'` with a separate `refined_path` to produce a "
+    "polished version of the source while keeping the original `msgid` "
+    "intact. See README 'Refine mode' for migration details."
+)
 
 
 @dataclass(frozen=True)
@@ -190,6 +204,7 @@ class MarkdownProcessor:
         progress_callback: Optional[ProgressCallback] = None,
         placeholders: Optional[PlaceholderRegistry] = None,
         glossary_mode: GlossaryMode = "instruction",
+        mode: Mode = "translate",
         **litellm_kwargs,
     ):
         """
@@ -237,6 +252,18 @@ class MarkdownProcessor:
                 fail — independent of the ``validation`` mode.
                 ``None`` (default) runs with only the T-6 built-ins;
                 passing an extra registry layers additional patterns on top.
+            mode: ``"translate"`` (default) issues cross-language translations
+                using :attr:`Prompts.TRANSLATE_SYSTEM_TEMPLATE` and runs the
+                translate-purpose validator (target-language-presence check).
+                ``"refine"`` issues same-language clarity/grammar polish using
+                :attr:`Prompts.REFINE_SYSTEM_TEMPLATE`, selects the batched
+                refine prompt, and runs the refine-purpose validator
+                (language-stability check replaces target-language-presence).
+                In refine mode ``target_lang`` names the source/output
+                language (refine never switches languages), ``inplace`` must
+                be ``False``, and the PO ``msgid`` is NEVER overwritten — a
+                processed entry stores the refined text in ``msgstr`` and
+                the original source stays authoritative.
             glossary_mode: How the configured glossary is fed to the LLM.
                 ``"instruction"`` (default, v0.4 back-compat) appends a
                 glossary block to the system prompt.  ``"placeholder"``
@@ -270,6 +297,23 @@ class MarkdownProcessor:
         self._progress_callback = progress_callback
         self._placeholders = placeholders
         self.glossary_mode: GlossaryMode = glossary_mode
+        if mode not in ("translate", "refine"):
+            raise ValueError(
+                f"mode must be 'translate' or 'refine', got {mode!r}"
+            )
+        self.mode: Mode = mode
+        if mode == "refine" and self._glossary:
+            # Translation glossaries typically map terms to a
+            # target-language form (e.g. ``"pull request" → "풀 리퀘스트"``).
+            # Applying those mappings during a same-language refine
+            # would deterministically inject target-language strings
+            # into the refined output — either via the instruction-mode
+            # prompt block or via placeholder-mode decode — which
+            # violates the refine contract.  Disable glossary handling
+            # in refine mode entirely; callers who need refine-specific
+            # vocabulary enforcement should swap the glossary when they
+            # switch modes or run refine as a standalone pass.
+            self._glossary = None
         # Effective registry merges user-supplied patterns with glossary
         # patterns when glossary_mode=="placeholder"; ``_encode_source``
         # calls into this (not ``_placeholders`` directly) so every
@@ -362,6 +406,52 @@ class MarkdownProcessor:
                 lines.append(f'- "{term}" \u2192 "{translation}"')
         return "Glossary (use these exact forms, do not alter):\n" + "\n".join(lines)
 
+    def _sibling_refine_processor(self, target_lang: str) -> "MarkdownProcessor":
+        """Build a refine-mode clone sharing this processor's config.
+
+        Used by :meth:`process_document` to run the first pass of a
+        ``refine_first=True`` translate composition without mutating
+        ``self.mode`` (which would be thread-unsafe and leak state on
+        failure).  Shared knobs — batching, placeholders, extra
+        instructions, LiteLLM kwargs — are copied through so the refine
+        pass uses the same provider and the same guardrails as the
+        translate pass.
+
+        The translation glossary is deliberately **not** forwarded: its
+        target-language mappings are defined for the translate pass and
+        would leak target-language terms into the source-language refine
+        output (deterministically under
+        ``glossary_mode="placeholder"``, where decode rewrites tokens to
+        the glossary replacement).  Callers who want refine-specific
+        glossary behaviour can run the refine pass standalone with its
+        own configured glossary.
+
+        The progress callback is also withheld: forwarding it would make
+        one public ``process_document`` call emit TWO independent
+        ``document_start``/``document_end`` lifecycles (one per pass),
+        which consumers (including the CLI's rich bar) correlate 1:1
+        with public calls.  The translate-pass callback alone drives the
+        outer progress; refine-pass progress would double-count or
+        overwrite the UI state.
+        """
+        return MarkdownProcessor(
+            model=self.model,
+            target_lang=target_lang,
+            max_reference_pairs=self.max_reference_pairs,
+            extra_instructions=self._extra_instructions,
+            post_process=self._post_process,
+            glossary=None,
+            batch_size=self.batch_size,
+            batch_max_chars=self.batch_max_chars,
+            validation=self.validation,
+            enable_prompt_cache=self.enable_prompt_cache,
+            progress_callback=None,
+            placeholders=self._placeholders,
+            glossary_mode=self.glossary_mode,
+            mode="refine",
+            **self._litellm_kwargs,
+        )
+
     # ----- per-entry messaging -----
 
     def _build_messages(
@@ -371,10 +461,15 @@ class MarkdownProcessor:
         *,
         glossary_source: Optional[str] = None,
     ):
-        instruction = Prompts.TRANSLATE_INSTRUCTION
+        if self.mode == "refine":
+            instruction = Prompts.REFINE_INSTRUCTION
+            system_template = Prompts.REFINE_SYSTEM_TEMPLATE
+        else:
+            instruction = Prompts.TRANSLATE_INSTRUCTION
+            system_template = Prompts.TRANSLATE_SYSTEM_TEMPLATE
         if self._extra_instructions:
             instruction += "\n" + self._extra_instructions
-        system_content = Prompts.TRANSLATE_SYSTEM_TEMPLATE.format(
+        system_content = system_template.format(
             lang=self.target_lang,
             instruction=instruction,
         )
@@ -684,10 +779,15 @@ class MarkdownProcessor:
         reference_pairs: Optional[List[tuple]] = None,
         glossary_block: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        instruction = Prompts.BATCH_TRANSLATE_INSTRUCTION
+        if self.mode == "refine":
+            instruction = Prompts.BATCH_REFINE_INSTRUCTION
+            system_template = Prompts.BATCH_REFINE_SYSTEM_TEMPLATE
+        else:
+            instruction = Prompts.BATCH_TRANSLATE_INSTRUCTION
+            system_template = Prompts.BATCH_TRANSLATE_SYSTEM_TEMPLATE
         if self._extra_instructions:
             instruction += "\n" + self._extra_instructions
-        system_content = Prompts.BATCH_TRANSLATE_SYSTEM_TEMPLATE.format(
+        system_content = system_template.format(
             lang=self.target_lang,
             instruction=instruction,
         )
@@ -743,10 +843,234 @@ class MarkdownProcessor:
         target_path: Path,
         po_path: Path | None = None,
         inplace: bool = False,
+        *,
+        refined_path: Path | None = None,
+        refine_first: bool = False,
+        refine_lang: Optional[str] = None,
+        refined_po_path: Path | None = None,
     ) -> ProcessResult:
         """
         Process a markdown document.
+
+        In the default translate mode (``self.mode == "translate"``) the
+        LLM translates ``source_path`` into ``target_lang`` and writes the
+        result to ``target_path``.  In refine mode (``self.mode == "refine"``)
+        the LLM polishes ``source_path`` in its original language and writes
+        the refined result to ``refined_path`` (or ``target_path`` when
+        ``refined_path`` is omitted).  Refine never overwrites the PO
+        ``msgid`` and is incompatible with ``inplace=True``.
+
+        Setting ``refine_first=True`` in translate mode runs a refine pass
+        before the translate pass: a sibling processor refines the source
+        into ``refined_path`` (required), then the translate pass reads
+        from ``refined_path`` and writes to ``target_path``.  Both passes
+        bill into the returned :class:`Receipt`.  ``refine_lang`` picks the
+        refine pass's language; defaults to ``self.target_lang``'s value
+        only when the caller's flow is symmetric — otherwise pass it
+        explicitly.
         """
+        if inplace:
+            warnings.warn(
+                _INPLACE_DEPRECATION_MESSAGE,
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if self.mode == "refine" and inplace:
+            raise ValueError(
+                "inplace=True is incompatible with mode='refine'. "
+                "Refine never overwrites the source or its PO msgid; "
+                "use refined_path instead."
+            )
+        if refine_first and self.mode != "translate":
+            raise ValueError(
+                "refine_first=True only applies in mode='translate'."
+            )
+        tls_usage_installed_here = False
+        if self.mode == "refine" and refined_path is not None:
+            # In refine mode, honour refined_path as the output when the
+            # caller supplies it; otherwise fall through to target_path so
+            # the signature stays compatible with translate callers.
+            target_path = Path(refined_path)
+        if self.mode == "refine":
+            # Refine contract: the original source document is NEVER
+            # overwritten.  Compare resolved absolute paths so relative
+            # vs absolute spellings (``./a.md`` vs ``a.md``) still trip
+            # the guard before ``_save_processed_document`` runs.
+            # ``Path.resolve(strict=False)`` is tolerant of missing
+            # output paths (refined_path may not exist yet on first run).
+            try:
+                src_resolved = Path(source_path).resolve(strict=False)
+                out_resolved = Path(target_path).resolve(strict=False)
+            except OSError:
+                src_resolved = Path(source_path).absolute()
+                out_resolved = Path(target_path).absolute()
+            if src_resolved == out_resolved:
+                raise ValueError(
+                    "Refine mode forbids writing the refined output back "
+                    "on top of the source document. "
+                    f"source_path and refined/target path both resolve to "
+                    f"{src_resolved}."
+                )
+        if refine_first:
+            if refined_path is None:
+                raise ValueError(
+                    "refine_first=True requires refined_path "
+                    "(the intermediate refined Markdown location)."
+                )
+            if not refine_lang:
+                # Falling back to ``self.target_lang`` is actively
+                # harmful for typical en→ko / en→ja runs: it would pin
+                # the refine pass to the translation TARGET language, so
+                # the refine step ends up translating the source and the
+                # downstream translate step becomes a no-op in the wrong
+                # language.  Force the caller to name the refine
+                # language explicitly — there is no safe default.
+                raise ValueError(
+                    "refine_first=True requires refine_lang "
+                    "(the BCP 47 locale of the SOURCE document). "
+                    "Do not rely on target_lang — refine is same-language "
+                    "and target_lang names the translate pass's target."
+                )
+            refined_path = Path(refined_path)
+            refine_proc = self._sibling_refine_processor(
+                target_lang=refine_lang
+            )
+            refine_po = (
+                Path(refined_po_path)
+                if refined_po_path is not None
+                else refined_path.with_suffix(".po")
+            )
+            # Distinctness guard: the refine and translate passes must
+            # not share output artefacts.  If ``refined_path`` aliases
+            # ``target_path`` (or their default POs collide), the
+            # translate pass reopens the PO that the refine pass just
+            # marked processed, so every unchanged block looks already
+            # translated and the final document silently stays in the
+            # source language.  Force the caller to pick distinct
+            # paths / POs before we burn tokens on a no-op run.  The
+            # default PO derivation (``target.with_suffix(".po")`` /
+            # ``refined_path.with_suffix(".po")``) is folded into the
+            # same check so callers who only pass the ``.md`` paths are
+            # still protected.
+            final_po_candidate = (
+                Path(po_path) if po_path is not None
+                else Path(target_path).with_suffix(".po")
+            )
+            try:
+                refined_resolved = refined_path.resolve(strict=False)
+                target_resolved = Path(target_path).resolve(strict=False)
+                refine_po_resolved = refine_po.resolve(strict=False)
+                final_po_resolved = final_po_candidate.resolve(strict=False)
+            except OSError:
+                refined_resolved = refined_path.absolute()
+                target_resolved = Path(target_path).absolute()
+                refine_po_resolved = refine_po.absolute()
+                final_po_resolved = final_po_candidate.absolute()
+            if refined_resolved == target_resolved:
+                raise ValueError(
+                    "refine_first=True requires distinct refined_path "
+                    "and target_path; sharing a path would let the "
+                    "translate pass reopen the refine-pass output."
+                )
+            if refine_po_resolved == final_po_resolved:
+                raise ValueError(
+                    "refine_first=True requires distinct PO files for "
+                    "the refine and translate passes. Sharing a PO "
+                    "means translate would see the refine entries as "
+                    "already processed and skip translation entirely. "
+                    "Pass an explicit ``po_path`` and/or "
+                    "``refined_po_path`` that resolve to different "
+                    "files."
+                )
+            # ``sync_po`` on the translate pass runs against blocks
+            # parsed from the REFINED intermediate, so any pre-existing
+            # translate PO (keyed on the original source msgids) gets
+            # its entries detached on first refine-first run and
+            # ``_remove_obsolete_entries`` wipes them outright — the
+            # new translate PO starts empty of prior translation work.
+            # Stash the old msgid→msgstr pairs on thread-local so the
+            # translate pass's reference pool can seed from them as
+            # few-shot context: they don't match the refined msgids
+            # exactly, but the LLM still benefits from prior
+            # terminology / tone when translating the refined version.
+            carryover: List[Tuple[str, str]] = []
+            if final_po_candidate.exists():
+                try:
+                    prior_po = polib.pofile(str(final_po_candidate))
+                    for entry in prior_po:
+                        if entry.obsolete or not entry.msgstr:
+                            continue
+                        if "fuzzy" in entry.flags:
+                            continue
+                        carryover.append((entry.msgid, entry.msgstr))
+                except (OSError, UnicodeDecodeError, IOError):
+                    # A malformed / unreadable prior PO shouldn't abort
+                    # the refine-first flow; translate pass will proceed
+                    # without carryover context.
+                    pass
+            if carryover:
+                self._tls.refine_first_carryover = carryover
+            # Install (or reuse) the thread-local usage slot BEFORE
+            # invoking the refine pass so a mid-flight failure still
+            # has somewhere to deposit billed tokens — otherwise a
+            # crash between the refine call and the post-call merge
+            # below drops the refine pass's cost on the floor.
+            existing = getattr(self._tls, "usage", None)
+            if existing is None:
+                existing = _UsageAccumulator()
+                self._tls.usage = existing
+                # Track that the refine-first branch planted the
+                # accumulator so the ``finally`` block can clear it on
+                # exit.  Without that cleanup a subsequent
+                # ``process_document`` call on the same thread would
+                # pick up the stale usage and inflate its receipt with
+                # this run's tokens.
+                tls_usage_installed_here = True
+
+            def _merge_refine_usage(receipt_like: Any) -> None:
+                if receipt_like is None:
+                    return
+                existing.input_tokens += getattr(receipt_like, "input_tokens", 0)
+                existing.output_tokens += getattr(receipt_like, "output_tokens", 0)
+                existing.api_calls += getattr(receipt_like, "api_calls", 0)
+
+            try:
+                refine_result = refine_proc.process_document(
+                    source_path=source_path,
+                    target_path=refined_path,
+                    po_path=refine_po,
+                )
+            except BaseException as refine_exc:
+                # A refine-pass crash that happened AFTER LLM calls is
+                # annotated with ``partial_receipt`` (see the main
+                # process_document error handler).  Fold that usage in
+                # before propagating so the outer ``partial_receipt``
+                # the caller sees includes every billed token across
+                # both passes — the whole point of the receipt.
+                _merge_refine_usage(getattr(refine_exc, "partial_receipt", None))
+                raise
+            # Hand the combined usage forward so the translate pass's
+            # receipt reflects tokens from BOTH passes; without this the
+            # caller's cost view would omit the refine step.  The
+            # sibling's billed usage is already materialised in its
+            # ``receipt`` so we don't have to scrape a stale thread-local.
+            _merge_refine_usage(refine_result.receipt)
+            # The translate pass works against the refined intermediate
+            # end-to-end: its PO is keyed on refined msgids, so every
+            # piece of returned metadata (ProcessResult.source_path,
+            # Receipt.source_path, progress-event path) must also name
+            # the refined file.  Otherwise downstream PO helpers
+            # (``get_translation_stats``, ``export_report``,
+            # ``estimate``) re-read the caller's ORIGINAL source,
+            # resync the PO against its unrefined blocks, and mark
+            # every refined-msgid entry as obsolete.  The caller
+            # already knows their own source path from the call args;
+            # emitting the refined path back makes the PO/source
+            # pairing unambiguous for automation.
+            read_path: Path = refined_path
+            source_path = refined_path
+        else:
+            read_path = Path(source_path)
         if po_path is None:
             po_path = Path(target_path).with_suffix(".po")
         parser = BlockParser()
@@ -764,7 +1088,7 @@ class MarkdownProcessor:
         source_path_str = str(source_path)
         document_started = False
         try:
-            source = source_path.read_text(encoding="utf-8")
+            source = read_path.read_text(encoding="utf-8")
             source_lines = source.splitlines(keepends=True)
             blocks = parser.segment_markdown(
                 [line.rstrip("\n") for line in source_lines]
@@ -936,6 +1260,22 @@ class MarkdownProcessor:
                 self._emit_progress(
                     kind="document_end", path=source_path_str
                 )
+            # ``refine_first=True`` on a single-call path plants a
+            # usage accumulator on ``self._tls`` so the translate-pass
+            # receipt picks up the refine-pass tokens.  Clear it now
+            # — otherwise a subsequent ``process_document`` on the
+            # same thread would start from this run's counts and
+            # inflate every later receipt.  The directory path
+            # owns its own accumulator via ``_process_one`` and is
+            # unaffected because it never enters this branch.
+            if tls_usage_installed_here:
+                self._tls.usage = None
+            # Same hygiene for the refine-first carryover slot: if
+            # ``_process_entries_*`` never ran (e.g. parse failed before
+            # reference-pool seeding), the stashed carryover would leak
+            # into the next call on this thread.
+            if getattr(self._tls, "refine_first_carryover", None):
+                self._tls.refine_first_carryover = None
 
     def process_directory(
         self,
@@ -945,14 +1285,130 @@ class MarkdownProcessor:
         glob: str = "**/*.md",
         inplace: bool = False,
         max_workers: int = 4,
+        *,
+        refined_dir: Path | None = None,
+        refine_first: bool = False,
+        refine_lang: Optional[str] = None,
+        refined_po_dir: Path | None = None,
     ) -> DirectoryResult:
         """
         Process all markdown files in a directory tree.
+
+        Refine mode / ``refine_first`` lift the single-file semantics: the
+        per-file refined output lands under ``refined_dir`` preserving the
+        relative path of each source file.  When ``refine_first=True``,
+        ``refined_dir`` is required so each file's refined intermediate
+        has a deterministic location.
         """
         import concurrent.futures
 
+        # The DeprecationWarning for ``inplace`` is raised by
+        # ``process_document`` per file so the deduplication rule applied
+        # by the ``warnings`` module is driven by a single call-site and
+        # emissions are consistent whether the caller used the single-file
+        # or directory API.
+        #
+        # Mirror the refine preconditions that ``process_document``
+        # enforces.  Without these, an invalid invocation (e.g.
+        # ``mode="refine"`` with ``inplace=True``) would only surface
+        # inside each worker, ``_process_one`` would catch the
+        # ``ValueError`` into the ``files_failed`` tally, and the caller
+        # would get a partial DirectoryResult instead of a clean usage
+        # error.  Fail fast so the contract is consistent whether the
+        # caller uses the single-file or directory API.
+        if self.mode == "refine" and inplace:
+            raise ValueError(
+                "inplace=True is incompatible with mode='refine'. "
+                "Refine never overwrites the source or its PO msgid; "
+                "use refined_dir instead."
+            )
+        if refine_first and self.mode != "translate":
+            raise ValueError(
+                "refine_first=True only applies in mode='translate'."
+            )
+        if refine_first and refined_dir is None:
+            raise ValueError(
+                "refine_first=True requires refined_dir for process_directory."
+            )
+        if refine_first and not refine_lang:
+            raise ValueError(
+                "refine_first=True requires refine_lang "
+                "(the BCP 47 locale of the SOURCE documents)."
+            )
         source_dir = Path(source_dir)
         target_dir = Path(target_dir)
+        refined_dir_path = Path(refined_dir) if refined_dir is not None else None
+        refined_po_dir_path = (
+            Path(refined_po_dir) if refined_po_dir is not None else None
+        )
+
+        # Path-collision guards mirror the per-file checks that
+        # ``process_document`` performs so deterministic bad inputs
+        # surface as a single ``ValueError`` up front — rather than
+        # every worker raising inside ``_process_one`` and degrading
+        # the run to a partial ``DirectoryResult`` with files_failed
+        # entries that hide the real configuration bug.
+        def _resolve_dir(p: Path) -> Path:
+            try:
+                return p.resolve(strict=False)
+            except OSError:
+                return p.absolute()
+
+        src_res = _resolve_dir(source_dir)
+        tgt_res = _resolve_dir(target_dir)
+        po_res = _resolve_dir(Path(po_dir)) if po_dir is not None else None
+        refined_res = (
+            _resolve_dir(refined_dir_path)
+            if refined_dir_path is not None
+            else None
+        )
+        refined_po_res = (
+            _resolve_dir(refined_po_dir_path)
+            if refined_po_dir_path is not None
+            else None
+        )
+
+        if self.mode == "refine":
+            effective_out = refined_res if refined_res is not None else tgt_res
+            if src_res == effective_out:
+                raise ValueError(
+                    "Refine directory run forbids writing refined output "
+                    f"on top of the source tree ({src_res})."
+                )
+
+        if refine_first:
+            # All four artefact directories (source, refined, target,
+            # refine PO, translate PO) must be distinct — otherwise a
+            # single run can silently clobber or reopen its own prior
+            # outputs.  ``refined_res is not None`` is guaranteed by
+            # the earlier ``refine_first requires refined_dir`` guard.
+            if refined_res == tgt_res:
+                raise ValueError(
+                    "refine_first=True requires distinct refined_dir "
+                    "and target_dir; sharing a directory would let the "
+                    "translate pass reopen the refine-pass output."
+                )
+            if src_res == refined_res:
+                raise ValueError(
+                    "refine_first=True requires refined_dir to differ "
+                    "from source_dir; refine would overwrite the source."
+                )
+            if src_res == tgt_res:
+                raise ValueError(
+                    "refine_first=True requires target_dir to differ "
+                    "from source_dir; translate would overwrite the source."
+                )
+            if (
+                po_res is not None
+                and refined_po_res is not None
+                and po_res == refined_po_res
+            ):
+                raise ValueError(
+                    "refine_first=True requires distinct PO directories "
+                    "for the refine and translate passes. A shared PO "
+                    "dir means translate would see every refine entry "
+                    "as already processed and skip translation."
+                )
 
         matched_files = sorted(source_dir.glob(glob))
         start = time.monotonic()
@@ -979,6 +1435,16 @@ class MarkdownProcessor:
                 if po_dir is not None
                 else None
             )
+            refined_path_file = (
+                refined_dir_path / relative_path
+                if refined_dir_path is not None
+                else None
+            )
+            refined_po_path_file = (
+                refined_po_dir_path / relative_path.with_suffix(".po")
+                if refined_po_dir_path is not None
+                else None
+            )
             u = _UsageAccumulator()
             # Plant ``u`` on the processor's thread-local so
             # ``process_document`` records into it — even when a subclass /
@@ -988,8 +1454,26 @@ class MarkdownProcessor:
             self._tls.usage = u
             self._emit_progress(kind="file_start", path=str(source_file))
             try:
+                # Only forward refine-specific kwargs when a refine pathway
+                # is actually active.  Test suites that monkey-patch
+                # ``process_document`` with the pre-T-7 signature
+                # (``source, target, po, inplace``) keep working when
+                # callers don't opt into refine mode.
+                extra: Dict[str, Any] = {}
+                if refined_path_file is not None:
+                    extra["refined_path"] = refined_path_file
+                if refine_first:
+                    extra["refine_first"] = True
+                if refine_lang is not None:
+                    extra["refine_lang"] = refine_lang
+                if refined_po_path_file is not None:
+                    extra["refined_po_path"] = refined_po_path_file
                 result = self.process_document(
-                    source_file, target_path, po_path_file, inplace=inplace
+                    source_file,
+                    target_path,
+                    po_path_file,
+                    inplace=inplace,
+                    **extra,
                 )
                 return result, u, None
             except Exception as exc:
@@ -1069,11 +1553,22 @@ class MarkdownProcessor:
             dir_usage.output_tokens += u.output_tokens
             dir_usage.api_calls += u.api_calls
 
+        # In refine mode with an explicit ``refined_dir``, per-file output
+        # is routed to ``refined_dir`` — not ``target_dir`` — so report
+        # that as the effective output path on the aggregate result and
+        # receipt.  Downstream tooling keys off these fields to locate
+        # outputs and would otherwise point at the unused target_dir.
+        effective_output_dir = (
+            refined_dir_path
+            if self.mode == "refine" and refined_dir_path is not None
+            else target_dir
+        )
+
         dir_receipt = _build_receipt(
             model=self.model,
             target_lang=self.target_lang,
             source_path=str(source_dir),
-            target_path=str(target_dir),
+            target_path=str(effective_output_dir),
             po_path=str(po_dir) if po_dir is not None else None,
             usage=dir_usage,
             duration_seconds=duration,
@@ -1081,7 +1576,7 @@ class MarkdownProcessor:
 
         return DirectoryResult(
             source_dir=str(source_dir),
-            target_dir=str(target_dir),
+            target_dir=str(effective_output_dir),
             po_dir=str(po_dir) if po_dir is not None else None,
             files_processed=files_processed,
             files_failed=files_failed,
@@ -1113,6 +1608,19 @@ class MarkdownProcessor:
     ) -> Dict[str, int]:
         pool = ReferencePool(max_results=self.max_reference_pairs)
         pool.seed_from_po(po_file)
+        # Consume any refine-first carryover parked on TLS — these
+        # are (source_msgid, translation) pairs from a pre-existing
+        # translate PO whose entries ``sync_po`` just invalidated
+        # because the refined intermediate changed the msgids.  They
+        # still serve as useful few-shot references for tone and
+        # terminology even though the keys don't align.  Clear the
+        # slot so a later call on the same thread doesn't inherit
+        # stale context.
+        carryover = getattr(self._tls, "refine_first_carryover", None)
+        if carryover:
+            for src, tgt in carryover:
+                pool.add(src, tgt)
+            self._tls.refine_first_carryover = None
 
         stats: Dict[str, int] = {
             "processed": 0,
@@ -1147,9 +1655,11 @@ class MarkdownProcessor:
                     # strings — so output==source is the expected outcome,
                     # not a failure signal. Suppress the warning for the
                     # ``code`` block type only; real regressions in prose
-                    # still surface.
+                    # still surface.  Refine mode is same-language: a
+                    # well-written paragraph may come back verbatim, so
+                    # suppress the entire warning in that mode.
                     block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
-                    if block_type != "code":
+                    if block_type != "code" and self.mode != "refine":
                         logger.warning(
                             "LLM returned untranslated output for entry %s",
                             entry.msgctxt,
@@ -1198,6 +1708,19 @@ class MarkdownProcessor:
     ) -> Dict[str, int]:
         pool = ReferencePool(max_results=self.max_reference_pairs)
         pool.seed_from_po(po_file)
+        # Consume any refine-first carryover parked on TLS — these
+        # are (source_msgid, translation) pairs from a pre-existing
+        # translate PO whose entries ``sync_po`` just invalidated
+        # because the refined intermediate changed the msgids.  They
+        # still serve as useful few-shot references for tone and
+        # terminology even though the keys don't align.  Clear the
+        # slot so a later call on the same thread doesn't inherit
+        # stale context.
+        carryover = getattr(self._tls, "refine_first_carryover", None)
+        if carryover:
+            for src, tgt in carryover:
+                pool.add(src, tgt)
+            self._tls.refine_first_carryover = None
 
         stats: Dict[str, int] = {
             "processed": 0,
@@ -1377,9 +1900,11 @@ class MarkdownProcessor:
                 # See the sequential path for rationale: code blocks are
                 # instructed to pass through unchanged so output==source
                 # is not a failure; only warn for non-code block types so
-                # prose regressions stay visible.
+                # prose regressions stay visible.  Refine mode is
+                # same-language and a well-written paragraph can round-trip
+                # verbatim, so the whole warning is suppressed there.
                 block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
-                if block_type != "code":
+                if block_type != "code" and self.mode != "refine":
                     logger.warning(
                         "LLM returned untranslated output for entry %s", entry.msgctxt
                     )
@@ -1518,6 +2043,18 @@ class MarkdownProcessor:
                     )
                 )
 
+        # Refine mode's same-language contract is a core feature
+        # guarantee — it must fire regardless of ``self.validation``.
+        # If we gated it on ``validation != "off"``, the default config
+        # (``mode="refine"``, ``validation="off"``) would accept a
+        # silently-translated response and write it to disk/PO without
+        # flagging drift.  Keep this independent of the ``validation``
+        # setting, alongside ``placeholder_roundtrip`` above.
+        if self.mode == "refine":
+            stability = check_language_stability(entry.msgid, processed)
+            if stability is not None:
+                issues.append(stability)
+
         if self.validation != "off":
             result = validate_translation(
                 entry.msgid,
@@ -1525,8 +2062,16 @@ class MarkdownProcessor:
                 target_lang=self.target_lang,
                 glossary=self._glossary,
                 mode=self.validation,
+                purpose=self.mode,
             )
-            issues.extend(result.issues)
+            # Deduplicate: when ``validation != "off"`` the refine-purpose
+            # branch inside ``validate()`` also runs ``language_stability``
+            # and would double-flag the same issue.
+            seen_checks = {i.check for i in issues}
+            for issue in result.issues:
+                if issue.check in seen_checks:
+                    continue
+                issues.append(issue)
 
         if not issues:
             if self.validation != "off" and stats is not None:
