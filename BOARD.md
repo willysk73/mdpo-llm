@@ -286,11 +286,14 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: pending
+  status: assigned
   priority: low
   depends_on: [T-5, T-6, T-7]
   brief: .ccx/tasks/T-9.md
-  attempts: 0
+  attempts: 1
+  worktree: /home/will/Repositories/mdpo-llm-T-9
+  branch: ccx/T-9
+  started_at: "2026-04-18T12:16:57Z"
   notes: |
     Roadmap #7. `target_langs: list[str]`. One batched call per source
     block returns {block_id: {lang: translation}}. Shared source-side
