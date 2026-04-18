@@ -18,6 +18,7 @@ mdpo-llm splits your Markdown into blocks, tracks each one in a PO file, and sen
 - **CLI** — `python -m mdpo_llm translate|translate-dir|estimate|report …`.
 - **Typed result dataclasses** (`ProcessResult`, `Coverage`, `BatchStats`) with dict-style access for backward compatibility.
 - **Dry-run estimator** — `processor.estimate(src)` reports pending blocks and estimated tokens with zero API calls.
+- **Per-run receipt** — every `translate` / `translate-dir` run attaches a `Receipt` with total tokens, per-1M USD pricing, wall-clock duration, and API-call count. CLI prints a human-readable block to stderr; `--json-receipt PATH` dumps the same data as JSON for CI.
 
 v0.2 behaviour (one call per block) is preserved via `batch_size=0`.
 
@@ -225,10 +226,27 @@ MdpoLLM(
 
 | Method | Description |
 |--------|-------------|
-| `process_document(source_path, target_path, po_path=None, inplace=False)` | Process a single Markdown file. `po_path` defaults to `target_path` with `.po` extension. |
-| `process_directory(source_dir, target_dir, po_dir=None, glob, inplace, max_workers)` | Process a directory tree concurrently. `po_dir` defaults to `target_dir`. |
+| `process_document(source_path, target_path, po_path=None, inplace=False)` | Process a single Markdown file. `po_path` defaults to `target_path` with `.po` extension. Returns a `ProcessResult` with a `.receipt` summarizing tokens, cost, and duration. |
+| `process_directory(source_dir, target_dir, po_dir=None, glob, inplace, max_workers)` | Process a directory tree concurrently. `po_dir` defaults to `target_dir`. Returns a `DirectoryResult` with a `.receipt` aggregated over every file. |
 | `get_translation_stats(source_path, po_path)` | Return coverage and block statistics |
 | `export_report(source_path, po_path)` | Generate a detailed text report |
+
+### Receipt
+
+Every `process_document` / `process_directory` call attaches a `Receipt`:
+
+```python
+result = processor.process_document(src, tgt)
+print(result.receipt.render())            # human-readable block (stderr from the CLI)
+print(result.receipt.total_tokens)        # int
+print(result.receipt.total_cost_usd)      # float | None (None for unpriced models)
+print(result.receipt.duration_seconds)    # float (wall clock)
+```
+
+Pricing is resolved from `litellm.model_cost`; models not listed there
+leave the cost fields `None` and render as `"—"`. From the CLI, pass
+`--json-receipt PATH` on `translate` / `translate-dir` to dump the same
+structure as JSON for downstream tooling.
 
 ### Prompts
 

@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -20,11 +22,117 @@ from .parser import BlockParser
 from .prompts import Prompts
 from .reconstructor import DocumentReconstructor
 from .reference_pool import ReferencePool
-from .results import BatchStats, Coverage, DirectoryResult, ProcessResult
+from .results import BatchStats, Coverage, DirectoryResult, ProcessResult, Receipt
 from .validator import validate as validate_translation
 
 
 ValidationMode = Literal["off", "conservative", "strict"]
+
+
+class _UsageAccumulator:
+    """Sum token usage and API-call counts across a single run.
+
+    Tolerant of missing / non-numeric ``usage`` fields: providers that don't
+    report usage (or mock responses in tests) still increment ``api_calls``
+    without corrupting token totals.
+    """
+
+    __slots__ = ("input_tokens", "output_tokens", "api_calls")
+
+    def __init__(self) -> None:
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
+        self.api_calls: int = 0
+
+    def record(self, response: Any) -> None:
+        self.api_calls += 1
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        self.input_tokens += _coerce_int(getattr(usage, "prompt_tokens", 0))
+        self.output_tokens += _coerce_int(getattr(usage, "completion_tokens", 0))
+
+
+def _coerce_int(value: Any) -> int:
+    """Return ``int(value)`` when it is a real number, else ``0``.
+
+    Guards against ``MagicMock`` responses (which would otherwise return a
+    truthy object) and providers that stuff ``None`` into usage fields.
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    return 0
+
+
+def _resolve_pricing(model: str) -> Tuple[Optional[float], Optional[float]]:
+    """Return ``(input_per_1m_usd, output_per_1m_usd)`` from ``litellm.model_cost``.
+
+    Returns ``(None, None)`` when the model isn't listed or the per-token
+    rates are missing — CLI renderers surface this as ``"—"`` so unpriced
+    models don't silently report ``$0.00``.
+    """
+    try:
+        cost_table = getattr(litellm, "model_cost", {}) or {}
+    except Exception:
+        return None, None
+
+    candidates = [model]
+    if "/" in model:
+        candidates.append(model.split("/", 1)[1])
+
+    for key in candidates:
+        entry = cost_table.get(key)
+        if not isinstance(entry, dict):
+            continue
+        ipt = entry.get("input_cost_per_token")
+        opt = entry.get("output_cost_per_token")
+        if isinstance(ipt, (int, float)) and isinstance(opt, (int, float)):
+            return float(ipt) * 1_000_000.0, float(opt) * 1_000_000.0
+    return None, None
+
+
+def _build_receipt(
+    *,
+    model: str,
+    target_lang: str,
+    source_path: Optional[str],
+    target_path: Optional[str],
+    po_path: Optional[str],
+    usage: _UsageAccumulator,
+    duration_seconds: float,
+) -> Receipt:
+    in_per_1m, out_per_1m = _resolve_pricing(model)
+    if in_per_1m is not None and out_per_1m is not None:
+        input_cost = usage.input_tokens * in_per_1m / 1_000_000.0
+        output_cost = usage.output_tokens * out_per_1m / 1_000_000.0
+        total_cost: Optional[float] = input_cost + output_cost
+    else:
+        input_cost = None
+        output_cost = None
+        total_cost = None
+
+    return Receipt(
+        model=model,
+        target_lang=target_lang,
+        source_path=source_path,
+        target_path=target_path,
+        po_path=po_path,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        total_tokens=usage.input_tokens + usage.output_tokens,
+        api_calls=usage.api_calls,
+        duration_seconds=duration_seconds,
+        input_cost_per_1m_usd=in_per_1m,
+        output_cost_per_1m_usd=out_per_1m,
+        input_cost_usd=input_cost,
+        output_cost_usd=output_cost,
+        total_cost_usd=total_cost,
+    )
 
 
 class MarkdownProcessor:
@@ -91,6 +199,10 @@ class MarkdownProcessor:
         self.validation: ValidationMode = validation
         self.enable_prompt_cache = enable_prompt_cache
         self._litellm_kwargs = litellm_kwargs
+        # Thread-local hand-off slot so ``process_directory`` can expose each
+        # worker's accumulator to ``process_document`` without changing that
+        # method's public signature (which existing tests monkey-patch).
+        self._tls = threading.local()
 
     # ----- glossary -----
 
@@ -203,11 +315,18 @@ class MarkdownProcessor:
             return "response_format" in params
         return False
 
-    def _call_llm(self, source_text: str, reference_pairs=None):
+    def _call_llm(
+        self,
+        source_text: str,
+        reference_pairs=None,
+        usage: Optional[_UsageAccumulator] = None,
+    ):
         messages = self._build_messages(source_text, reference_pairs)
         response = litellm.completion(
             model=self.model, messages=messages, **self._litellm_kwargs
         )
+        if usage is not None:
+            usage.record(response)
         result = response.choices[0].message.content
         if self._post_process:
             result = self._post_process(result)
@@ -248,6 +367,7 @@ class MarkdownProcessor:
         self,
         reference_pairs: Optional[List[tuple]],
         glossary_block: Optional[str],
+        usage: Optional[_UsageAccumulator] = None,
     ) -> Callable[[Dict[str, str]], str]:
         """Return a ``call_llm`` closure suitable for ``BatchTranslator``."""
 
@@ -265,6 +385,8 @@ class MarkdownProcessor:
             response = litellm.completion(
                 model=self.model, messages=messages, **call_kwargs
             )
+            if usage is not None:
+                usage.record(response)
             return response.choices[0].message.content
 
         return _call
@@ -286,8 +408,15 @@ class MarkdownProcessor:
         parser = BlockParser()
         po_manager = POManager(skip_types=self.SKIP_TYPES)
         reconstructor = DocumentReconstructor(skip_types=self.SKIP_TYPES)
+        # ``process_directory`` hands its per-worker accumulator in via this
+        # thread-local slot so tokens already billed before an exception
+        # still reach the directory-level receipt.  Single-file calls find
+        # no slot and allocate their own.
+        usage = getattr(self._tls, "usage", None) or _UsageAccumulator()
+        start = time.monotonic()
 
         po_file = None
+        po_saved = False
         try:
             source = source_path.read_text(encoding="utf-8")
             source_lines = source.splitlines(keepends=True)
@@ -295,16 +424,18 @@ class MarkdownProcessor:
                 [line.rstrip("\n") for line in source_lines]
             )
 
-            po_file = po_manager.load_or_create_po(po_path, target_lang=self.target_lang)
+            po_file = po_manager.load_or_create_po(
+                po_path, target_lang=self.target_lang
+            )
             po_manager.sync_po(po_file, blocks, parser.context_id)
 
             if self.batch_size and self.batch_size > 0:
                 translation_stats = self._process_entries_batched(
-                    po_file, po_manager, inplace=inplace
+                    po_file, po_manager, inplace=inplace, usage=usage
                 )
             else:
                 translation_stats = self._process_entries_sequential(
-                    po_file, po_manager, inplace=inplace
+                    po_file, po_manager, inplace=inplace, usage=usage
                 )
 
             coverage_dict = reconstructor.get_process_coverage(
@@ -318,9 +449,10 @@ class MarkdownProcessor:
             if inplace:
                 # Capture validator/fuzzy state BEFORE the redraw so the
                 # replacement PO can inherit fuzzy flags and tcomments.
-                # Without this, a validator failure followed by ``inplace``
-                # writes a fresh entry with no fuzzy flag and the next run
-                # treats the bad translation as fully processed.
+                # Without this, a validator failure followed by
+                # ``inplace`` writes a fresh entry with no fuzzy flag
+                # and the next run treats the bad translation as fully
+                # processed.
                 #
                 # Keying by msgid alone would collide on repeated labels
                 # ("Overview", "OK", …).  Instead we track each msgid's
@@ -362,17 +494,62 @@ class MarkdownProcessor:
 
             self._save_processed_document(processed_content, target_path)
 
-            return ProcessResult(
+            receipt = _build_receipt(
+                model=self.model,
+                target_lang=self.target_lang,
+                source_path=str(source_path),
+                target_path=str(target_path),
+                po_path=str(po_path),
+                usage=usage,
+                duration_seconds=time.monotonic() - start,
+            )
+
+            result = ProcessResult(
                 source_path=str(source_path),
                 target_path=str(target_path),
                 po_path=str(po_path),
                 blocks_count=len(blocks),
                 coverage=Coverage(**coverage_dict),
                 translation_stats=BatchStats(**translation_stats),
+                receipt=receipt,
             )
-        finally:
-            if po_file is not None:
-                po_manager.save_po(po_file, po_path)
+
+            po_manager.save_po(po_file, po_path)
+            po_saved = True
+            return result
+        except BaseException as exc:
+            # Only annotate when LLM calls were actually billed — a
+            # zero-usage receipt on a pre-API failure (missing source,
+            # bad PO) would mislead operators into thinking a call was
+            # made.  This keeps the CLI fallback path meaningful.
+            if usage.api_calls > 0:
+                partial = _build_receipt(
+                    model=self.model,
+                    target_lang=self.target_lang,
+                    source_path=str(source_path),
+                    target_path=str(target_path),
+                    po_path=str(po_path),
+                    usage=usage,
+                    duration_seconds=time.monotonic() - start,
+                )
+                try:
+                    exc.partial_receipt = partial  # type: ignore[attr-defined]
+                except (AttributeError, TypeError):
+                    # Immutable / slot-based exceptions can't carry the
+                    # attribute; propagate without it rather than masking
+                    # the original failure with a secondary error.
+                    pass
+            # Preserve translations already written into the PO on
+            # failure — unless save_po itself was the failure, in which
+            # case retrying would likely raise the same error.
+            if po_file is not None and not po_saved:
+                try:
+                    po_manager.save_po(po_file, po_path)
+                except Exception:
+                    logger.exception(
+                        "PO save failed during error handling for %s", po_path
+                    )
+            raise
 
     def process_directory(
         self,
@@ -392,11 +569,15 @@ class MarkdownProcessor:
         target_dir = Path(target_dir)
 
         matched_files = sorted(source_dir.glob(glob))
+        start = time.monotonic()
 
         results: List[Any] = []
         files_processed = 0
         files_failed = 0
         files_skipped = 0
+        # Hold each worker's accumulator so a mid-run exception still
+        # contributes its billed tokens to the directory-level receipt.
+        worker_usages: List[_UsageAccumulator] = []
 
         def _process_one(source_file: Path):
             relative_path = source_file.relative_to(source_dir)
@@ -406,9 +587,22 @@ class MarkdownProcessor:
                 if po_dir is not None
                 else None
             )
-            return self.process_document(
-                source_file, target_path, po_path_file, inplace=inplace
-            )
+            u = _UsageAccumulator()
+            # Plant ``u`` on the processor's thread-local so
+            # ``process_document`` records into it — even when a subclass /
+            # test monkey-patches the method signature.  Clearing the slot
+            # afterwards prevents one worker's accumulator leaking into the
+            # next task that lands on this thread.
+            self._tls.usage = u
+            try:
+                result = self.process_document(
+                    source_file, target_path, po_path_file, inplace=inplace
+                )
+                return result, u, None
+            except Exception as exc:
+                return None, u, exc
+            finally:
+                self._tls.usage = None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_file = {
@@ -417,23 +611,54 @@ class MarkdownProcessor:
             for future in concurrent.futures.as_completed(future_to_file):
                 source_file = future_to_file[future]
                 try:
-                    result = future.result()
-                    results.append(result)
-
-                    stats = result.translation_stats
-                    if stats.failed > 0 or stats.validation_failed > 0:
-                        # Entry-level failures still count as a file-level
-                        # failure so automation can detect partial errors
-                        # via ``files_failed`` / the CLI exit code.
-                        files_failed += 1
-                    elif stats.processed == 0:
-                        files_skipped += 1
-                    else:
-                        files_processed += 1
+                    result, worker_usage, worker_error = future.result()
                 except Exception:
-                    logger.exception("Failed to process %s", source_file)
+                    # _process_one swallows task exceptions into the tuple;
+                    # reaching here means the executor itself blew up.
+                    logger.exception("Worker crashed for %s", source_file)
                     files_failed += 1
                     results.append({"source_path": str(source_file), "error": True})
+                    continue
+
+                worker_usages.append(worker_usage)
+
+                if worker_error is not None:
+                    logger.exception(
+                        "Failed to process %s", source_file, exc_info=worker_error
+                    )
+                    files_failed += 1
+                    results.append({"source_path": str(source_file), "error": True})
+                    continue
+
+                results.append(result)
+
+                stats = result.translation_stats
+                if stats.failed > 0 or stats.validation_failed > 0:
+                    # Entry-level failures still count as a file-level
+                    # failure so automation can detect partial errors
+                    # via ``files_failed`` / the CLI exit code.
+                    files_failed += 1
+                elif stats.processed == 0:
+                    files_skipped += 1
+                else:
+                    files_processed += 1
+
+        duration = time.monotonic() - start
+        dir_usage = _UsageAccumulator()
+        for u in worker_usages:
+            dir_usage.input_tokens += u.input_tokens
+            dir_usage.output_tokens += u.output_tokens
+            dir_usage.api_calls += u.api_calls
+
+        dir_receipt = _build_receipt(
+            model=self.model,
+            target_lang=self.target_lang,
+            source_path=str(source_dir),
+            target_path=str(target_dir),
+            po_path=str(po_dir) if po_dir is not None else None,
+            usage=dir_usage,
+            duration_seconds=duration,
+        )
 
         return DirectoryResult(
             source_dir=str(source_dir),
@@ -443,19 +668,26 @@ class MarkdownProcessor:
             files_failed=files_failed,
             files_skipped=files_skipped,
             results=results,
+            receipt=dir_receipt,
         )
 
     # ----- sequential path (v0.2 fallback when batch_size=0) -----
 
-    def _process_entry(self, entry, reference_pairs=None):
+    def _process_entry(self, entry, reference_pairs=None, usage=None):
         try:
-            processed = self._call_llm(entry.msgid, reference_pairs=reference_pairs)
+            processed = self._call_llm(
+                entry.msgid, reference_pairs=reference_pairs, usage=usage
+            )
             return (entry, processed, None)
         except Exception as e:
             return (entry, None, e)
 
     def _process_entries_sequential(
-        self, po_file: polib.POFile, po_manager: POManager, inplace: bool = False
+        self,
+        po_file: polib.POFile,
+        po_manager: POManager,
+        inplace: bool = False,
+        usage: Optional[_UsageAccumulator] = None,
     ) -> Dict[str, int]:
         pool = ReferencePool(max_results=self.max_reference_pairs)
         pool.seed_from_po(po_file)
@@ -479,7 +711,7 @@ class MarkdownProcessor:
 
             try:
                 entry_obj, processed, error = self._process_entry(
-                    entry, reference_pairs=similar or None
+                    entry, reference_pairs=similar or None, usage=usage
                 )
                 if error is not None:
                     logger.warning(
@@ -520,7 +752,11 @@ class MarkdownProcessor:
     # ----- batched path -----
 
     def _process_entries_batched(
-        self, po_file: polib.POFile, po_manager: POManager, inplace: bool = False
+        self,
+        po_file: polib.POFile,
+        po_manager: POManager,
+        inplace: bool = False,
+        usage: Optional[_UsageAccumulator] = None,
     ) -> Dict[str, int]:
         pool = ReferencePool(max_results=self.max_reference_pairs)
         pool.seed_from_po(po_file)
@@ -553,7 +789,7 @@ class MarkdownProcessor:
 
         for group in self._section_aware_groups(pending):
             self._translate_group(
-                group, po_manager, pool, stats, inplace=inplace
+                group, po_manager, pool, stats, inplace=inplace, usage=usage
             )
 
         return stats
@@ -620,6 +856,7 @@ class MarkdownProcessor:
         pool: ReferencePool,
         stats: Dict[str, int],
         inplace: bool,
+        usage: Optional[_UsageAccumulator] = None,
     ) -> None:
         items: Dict[str, str] = {e.msgctxt: e.msgid for e in group}
         entry_by_ctx: Dict[str, polib.POEntry] = {e.msgctxt: e for e in group}
@@ -627,7 +864,7 @@ class MarkdownProcessor:
         references = self._collect_references(items.values(), pool)
         glossary_block = self._collect_glossary_block(items.values())
 
-        base_caller = self._make_batch_caller(references, glossary_block)
+        base_caller = self._make_batch_caller(references, glossary_block, usage=usage)
 
         # Count every real LLM call made from inside BatchTranslator —
         # including any internal partitioning and recursive bisection —
@@ -663,7 +900,9 @@ class MarkdownProcessor:
                 stats["per_entry_calls"] += 1
                 similar = pool.find_similar(entry.msgid)
                 try:
-                    processed = self._call_llm(entry.msgid, reference_pairs=similar or None)
+                    processed = self._call_llm(
+                        entry.msgid, reference_pairs=similar or None, usage=usage
+                    )
                 except Exception as exc:
                     logger.warning(
                         "Per-entry fallback failed for %s: %s", ctx, exc
