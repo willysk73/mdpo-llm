@@ -117,7 +117,9 @@ class TestTargetLangFlow:
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
 
-        processor = MarkdownProcessor(model="test-model", target_lang="ko")
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
         result = processor.process_document(
             source, tmp_path / "target.md", tmp_path / "m.po"
         )
@@ -156,7 +158,9 @@ class TestLLMFailureHandling:
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
 
-        processor = MarkdownProcessor(model="test-model", target_lang="ko")
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
         result = processor.process_document(
             source, tmp_path / "target.md", tmp_path / "m.po"
         )
@@ -174,7 +178,9 @@ class TestLLMFailureHandling:
         source.write_text(md, encoding="utf-8")
         po_path = tmp_path / "messages.po"
 
-        processor = MarkdownProcessor(model="test-model", target_lang="ko")
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
         processor.process_document(source, tmp_path / "target.md", po_path)
         # PO should still be saved (finally block)
         assert po_path.exists()
@@ -425,7 +431,9 @@ class TestSequentialProcessing:
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
 
-        processor = MarkdownProcessor(model="test-model", target_lang="ko")
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
         processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
 
         # Extract user messages from call args (last user message in each call)
@@ -446,7 +454,9 @@ class TestSequentialProcessing:
         source = tmp_path / "source.md"
         source.write_text(md, encoding="utf-8")
 
-        processor = MarkdownProcessor(model="test-model", target_lang="ko")
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
         processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
 
         # First call: system + user (2 messages)
@@ -468,7 +478,9 @@ class TestSequentialProcessing:
         source.write_text(md, encoding="utf-8")
         po_path = tmp_path / "m.po"
 
-        processor = MarkdownProcessor(model="test-model", target_lang="ko")
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
         # First run — translates everything
         processor.process_document(source, tmp_path / "target.md", po_path)
 
@@ -497,7 +509,10 @@ class TestSequentialProcessing:
         source.write_text(md, encoding="utf-8")
 
         processor = MarkdownProcessor(
-            model="test-model", target_lang="ko", max_reference_pairs=2
+            model="test-model",
+            target_lang="ko",
+            max_reference_pairs=2,
+            batch_size=0,
         )
         processor.process_document(source, tmp_path / "target.md", tmp_path / "m.po")
 

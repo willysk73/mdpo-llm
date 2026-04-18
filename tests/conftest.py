@@ -1,5 +1,6 @@
 """Shared fixtures for mdpo-llm tests."""
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -59,7 +60,13 @@ def sample_lines():
 
 @pytest.fixture
 def mock_completion():
-    """Patch litellm.completion — returns '[TRANSLATED] {source_text}' by default."""
+    """Patch litellm.completion.
+
+    In sequential mode the user content is a raw source string → returns
+    ``[TRANSLATED] {source}``.  In batch mode the user content is a JSON
+    object → returns a JSON object with each value prefixed with
+    ``[TRANSLATED] ``, so both paths round-trip the same sentinel.
+    """
 
     def _side_effect(*args, **kwargs):
         messages = kwargs.get("messages", args[0] if args else [])
@@ -68,12 +75,39 @@ def mock_completion():
             if msg["role"] == "user":
                 source_text = msg["content"]
                 break
+
+        # Detect batch JSON input.
+        parsed = None
+        if isinstance(source_text, str):
+            stripped = source_text.strip()
+            if stripped.startswith("{"):
+                try:
+                    candidate = json.loads(stripped)
+                    if isinstance(candidate, dict):
+                        parsed = candidate
+                except json.JSONDecodeError:
+                    parsed = None
+
         mock_response = MagicMock()
-        mock_response.choices[0].message.content = f"[TRANSLATED] {source_text}"
+        if parsed is not None:
+            translated = {k: f"[TRANSLATED] {v}" for k, v in parsed.items()}
+            mock_response.choices[0].message.content = json.dumps(
+                translated, ensure_ascii=False
+            )
+        else:
+            mock_response.choices[0].message.content = f"[TRANSLATED] {source_text}"
         return mock_response
 
     with patch("mdpo_llm.processor.litellm") as mock_litellm:
         mock_litellm.completion.side_effect = _side_effect
+        # Default to an OpenAI-compatible param list so batched tests
+        # exercise the json-object response-format path.  Individual tests
+        # can override this to simulate providers that lack support.
+        mock_litellm.get_supported_openai_params.return_value = [
+            "temperature",
+            "max_tokens",
+            "response_format",
+        ]
         yield mock_litellm
 
 

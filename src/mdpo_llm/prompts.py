@@ -19,3 +19,29 @@ class Prompts:
         "7. Widely-adopted technical terms (e.g., API, SDK, GPU) may remain in English "
         "if that is conventional in the target language.\n"
     )
+
+    BATCH_TRANSLATE_SYSTEM_TEMPLATE = (
+        "You are an expert technical translator. "
+        "Translate a set of Markdown blocks into **{lang}**.\n"
+        "Maintain a single consistent tone, register, and terminology across ALL values in one call "
+        "(e.g. in Korean pick one of -입니다 / -하세요 and keep it throughout).\n\n"
+        "{instruction}\n"
+    )
+
+    BATCH_TRANSLATE_INSTRUCTION = (
+        "Input is a JSON object where each key is an opaque block identifier and each value is a "
+        "Markdown source fragment.\n"
+        "Output a JSON object with EXACTLY the same set of keys as the input.\n\n"
+        "Strict rules:\n"
+        "1. Return ONLY a JSON object. No prose, no explanations, no Markdown code fences.\n"
+        "2. Every input key MUST appear in the output exactly once — same order, same spelling.\n"
+        "3. Do NOT add, omit, merge, or rename keys. Do NOT nest the object.\n"
+        "4. Each value is the translated Markdown for that block, preserving original structure "
+        "(headings, list bullets, table pipes, code fences, blockquote markers).\n"
+        "5. Translate prose only. Keep URLs, file paths, identifiers, interpolation tokens "
+        "(`{{name}}`, `%s`, `${{var}}`) unchanged.\n"
+        "6. In code blocks, keep code as-is; only translate comments and user-facing strings.\n"
+        "7. Widely-adopted technical terms (API, SDK, GPU) may remain in English when conventional "
+        "in the target language.\n"
+        "8. Keep tone, register, and terminology consistent across all values.\n"
+    )

@@ -9,6 +9,18 @@
 
 mdpo-llm splits your Markdown into blocks, tracks each one in a PO file, and sends only new or changed blocks to your LLM. Edit one paragraph in a 50-block document? One API call, not fifty.
 
+## What's new in v0.3
+
+- **Batched JSON-mode translation** (default on). A 50-block first-run collapses from 50 serial calls to ~2 batched calls.
+- **Intra-document consistency by construction** — sibling blocks share one LLM context, so tone and terminology unify across a document.
+- **Post-translation validator** (opt-in via `validation="conservative"` or `"strict"`) checks heading levels, fence counts, glossary preservation, and target-language presence.
+- **Prompt caching** hint on the stable system prefix — pass `enable_prompt_cache=True` to cut cost on re-runs and large directory jobs.
+- **CLI** — `python -m mdpo_llm translate|translate-dir|estimate|report …`.
+- **Typed result dataclasses** (`ProcessResult`, `Coverage`, `BatchStats`) with dict-style access for backward compatibility.
+- **Dry-run estimator** — `processor.estimate(src)` reports pending blocks and estimated tokens with zero API calls.
+
+v0.2 behaviour (one call per block) is preserved via `batch_size=0`.
+
 ## How It Works
 
 ```mermaid
