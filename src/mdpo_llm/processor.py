@@ -4,6 +4,7 @@ Main Markdown Translator orchestrator class.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -22,7 +23,7 @@ import polib
 
 from .batch import BatchTranslator, MultiTargetBatchTranslator
 from .manager import POManager
-from .parser import BlockParser
+from .parser import BlockParser, slugify_path_segment
 from .placeholder import (
     ANCHOR_PATTERN,
     BUILTIN_PATTERNS,
@@ -1357,6 +1358,276 @@ class MarkdownProcessor:
             if getattr(self._tls, "refine_first_carryover", None):
                 self._tls.refine_first_carryover = None
 
+    def _translate_path_segments(
+        self,
+        *,
+        source_dir: Path,
+        matched_files: List[Path],
+        paths_po_path: Path,
+        usage: _UsageAccumulator,
+        previous_map: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """Translate the distinct path segments across ``matched_files``
+        and return a source → target relative-path mapping.
+
+        Scope:
+
+        - Each segment (directory name or markdown stem) is catalogued in
+          ``_paths.po`` as a single entry keyed by ``msgctxt="path::segment::<raw>"``.
+          File extensions are preserved verbatim and never translated.
+        - Translations flow through :meth:`_call_llm` (same prompt pipeline
+          as content blocks), so caching, glossary, validation, and
+          ``usage`` accounting all behave the way the rest of the directory
+          run does.
+        - Outputs are piped through :func:`slugify_path_segment` to
+          normalise whitespace / strip filesystem-unsafe characters, and a
+          per-directory uniqueness pass appends ``-2``, ``-3``, … when two
+          source segments collapse to the same slug inside the same
+          directory.  Sibling directories are handled independently —
+          ``a/x`` and ``b/x`` never contend for the same slot.
+        - Missing / empty / failed translations fall back to the sanitized
+          source segment so every source path still maps to SOMETHING.
+
+        Returns a dict keyed by the source file's POSIX relative path
+        (``"guide/intro.md"``) with the translated relative path as value.
+        The caller composes the on-disk target path by joining this value
+        under ``target_dir``.
+        """
+        unique_segments: List[str] = []
+        seen_segments: set = set()
+
+        # Collect segments in deterministic first-appearance order so the
+        # resulting _paths.po diff is stable across runs with unchanged
+        # input.  Dotfile-only segments (``""``, ``"."``, ``".."``) are
+        # preserved verbatim and never translated — they're filesystem
+        # navigation tokens, not content.
+        def _is_translatable(seg: str) -> bool:
+            return bool(seg) and seg not in {".", ".."} and not seg.startswith(".")
+
+        for source_file in matched_files:
+            rel = source_file.relative_to(source_dir)
+            parent_parts = list(rel.parts[:-1])
+            segments_in_file = parent_parts + [rel.stem]
+            for seg in segments_in_file:
+                if not _is_translatable(seg):
+                    continue
+                if seg in seen_segments:
+                    continue
+                seen_segments.add(seg)
+                unique_segments.append(seg)
+
+        po_manager = POManager(skip_types=[])
+        po_file = po_manager.load_or_create_po(
+            paths_po_path, target_lang=self.target_lang
+        )
+
+        def _ctx_for(seg: str) -> str:
+            return f"path::segment::{seg}"
+
+        # Add / update entries for segments seen in THIS run.  Entries
+        # whose segments aren't matched by the current glob are left
+        # untouched — a narrower-glob retry must not flush cached
+        # translations (or operator edits) for out-of-scope paths.
+        # That mirrors the partial-rerun behaviour already guaranteed
+        # for ``path_map.json``: stale PO rows accumulate but never get
+        # silently deleted.  Operators who genuinely want to prune can
+        # edit ``_paths.po`` by hand, same as the per-document PO flow.
+        entry_by_ctx = {e.msgctxt: e for e in po_file if e.msgctxt}
+        for seg in unique_segments:
+            ctx = _ctx_for(seg)
+            entry = entry_by_ctx.get(ctx)
+            if entry is None:
+                po_file.append(polib.POEntry(msgctxt=ctx, msgid=seg, msgstr=""))
+                continue
+            if entry.msgid != seg:
+                entry.msgid = seg
+                if "fuzzy" not in entry.flags:
+                    entry.flags.append("fuzzy")
+
+        # Scope translation to segments actually used by THIS run so a
+        # narrower-glob retry never spends tokens on (or silently
+        # re-translates) an out-of-scope fuzzy entry that an earlier
+        # full run left in ``_paths.po``.  Operators who want to
+        # re-translate preserved entries can either widen the glob or
+        # edit ``_paths.po`` and clear ``msgstr`` themselves.
+        current_segment_set = set(unique_segments)
+        pending = [
+            e
+            for e in po_file
+            if not e.obsolete
+            and e.msgid in current_segment_set
+            and ((not e.msgstr) or "fuzzy" in e.flags)
+        ]
+
+        for entry in pending:
+            try:
+                translated = self._call_llm(entry.msgid, usage=usage)
+            except Exception as exc:
+                logger.warning(
+                    "Path segment translation failed for %r: %s", entry.msgid, exc
+                )
+                continue
+            if translated is None:
+                continue
+            entry.msgstr = translated.strip()
+            po_manager.mark_entry_processed(entry)
+
+        # Save eagerly so a downstream crash during file-level translation
+        # doesn't discard the segment translations we already billed for.
+        po_manager.save_po(po_file, paths_po_path)
+
+        # Raw source segment → sanitized translated slug lookup.  Empty /
+        # missing translations fall back to a sanitized source segment so
+        # every path still resolves; filesystem-unsafe characters in the
+        # raw source are also stripped so the fallback is always writable.
+        def _safe_slug_for(raw: str) -> str:
+            """Return a guaranteed-filesystem-safe slug for ``raw``.
+
+            Falls back to a deterministic ``segment-<sha1>`` form when
+            :func:`slugify_path_segment` strips every character — a
+            source segment legally composed of characters that are
+            reserved on Windows (``?``, ``*``, ``<``, ``>`` …) would
+            otherwise leak straight through as an unwritable path on
+            that platform.  The hash is stable across runs so the
+            published mapping and on-disk filename stay reproducible.
+            """
+            slug = slugify_path_segment(raw)
+            if slug:
+                return slug
+            digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+            return f"segment-{digest}"
+
+        segment_slug: Dict[str, str] = {}
+        for entry in po_file:
+            if entry.obsolete or not entry.msgctxt:
+                continue
+            raw_msgstr = entry.msgstr or ""
+            slug = slugify_path_segment(raw_msgstr)
+            if not slug:
+                slug = _safe_slug_for(entry.msgid)
+            segment_slug[entry.msgid] = slug
+
+        # Per-directory uniqueness: two segments whose TRANSLATED parent
+        # is the same (i.e. they land in the same on-disk directory) and
+        # whose slugified translations collide get ``-N`` disambiguators.
+        # Keying by the TRANSLATED parent — not the raw source parent —
+        # matches filesystem semantics: two distinct source dirs that
+        # happen to translate to the same slug already get disambiguated
+        # at the outer level, so their children share one namespace.
+        # Raw-keyed buckets would treat them as separate namespaces even
+        # after the outer-level disambig converges the paths, letting
+        # descendants shadow each other on disk.
+        assigned: Dict[Tuple[Tuple[str, ...], str], str] = {}
+        used_at_level: Dict[Tuple[str, ...], set] = {}
+
+        # Pre-seed ``assigned`` AND ``used_at_level`` for out-of-scope
+        # preserved entries whose translation is UNCHANGED from the
+        # current PO state.  The cache hit makes in-scope resolutions
+        # for the same raw segment return the preserved slug (so
+        # directories get shared instead of spuriously disambiguated
+        # with ``-2``).  For entries whose translation has CHANGED
+        # between runs (operator edited ``_paths.po``; LLM output
+        # differs on a retranslate), do NOT pre-seed — letting the
+        # fresh resolution compute from ``segment_slug`` is what makes
+        # rename propagate to in-scope files on partial reruns.
+        # Out-of-scope preserved files stay at their old on-disk path;
+        # the operator needs a full-tree rerun to migrate them too.
+        current_source_set = {
+            sf.relative_to(source_dir).as_posix() for sf in matched_files
+        }
+        for src_rel, old_tgt_rel in (previous_map or {}).items():
+            if src_rel in current_source_set:
+                continue
+            try:
+                src_parts = Path(src_rel).parts
+                tgt_parts = Path(old_tgt_rel).parts
+            except (TypeError, ValueError):
+                continue
+            if not src_parts or not tgt_parts:
+                continue
+            if len(src_parts) != len(tgt_parts):
+                # Length mismatch (e.g. a prior run with a different
+                # flag set) — the segment-to-segment alignment would
+                # be ambiguous, so skip this entry rather than risk
+                # seeding an incorrect mapping.
+                continue
+            src_last_stem = Path(src_parts[-1]).stem
+            src_last_suffix = Path(src_parts[-1]).suffix
+            tgt_last_stem = Path(tgt_parts[-1]).stem
+            tgt_last_suffix = Path(tgt_parts[-1]).suffix
+            if src_last_suffix != tgt_last_suffix:
+                continue
+            src_walk = list(src_parts[:-1]) + [src_last_stem]
+            tgt_walk = list(tgt_parts[:-1]) + [tgt_last_stem]
+            translated_acc: Tuple[str, ...] = ()
+            for raw, translated in zip(src_walk, tgt_walk):
+                if _is_translatable(raw):
+                    current_slug = segment_slug.get(raw)
+                    if current_slug is None:
+                        current_slug = _safe_slug_for(raw)
+                    if current_slug == translated:
+                        # Unchanged: cache the mapping and reserve the
+                        # slot so in-scope lookups share the directory.
+                        key = (translated_acc, raw)
+                        assigned.setdefault(key, translated)
+                        used_at_level.setdefault(translated_acc, set()).add(
+                            translated.casefold()
+                        )
+                    # Renamed: skip.  In-scope resolution uses the new
+                    # slug freely; the preserved file at the OLD slug
+                    # lives on a disjoint path and cannot collide.
+                translated_acc = translated_acc + (translated,)
+
+        def _resolve(translated_parent: Tuple[str, ...], raw_seg: str) -> str:
+            if not _is_translatable(raw_seg):
+                return raw_seg
+            key = (translated_parent, raw_seg)
+            cached = assigned.get(key)
+            if cached is not None:
+                return cached
+            base = segment_slug.get(raw_seg) or _safe_slug_for(raw_seg)
+            # Collision detection uses ``str.casefold`` so sibling
+            # translations like ``Guide`` and ``guide`` — distinct under
+            # Linux ext4 but ALIASES on default Windows NTFS and
+            # macOS APFS (case-insensitive by default) — still receive
+            # ``-2`` disambiguation.  Without casefolding those siblings
+            # clobber each other on the majority of operator platforms
+            # even though the in-memory string set accepts both.
+            used = used_at_level.setdefault(translated_parent, set())
+            candidate = base
+            n = 2
+            while candidate.casefold() in used:
+                candidate = f"{base}-{n}"
+                n += 1
+            used.add(candidate.casefold())
+            assigned[key] = candidate
+            return candidate
+
+        path_map: Dict[str, str] = {}
+        # Deterministic assignment order: sort by source posix relpath so
+        # disambiguation collisions always resolve the same way across
+        # runs.  Without this, two bare-``--translate-paths`` invocations
+        # could disagree on which colliding sibling gets the base slug.
+        for source_file in sorted(
+            matched_files, key=lambda p: p.relative_to(source_dir).as_posix()
+        ):
+            rel = source_file.relative_to(source_dir)
+            parent_parts = tuple(rel.parts[:-1])
+            stem = rel.stem
+            suffix = rel.suffix
+
+            translated_parents: List[str] = []
+            translated_accumulated: Tuple[str, ...] = ()
+            for raw in parent_parts:
+                translated = _resolve(translated_accumulated, raw)
+                translated_parents.append(translated)
+                translated_accumulated = translated_accumulated + (translated,)
+            translated_stem = _resolve(translated_accumulated, stem)
+            translated_rel = Path(*translated_parents, translated_stem + suffix)
+            path_map[rel.as_posix()] = translated_rel.as_posix()
+
+        return path_map
+
     def process_directory(
         self,
         source_dir: Path,
@@ -1370,6 +1641,7 @@ class MarkdownProcessor:
         refine_first: bool = False,
         refine_lang: Optional[str] = None,
         refined_po_dir: Path | None = None,
+        translate_paths: bool = False,
     ) -> DirectoryResult:
         """
         Process all markdown files in a directory tree.
@@ -1379,6 +1651,19 @@ class MarkdownProcessor:
         relative path of each source file.  When ``refine_first=True``,
         ``refined_dir`` is required so each file's refined intermediate
         has a deterministic location.
+
+        ``translate_paths`` (opt-in, default ``False``) treats filesystem
+        path segments (directory names and markdown file stems) as their
+        own "block type".  A dedicated ``_paths.po`` catalog is created
+        beside the effective PO directory (or under ``target_dir`` when
+        ``po_dir`` is omitted) and drives the per-segment translations; a
+        ``path_map.json`` is emitted alongside the translated tree so
+        downstream link-rewriters / sitemaps / CI can resolve the
+        source → target path pairing without re-running the translator.
+        Link text and URLs inside translated Markdown are deliberately
+        NOT rewritten — that's a separate cross-reference problem, and
+        scoping it here would invalidate every translated document's
+        internal anchors.
         """
         import concurrent.futures
 
@@ -1493,6 +1778,140 @@ class MarkdownProcessor:
         matched_files = sorted(source_dir.glob(glob))
         start = time.monotonic()
 
+        # Directory where path-translation catalog files (_paths.po,
+        # path_map.json) live.  Refine mode with ``refined_dir`` routes
+        # the processed tree to ``refined_dir``, so anchor the path-map
+        # there too; everything else lands under ``target_dir``.
+        path_artefacts_dir = (
+            refined_dir_path
+            if self.mode == "refine" and refined_dir_path is not None
+            else target_dir
+        )
+
+        # Opt-in path translation: build a segment catalog in ``_paths.po``
+        # and compose a source → target relative-path map BEFORE the thread
+        # pool starts, so each worker's ``_process_one`` knows the
+        # translated target for its file.  Tokens billed by the per-segment
+        # LLM calls are recorded into ``path_usage`` and merged into the
+        # directory-level receipt alongside per-worker totals.
+        path_usage = _UsageAccumulator()
+        path_map_relative: Dict[str, str] = {}
+        paths_po_path: Optional[Path] = None
+        path_map_json_path: Optional[Path] = None
+        previous_map: Dict[str, str] = {}
+        if translate_paths:
+            paths_po_dir = po_dir if po_dir is not None else path_artefacts_dir
+            paths_po_path = Path(paths_po_dir) / "_paths.po"
+            path_map_json_path = Path(path_artefacts_dir) / "path_map.json"
+            # Load the previous run's map NOW (before the segment
+            # catalog runs) so ``_translate_path_segments`` can pre-seed
+            # its disambig namespace with preserved out-of-scope
+            # entries.  A narrower-glob retry otherwise reshuffles
+            # prior ``-N`` suffixes and overwrites outputs for sources
+            # it didn't touch.
+            if path_map_json_path.exists():
+                try:
+                    raw_prev = json.loads(
+                        path_map_json_path.read_text(encoding="utf-8")
+                    )
+                    if isinstance(raw_prev, dict):
+                        previous_map = {
+                            k: v
+                            for k, v in raw_prev.items()
+                            if isinstance(k, str) and isinstance(v, str)
+                        }
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    # A corrupt prior map shouldn't abort the run; we
+                    # simply skip preserved-slug seeding and cleanup.
+                    previous_map = {}
+            # Synthesize implicit mirror-path entries for source files
+            # whose source-relative target still sits in the EFFECTIVE
+            # output tree (``refined_dir`` under refine mode with a
+            # separate refined_dir, else ``target_dir``) without a
+            # matching ``path_map.json`` row.  That happens on the
+            # FIRST ``--translate-paths`` run against a tree that was
+            # previously populated by the default source-mirror path
+            # (or by an earlier run without the flag): the new
+            # localized outputs would otherwise land beside the legacy
+            # mirror files and static-site deploys would publish both
+            # copies.  Probing the wrong tree (``target_dir`` in refine
+            # mode with a separate refined_dir) would also silently
+            # miss the legacy files.  Treating the mirror as
+            # ``src_rel -> src_rel`` in ``previous_map`` routes it
+            # through the same cleanup pass that handles any other
+            # translation change, so the legacy file is removed exactly
+            # when the new translated target differs from the
+            # source-relative path.
+            try:
+                artefacts_dir_abs = Path(path_artefacts_dir).resolve(
+                    strict=False
+                )
+            except OSError:
+                artefacts_dir_abs = Path(path_artefacts_dir).absolute()
+            for source_file in matched_files:
+                src_rel = source_file.relative_to(source_dir).as_posix()
+                if src_rel in previous_map:
+                    continue
+                try:
+                    mirror_abs = (Path(path_artefacts_dir) / src_rel).resolve(
+                        strict=False
+                    )
+                except OSError:
+                    continue
+                try:
+                    mirror_abs.relative_to(artefacts_dir_abs)
+                except ValueError:
+                    continue
+                if mirror_abs.is_file():
+                    previous_map[src_rel] = src_rel
+            # Filename collision guard: ``_paths.po`` is fixed by the
+            # feature contract, so a source file whose per-document PO
+            # would resolve to the same path corrupts both the segment
+            # catalog AND the document PO on every run (each overwrites
+            # the other's state).  Detect up front and fail with a
+            # specific usage error — a deep inconsistency would be far
+            # harder to diagnose from symptoms alone.
+            if matched_files:
+                try:
+                    paths_po_abs = paths_po_path.resolve(strict=False)
+                except OSError:
+                    paths_po_abs = paths_po_path.absolute()
+                # Match the per-document PO routing in ``_process_one``:
+                # when ``po_dir`` is omitted AND ``translate_paths`` is
+                # on, the default PO lives under the EFFECTIVE output
+                # tree (``path_artefacts_dir``), not ``target_dir``.
+                # Checking the wrong root here would let a source named
+                # ``_paths.md`` slip past the guard in refine-mode runs
+                # and silently corrupt both the segment catalog and the
+                # per-file PO on every invocation.
+                per_file_po_root = (
+                    Path(po_dir) if po_dir is not None else Path(path_artefacts_dir)
+                )
+                for source_file in matched_files:
+                    rel = source_file.relative_to(source_dir)
+                    candidate = per_file_po_root / rel.with_suffix(".po")
+                    try:
+                        cand_abs = candidate.resolve(strict=False)
+                    except OSError:
+                        cand_abs = candidate.absolute()
+                    if cand_abs == paths_po_abs:
+                        raise ValueError(
+                            "translate_paths=True reserves the filename "
+                            "'_paths.po' for the segment catalog, which "
+                            f"collides with the per-document PO for "
+                            f"{source_file!s}. Rename the source file (e.g. "
+                            "'paths.md' or 'docs-paths.md') or pass an "
+                            "explicit --po-dir that does not contain a "
+                            "source document mapped to '_paths.po'."
+                        )
+                path_map_relative = self._translate_path_segments(
+                    source_dir=source_dir,
+                    matched_files=matched_files,
+                    paths_po_path=paths_po_path,
+                    usage=path_usage,
+                    previous_map=previous_map,
+                )
+
         results: List[Any] = []
         files_processed = 0
         files_failed = 0
@@ -1500,6 +1919,14 @@ class MarkdownProcessor:
         # Hold each worker's accumulator so a mid-run exception still
         # contributes its billed tokens to the directory-level receipt.
         worker_usages: List[_UsageAccumulator] = []
+        # Track which source files actually produced on-disk output in
+        # this run.  ``--translate-paths`` uses this to (a) keep
+        # path_map.json honest — advertising a target path is only safe
+        # when the worker actually wrote that file — and (b) gate the
+        # stale-file cleanup so a transient per-file failure doesn't
+        # delete the prior good output when the replacement was never
+        # produced.
+        successful_source_posix: set = set()
 
         self._emit_progress(
             kind="directory_start",
@@ -1509,14 +1936,53 @@ class MarkdownProcessor:
 
         def _process_one(source_file: Path):
             relative_path = source_file.relative_to(source_dir)
-            target_path = target_dir / relative_path
-            po_path_file = (
-                po_dir / relative_path.with_suffix(".po")
-                if po_dir is not None
-                else None
+            # When ``translate_paths`` is active, the worker writes the
+            # translated markdown to the TRANSLATED target path so
+            # filesystem layout matches the localized filenames.  PO
+            # files remain keyed on the SOURCE relative path so
+            # incremental re-runs still find their previously-processed
+            # entries; renaming the output file doesn't invalidate the
+            # translation memory.
+            translated_relative = Path(
+                path_map_relative.get(relative_path.as_posix(), relative_path.as_posix())
             )
+            target_path = target_dir / translated_relative
+            if po_dir is not None:
+                po_path_file: Optional[Path] = (
+                    po_dir / relative_path.with_suffix(".po")
+                )
+            elif translate_paths:
+                # When ``po_dir`` is omitted, ``process_document`` would
+                # default the per-file PO to ``target_path.with_suffix(".po")``
+                # — but with ``translate_paths`` active ``target_path`` has
+                # already been localized, so the PO moves whenever a path
+                # translation changes (e.g. the operator edits ``_paths.po``).
+                # That breaks the feature's advertised source-relative PO
+                # stability for the default layout.  Pin the PO to the
+                # source-relative location under the EFFECTIVE output
+                # tree (``refined_dir`` in refine mode, else
+                # ``target_dir``) so incremental re-runs keep hitting
+                # the same cache even when localized filenames drift —
+                # and so refine runs don't write .po files into the
+                # source tree when the caller has pointed ``target_dir``
+                # at it (refine mode permits that alias because refine
+                # output goes to ``refined_dir``, not ``target_dir``).
+                po_path_file = (
+                    path_artefacts_dir / relative_path.with_suffix(".po")
+                )
+            else:
+                po_path_file = None
+            # ``process_document`` in refine mode REWRITES its
+            # ``target_path`` kwarg with ``refined_path`` before writing
+            # the output, so the refined Markdown actually lands at
+            # ``refined_path_file``.  Applying the translated relative
+            # path here (not the raw one) keeps the refined tree layout
+            # consistent with ``path_map.json`` — otherwise the map
+            # advertises localized paths that the refine-mode writer
+            # never creates and every downstream consumer of the map
+            # breaks under ``mode='refine'`` with ``refined_dir``.
             refined_path_file = (
-                refined_dir_path / relative_path
+                refined_dir_path / translated_relative
                 if refined_dir_path is not None
                 else None
             )
@@ -1602,6 +2068,18 @@ class MarkdownProcessor:
                         continue
 
                     results.append(result)
+                    # Record that this source file produced on-disk
+                    # output — even when entry-level failures flip
+                    # ``files_failed``, the translated markdown was
+                    # written by ``_save_processed_document`` before
+                    # return.  Only hard worker errors (caught above)
+                    # leave the target missing.
+                    try:
+                        successful_source_posix.add(
+                            source_file.relative_to(source_dir).as_posix()
+                        )
+                    except ValueError:
+                        pass
 
                     stats = result.translation_stats
                     if stats.failed > 0 or stats.validation_failed > 0:
@@ -1632,6 +2110,160 @@ class MarkdownProcessor:
             dir_usage.input_tokens += u.input_tokens
             dir_usage.output_tokens += u.output_tokens
             dir_usage.api_calls += u.api_calls
+        # Fold the path-translation billing into the directory receipt so
+        # operators see the full cost of the run — skipping it would
+        # under-report whenever ``--translate-paths`` issued API calls.
+        dir_usage.input_tokens += path_usage.input_tokens
+        dir_usage.output_tokens += path_usage.output_tokens
+        dir_usage.api_calls += path_usage.api_calls
+
+        # Emit path_map.json after workers finish so the file is only
+        # written on directory completion, alongside the (possibly partial)
+        # translated tree.  Writing it before the workers would leave stale
+        # mappings on disk if a worker failure aborts the run.
+        if translate_paths and path_map_json_path is not None:
+            # ``previous_map`` was loaded BEFORE path-segment translation
+            # so the disambig pass could pre-seed out-of-scope
+            # assignments.  Reuse the same snapshot here for cleanup /
+            # merge — re-reading the file would spuriously diff against
+            # the empty map when the segment helper overwrote it, and
+            # deleting the helper's already-loaded snapshot risks
+            # drift between pre- and post-worker views.
+            # Restrict the public mapping to sources whose worker
+            # actually wrote a translated file.  Hard worker failures
+            # leave the target missing on disk, and advertising a
+            # non-existent path in path_map.json would break every
+            # downstream consumer (link rewriters, sitemap jobs) that
+            # trusts the file as ground truth.  Preserve prior map
+            # entries for sources that didn't run this time (narrower
+            # glob, retry-specific invocation) — but only when the
+            # source still exists on disk, so mappings for genuinely
+            # deleted files don't linger forever — so repeated partial
+            # runs converge on a complete map rather than shrinking.
+            try:
+                source_dir_resolved = Path(source_dir).resolve(strict=False)
+            except OSError:
+                source_dir_resolved = Path(source_dir).absolute()
+
+            def _source_still_on_disk(src_rel: str) -> bool:
+                # Defend against a corrupt / hand-edited prior map that
+                # contains ``..`` or absolute paths: confine the file
+                # existence probe to the current ``source_dir`` tree.
+                if not src_rel:
+                    return False
+                try:
+                    candidate = (Path(source_dir) / src_rel).resolve(
+                        strict=False
+                    )
+                except OSError:
+                    return False
+                try:
+                    candidate.relative_to(source_dir_resolved)
+                except ValueError:
+                    return False
+                return candidate.is_file()
+
+            published_map: Dict[str, str] = {}
+            for src_rel, old_tgt in previous_map.items():
+                # Start from the prior map so a narrower-glob rerun or
+                # targeted retry does not shrink the published map.
+                # Drop entries whose source file has been removed from
+                # the tree — those are genuinely stale.
+                if _source_still_on_disk(src_rel):
+                    published_map[src_rel] = old_tgt
+            for src_rel, tgt_rel in path_map_relative.items():
+                if src_rel in successful_source_posix:
+                    # Override with this run's successful update.
+                    published_map[src_rel] = tgt_rel
+            try:
+                path_map_json_path.parent.mkdir(parents=True, exist_ok=True)
+                path_map_json_path.write_text(
+                    json.dumps(
+                        published_map,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                logger.exception(
+                    "Failed to write path_map.json at %s", path_map_json_path
+                )
+            # Delete stale translated outputs.  ``old_target`` only comes
+            # off disk when the REPLACEMENT was actually written this
+            # run (or the source file is gone from the tree entirely) —
+            # otherwise a transient per-file failure after an operator
+            # edits ``_paths.po`` would delete the last good translation
+            # without producing a new one, which is permanent data loss
+            # from a recoverable error.
+            try:
+                artefacts_resolved = Path(path_artefacts_dir).resolve(
+                    strict=False
+                )
+            except OSError:
+                artefacts_resolved = Path(path_artefacts_dir).absolute()
+            current_targets_resolved: set = set()
+            for src_rel_cur, new_rel in path_map_relative.items():
+                if src_rel_cur not in successful_source_posix:
+                    # The planned target was never written; keep it
+                    # out of the "current" set so the cleanup below
+                    # doesn't treat an unrelated-but-equal prior target
+                    # as already claimed by this run.
+                    continue
+                try:
+                    current_targets_resolved.add(
+                        (Path(path_artefacts_dir) / new_rel).resolve(
+                            strict=False
+                        )
+                    )
+                except OSError:
+                    continue
+            for src_rel, old_tgt_rel in previous_map.items():
+                if path_map_relative.get(src_rel) == old_tgt_rel:
+                    continue
+                planned_new = path_map_relative.get(src_rel)
+                # Partial-rerun safety: a narrower glob or targeted
+                # retry leaves sources outside scope missing from
+                # ``path_map_relative``, but those files still exist
+                # on disk and must NOT be deleted.  Only treat a
+                # source as "removed" when the file is genuinely gone
+                # from the source tree.
+                source_removed = (
+                    planned_new is None
+                    and not _source_still_on_disk(src_rel)
+                )
+                replacement_ready = (
+                    planned_new is not None
+                    and src_rel in successful_source_posix
+                )
+                if not (source_removed or replacement_ready):
+                    # Replacement run failed OR source outside this
+                    # run's glob; keep the old file so deploys still
+                    # have SOMETHING for this source.
+                    continue
+                try:
+                    old_target_abs = (
+                        Path(path_artefacts_dir) / old_tgt_rel
+                    ).resolve(strict=False)
+                except OSError:
+                    continue
+                try:
+                    old_target_abs.relative_to(artefacts_resolved)
+                except ValueError:
+                    continue
+                if old_target_abs in current_targets_resolved:
+                    continue
+                if not old_target_abs.is_file():
+                    continue
+                try:
+                    old_target_abs.unlink()
+                except OSError:
+                    logger.exception(
+                        "Failed to remove stale translated output %s",
+                        old_target_abs,
+                    )
 
         # In refine mode with an explicit ``refined_dir``, per-file output
         # is routed to ``refined_dir`` — not ``target_dir`` — so report
