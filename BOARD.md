@@ -48,11 +48,14 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: pending
+  status: assigned
   priority: high
   depends_on: []
   brief: .ccx/tasks/T-1.md
-  attempts: 0
+  attempts: 1
+  worktree: /home/will/Repositories/mdpo-llm-T-1
+  branch: ccx/T-1
+  started_at: "2026-04-18T06:41:11Z"
   notes: |
     Roadmap #2. Sum token usage returned by litellm.completion across all
     calls (batched + per-entry), resolve per-1M pricing via
