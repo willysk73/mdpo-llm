@@ -47,11 +47,20 @@ class PlaceholderPattern:
 
 @dataclass(frozen=True)
 class Placeholder:
-    """One substitution produced by :meth:`PlaceholderRegistry.encode`."""
+    """One substitution produced by :meth:`PlaceholderRegistry.encode`.
+
+    ``replacement`` is an optional override consumed by
+    :meth:`PlaceholderRegistry.decode`: when non-``None``, decode restores
+    the token to this string instead of ``original``.  The glossary
+    placeholder mode uses it to rewrite a matched source term to its
+    target-language form on restore; other callers can leave it ``None``
+    for a pure identity decode.
+    """
 
     token: str
     original: str
     pattern_name: str
+    replacement: Optional[str] = None
 
 
 @dataclass
@@ -219,13 +228,23 @@ class PlaceholderRegistry:
     def decode(text: str, mapping: PlaceholderMap) -> str:
         """Restore every ``\u27e6P:N\u27e7`` token in ``text`` using ``mapping``.
 
+        Each token is replaced with :attr:`Placeholder.replacement` when
+        that field is set on the mapping entry, otherwise with
+        :attr:`Placeholder.original`.  The replacement override lets
+        callers map a matched source span to a different string on
+        restore — the glossary placeholder path uses it to emit the
+        target-language form instead of the original source term.
+
         Tokens absent from ``mapping`` (model hallucinated a token index)
         pass through unchanged so the round-trip check can surface them as
         ``unexpected`` rather than silently eating them.
         """
         if not mapping.items:
             return text
-        lookup = {p.token: p.original for p in mapping.items}
+        lookup = {
+            p.token: (p.replacement if p.replacement is not None else p.original)
+            for p in mapping.items
+        }
 
         def replace(m: "re.Match[str]") -> str:
             return lookup.get(m.group(0), m.group(0))

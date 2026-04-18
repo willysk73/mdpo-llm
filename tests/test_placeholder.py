@@ -638,6 +638,290 @@ def test_sequential_path_glossary_uses_unencoded_source():
     assert "https://example.com" not in user_content
 
 
+# ---------- glossary placeholder mode ----------
+
+
+def test_glossary_mode_defaults_to_instruction():
+    """Default mode preserves v0.4 back-compat: glossary block in the system
+    prompt, terms untouched in the user message."""
+    from unittest.mock import MagicMock, patch
+
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={"GitHub": None, "API": "API"},
+    )
+    assert proc.glossary_mode == "instruction"
+
+    captured = {}
+
+    def _capture(*args, **kwargs):
+        captured["messages"] = kwargs["messages"]
+        resp = MagicMock()
+        resp.choices = [MagicMock(message=MagicMock(content="ok"))]
+        resp.usage = None
+        return resp
+
+    with patch("mdpo_llm.processor.litellm.completion", side_effect=_capture):
+        proc._call_llm("Visit GitHub to read the API docs")
+
+    user = captured["messages"][-1]["content"]
+    system = captured["messages"][0]["content"]
+    assert "GitHub" in user, "instruction mode must NOT substitute terms"
+    assert "API" in user
+    assert "Glossary" in system
+    assert "GitHub" in system
+
+
+def test_glossary_placeholder_mode_substitutes_and_restores():
+    from unittest.mock import MagicMock, patch
+
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={"GitHub": None, "pull request": "\ud480 \ub9ac\ud018\uc2a4\ud2b8"},
+        glossary_mode="placeholder",
+    )
+
+    captured = {}
+
+    def _echo(*args, **kwargs):
+        captured["messages"] = kwargs["messages"]
+        user_text = kwargs["messages"][-1]["content"]
+        resp = MagicMock()
+        # LLM preserves tokens verbatim.
+        resp.choices = [MagicMock(message=MagicMock(content=user_text))]
+        resp.usage = None
+        return resp
+
+    with patch("mdpo_llm.processor.litellm.completion", side_effect=_echo):
+        result = proc._call_llm("Visit GitHub to open a pull request today")
+
+    user = captured["messages"][-1]["content"]
+    system = captured["messages"][0]["content"]
+    # Source text sent to the LLM has terms replaced with tokens.
+    assert "GitHub" not in user
+    assert "pull request" not in user
+    assert format_token(0) in user or format_token(1) in user
+    # Placeholder mode suppresses the instruction-mode glossary block so
+    # the two paths don't double-feed terms to the model.
+    assert "Glossary" not in system
+    # Restored output: GitHub stays verbatim, "pull request" becomes the
+    # target translation.
+    assert "GitHub" in result
+    assert "\ud480 \ub9ac\ud018\uc2a4\ud2b8" in result
+    assert "pull request" not in result
+
+
+def test_glossary_placeholder_mode_word_boundary_skips_morphology():
+    # "APIs" (plural) must NOT match the glossary term "API" — the
+    # trailing 's' is a word character and breaks the closing \b.  This is
+    # the conservative false-negative rule: a missed match falls through
+    # to the LLM, whereas a false-positive would corrupt neighbouring
+    # text mid-word.
+    from unittest.mock import MagicMock, patch
+
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={"API": None},
+        glossary_mode="placeholder",
+    )
+
+    captured = {}
+
+    def _echo(*args, **kwargs):
+        captured["messages"] = kwargs["messages"]
+        user_text = kwargs["messages"][-1]["content"]
+        resp = MagicMock()
+        resp.choices = [MagicMock(message=MagicMock(content=user_text))]
+        resp.usage = None
+        return resp
+
+    with patch("mdpo_llm.processor.litellm.completion", side_effect=_echo):
+        proc._call_llm("The APIs are documented but API is singular")
+
+    user = captured["messages"][-1]["content"]
+    # 'APIs' survives untouched; standalone 'API' becomes a token.
+    assert "APIs" in user
+    assert user.count("APIs") == 1
+    # Exactly one bare-'API' match became a token.
+    assert format_token(0) in user
+
+
+def test_glossary_placeholder_mode_prefix_does_not_match_mid_word():
+    # Mid-word occurrences must not be substituted either.
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={"git": None},
+        glossary_mode="placeholder",
+    )
+    # "github" contains "git" but is a word on its own; word-boundary
+    # should refuse to match.
+    encoded, mapping = proc._encode_source("Use github and commit to git")
+    assert "github" in encoded
+    # One match for the standalone "git".
+    glossary_entries = [p for p in mapping if p.pattern_name.startswith("glossary:")]
+    assert len(glossary_entries) == 1
+    assert glossary_entries[0].original == "git"
+
+
+def test_glossary_placeholder_mode_longer_term_wins_on_overlap():
+    # "pull request" and "pull" both match at the same start; the longer
+    # term must win so "pull request" stays intact.
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={"pull": "P", "pull request": "PR"},
+        glossary_mode="placeholder",
+    )
+    encoded, mapping = proc._encode_source("Open a pull request today")
+    glossary_entries = [p for p in mapping if p.pattern_name.startswith("glossary:")]
+    assert len(glossary_entries) == 1
+    assert glossary_entries[0].original == "pull request"
+    assert glossary_entries[0].replacement == "PR"
+
+
+def test_glossary_placeholder_mode_skips_non_word_terms():
+    # Terms starting or ending with non-word chars (e.g. ".NET", "C++")
+    # cannot be matched reliably with \bterm\b — they are silently
+    # skipped and fall through to the LLM's normal translation path.
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={".NET": None, "C++": None, "API": None},
+        glossary_mode="placeholder",
+    )
+
+    text = "Use API on .NET or C++"
+    encoded, mapping = proc._encode_source(text)
+    # Only "API" is substituted; ".NET" and "C++" are left alone.
+    assert ".NET" in encoded
+    assert "C++" in encoded
+    assert "API" not in encoded
+    glossary_entries = [p for p in mapping if p.pattern_name.startswith("glossary:")]
+    assert len(glossary_entries) == 1
+    assert glossary_entries[0].original == "API"
+
+
+def test_glossary_placeholder_mode_do_not_translate_restored_verbatim():
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={"GitHub": None},
+        glossary_mode="placeholder",
+    )
+    encoded, mapping = proc._encode_source("Visit GitHub today")
+    assert "GitHub" not in encoded
+    # Decode with the SAME encoded text simulates the LLM echoing tokens
+    # verbatim.  The restore must put the term back unchanged.
+    decoded = PlaceholderRegistry.decode(encoded, mapping)
+    assert decoded == "Visit GitHub today"
+
+
+def test_glossary_placeholder_mode_translated_restores_target_form():
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={"API": "\uc5d0\uc774\ud53c\uc544\uc774"},
+        glossary_mode="placeholder",
+    )
+    encoded, mapping = proc._encode_source("Read the API docs")
+    assert "API" not in encoded
+    decoded = PlaceholderRegistry.decode(encoded, mapping)
+    # Restored as the target-language form, not the original.
+    assert "\uc5d0\uc774\ud53c\uc544\uc774" in decoded
+    assert "API" not in decoded
+
+
+def test_glossary_placeholder_mode_no_glossary_is_identity():
+    # Placeholder mode without a glossary is a no-op — no effective
+    # registry, no substitution.
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary_mode="placeholder",
+    )
+    encoded, mapping = proc._encode_source("unchanged text")
+    assert encoded == "unchanged text"
+    assert mapping is None
+
+
+def test_glossary_placeholder_mode_combines_with_user_registry():
+    # A user-supplied placeholder registry must keep working when glossary
+    # placeholder mode adds its own patterns on top.
+    from mdpo_llm.processor import MarkdownProcessor
+
+    user_reg = PlaceholderRegistry()
+    user_reg.register("url", r"https?://\S+")
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={"GitHub": None},
+        glossary_mode="placeholder",
+        placeholders=user_reg,
+    )
+    encoded, mapping = proc._encode_source(
+        "See https://example.com on GitHub"
+    )
+    # Both the URL (user pattern) and "GitHub" (glossary) become tokens.
+    assert "https://example.com" not in encoded
+    assert "GitHub" not in encoded
+    # Decode restores the URL verbatim and GitHub (do-not-translate) too.
+    decoded = PlaceholderRegistry.decode(encoded, mapping)
+    assert decoded == "See https://example.com on GitHub"
+
+
+def test_glossary_placeholder_mode_round_trip_catches_dropped_term():
+    # If the LLM drops a glossary token the round-trip check must flag it
+    # as missing, so _apply_validation marks the entry fuzzy.
+    from unittest.mock import MagicMock
+
+    import polib
+
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={"GitHub": None},
+        glossary_mode="placeholder",
+    )
+    source = "Visit GitHub today"
+    encoded, mapping = proc._encode_source(source)
+    # Simulate a model response that forgot the token.
+    proc._tls.last_encoded_response = "\ubc29\ubb38\ud558\uc138\uc694"
+    proc._tls.last_placeholder_map = mapping
+
+    entry = polib.POEntry(msgid=source, msgstr="")
+    ok = proc._apply_validation(
+        entry, "\ubc29\ubb38\ud558\uc138\uc694", inplace=False, pool=MagicMock()
+    )
+    assert ok is False
+    assert "fuzzy" in entry.flags
+    assert "placeholder_roundtrip" in (entry.tcomment or "")
+
+
 def test_processor_structural_checks_run_on_decoded_not_encoded():
     # Regression for P2: when a placeholder covers inline code, the
     # encoded response has no backticks, but the decoded `processed`
