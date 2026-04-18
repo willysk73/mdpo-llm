@@ -3,6 +3,31 @@
 ## Unreleased
 
 ### Added
+- **`translate-dir --translate-paths` (opt-in)**: translate filesystem
+  path segments (directory names and markdown file stems) so the target
+  tree uses localized filenames. Segments are tracked in a dedicated
+  `_paths.po` catalog that lives under `--po-dir` (or the target
+  directory when `--po-dir` is omitted), with one PO entry per distinct
+  source segment keyed by `msgctxt="path::segment::<raw>"`. Translations
+  flow through the same `_call_llm` pipeline as content blocks, so
+  caching, glossary configuration, and `usage` accounting reuse the
+  existing machinery. Output segments are sanitized via
+  `parser.slugify_path_segment` (NFC-normalised, whitespace collapsed,
+  Windows / POSIX filesystem-reserved characters stripped, leading `.`
+  refused) and per-directory `-2` / `-3` disambiguators resolve slug
+  collisions deterministically. File extensions are preserved verbatim;
+  dotfile segments (`.github`, `.well-known`) pass through unchanged. A
+  `path_map.json` with the full source → target relative-path mapping
+  is written alongside the translated tree so downstream tooling (link
+  rewriters, sitemaps, CI) can resolve the pairing without re-running
+  the translator. Link text and URLs inside translated Markdown are
+  deliberately NOT rewritten — that is a separate cross-reference
+  problem, and solving it in this task would invalidate every
+  translated document's internal anchors. PO paths remain keyed on the
+  SOURCE relative path so incremental re-runs still hit their
+  previously-processed entries even when output filenames move. Tokens
+  billed by path-segment translation fold into the directory-level
+  `Receipt` so operators see the real cost of a `--translate-paths` run.
 - **`processor.py` — `process_document_multi` / multi-target translation
   (experimental)**: new method on `MarkdownProcessor` that translates a
   single Markdown source into multiple target languages in a single
