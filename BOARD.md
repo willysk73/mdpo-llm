@@ -223,11 +223,14 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: pending
+  status: assigned
   priority: normal
   depends_on: [T-4]
   brief: .ccx/tasks/T-7.md
-  attempts: 0
+  attempts: 1
+  worktree: /home/will/Repositories/mdpo-llm-T-7
+  branch: ccx/T-7
+  started_at: "2026-04-18T10:25:24Z"
   notes: |
     Roadmap #9. Split into two modes: `translate` (cross-language,
     today's behaviour) and `refine` (same-language clarity/grammar
