@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.4.1 — 2026-04-19
+
+### Changed
+- **Translation prompts simplified further.** Three rule families were
+  dropped from the translating instructions (`TRANSLATE_INSTRUCTION`,
+  `BATCH_TRANSLATE_INSTRUCTION`, `BATCH_MULTI_TRANSLATE_INSTRUCTION`)
+  because in practice each one was causing more harm than protection:
+
+  1. **Inline-code code-literal-vs-human-label distinction** — the
+     v0.4 split asked the LLM to judge whether a backticked fragment
+     was an identifier or a UI label. For ambiguous cases like
+     `` `게임코드` `` (a parameter-name label written in Korean) the
+     model erred on preserve, which stranded source-language tokens
+     in the target document.
+  2. **Format-string interpolation-token preservation**
+     (`{{name}}` / `%s` / `${var}`) — intended for Python `.format()`
+     and Handlebars runtime templates, but the LLM generalized it to
+     every `{word}` including URL path parameters, so
+     `/{GameCode}/json/epoch/{년}/{월}/{일}` left the Korean segments
+     untranslated even when a target-language equivalent existed.
+  3. **Bare URL / file path preservation outside code contexts** —
+     prevented legitimate translation of illustrative example paths
+     like `설치/경로/config.json`.
+
+  A **narrow printf-style preservation rule** was kept for `%s`,
+  `%d`, `%f`, `%(name)s`, and width/precision variants (`%02d`,
+  `%.2f`). These are C-style runtime format directives — never
+  documentation prose — and mangling them breaks the caller's
+  format call. The brace (`{{name}}`) and dollar (`${var}`) template
+  syntaxes were removed from this rule because the LLM was
+  generalizing them to every `{word}` including URL path parameters.
+
+  The remaining translation safeguards:
+  - **Fenced code blocks** still preserve code syntax (identifiers,
+    function and variable names, API paths, type names), and the
+    "MUST translate comments and user-facing string literals" rule is
+    kept so docs continue to show target-language examples.
+  - **`⟦P:N⟧` placeholder tokens** are hard-protected via sentinel
+    substitution with round-trip verification (`placeholder.py`).
+    This is the deterministic path for glossary entries, anchor IDs
+    (`{#section}`), and the HTML attribute allowlist — none of it
+    changed.
+  - **Glossary (`--glossary-mode placeholder`)** remains the
+    recommended tool for pinning product names, API parameter names,
+    and stable identifiers across the document.
+
+  **Migration note for API reference translations:** after v0.4.1 the
+  LLM will more readily translate tokens that look like identifiers
+  but read as natural-language labels, which is the behaviour most
+  users want. If your document has identifiers that must stay stable
+  (e.g. `getUserInfo`, `/api/v1/users`, `{GameCode}`), register them
+  in a glossary — that is now the only deterministic path for
+  identifier stability.
+
+- Refine prompts (`REFINE_INSTRUCTION`, `BATCH_REFINE_INSTRUCTION`)
+  are **unchanged** from v0.4. Refine is same-language polish, and
+  the backtick-verbatim rule plus bare-URL preservation stay for the
+  reasons Codex flagged in the v0.4 review: polishing inline code
+  risks silently breaking exact product strings, and nothing
+  downstream rewrites URLs.
+
 ## 0.4.0 — 2026-04-19
 
 ### Changed

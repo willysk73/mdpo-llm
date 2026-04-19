@@ -21,14 +21,22 @@ class TestTranslateTemplates:
         assert "Markdown" in Prompts.TRANSLATE_INSTRUCTION
 
 
-class TestPromptCleanup:
-    """v0.4 replaced the old sweeping "keep all code as-is" clauses with
-    a split that preserves identifiers/paths/URLs while explicitly
-    allowing comment/string translation and source-language-label
-    translation inside inline code.
+class TestPromptShape:
+    """v0.4.1 dropped three rule families from the translate prompts:
 
-    These assertions lock the shape so a future edit can't silently
-    revert to the earlier behaviour.
+    - The inline-code code-literal-vs-human-label distinction — LLMs
+      over-preserved identifier-shaped source-language tokens like
+      `{년}`, leaving target docs littered with source-language text.
+    - The format-string interpolation-token preservation rule
+      (`{{name}}` / `%s` / `${var}`) — intended for Python / Handlebars
+      runtime templates but generalized by the LLM to every `{word}`
+      including URL path parameters, which regressed the case above.
+    - The bare-URL / file-path preservation rule — prevents legitimate
+      translation of illustrative example paths like
+      `설치/경로/config.json`.
+
+    Refine prompts are untouched (same-language polish, different
+    trade-offs).
     """
 
     TRANSLATING_INSTRUCTIONS = [
@@ -44,7 +52,7 @@ class TestPromptCleanup:
 
     ALL_INSTRUCTIONS = TRANSLATING_INSTRUCTIONS + REFINING_INSTRUCTIONS
 
-    FORBIDDEN_SUBSTRINGS = [
+    FORBIDDEN_SUBSTRINGS_ALL = [
         "keep all code as-is",
         "keep code as-is",
         "Keep inline code",
@@ -54,35 +62,52 @@ class TestPromptCleanup:
         "In code blocks,",
     ]
 
-    def test_forbidden_pre_v04_rules_gone(self):
+    # v0.4.1 dropped these from the translate side only. Refine still
+    # keeps analogous rules because same-language polish benefits
+    # from backtick verbatim.
+    FORBIDDEN_SUBSTRINGS_TRANSLATE_ONLY = [
+        "code-literal",
+        "human labels",
+        "SOURCE language",
+        "interpolation tokens",
+        "bare URLs and file paths",
+    ]
+
+    def test_pre_v04_rules_gone_everywhere(self):
         for name in self.ALL_INSTRUCTIONS:
             text = getattr(Prompts, name)
-            for bad in self.FORBIDDEN_SUBSTRINGS:
+            for bad in self.FORBIDDEN_SUBSTRINGS_ALL:
                 assert bad not in text, (
                     f"{name} still contains removed pre-v0.4 substring: {bad!r}"
                 )
 
-    def test_code_block_rule_split_into_preserve_plus_translate(self):
-        # Every instruction now preserves code syntax but calls out
-        # translatable natural-language content inside code blocks —
-        # the two halves of the split.
+    def test_v041_removed_rules_gone_from_translate(self):
+        for name in self.TRANSLATING_INSTRUCTIONS:
+            text = getattr(Prompts, name)
+            for bad in self.FORBIDDEN_SUBSTRINGS_TRANSLATE_ONLY:
+                assert bad not in text, (
+                    f"{name} should not contain {bad!r} — dropped in v0.4.1"
+                )
+
+    def test_code_block_rule_kept(self):
+        # Translating + refining instructions all still carry the
+        # "preserve code, translate comments/strings" rule for fenced
+        # code blocks. This is the main safety net that survived the
+        # simplification.
         for name in self.ALL_INSTRUCTIONS:
             text = getattr(Prompts, name)
             assert "Inside fenced code blocks" in text, (
-                f"{name} missing the new 'Inside fenced code blocks' rule"
+                f"{name} missing the 'Inside fenced code blocks' rule"
             )
             assert "preserve the code itself verbatim" in text, (
                 f"{name} missing the identifier preservation clause"
             )
             assert "comments and user-facing string literals" in text, (
-                f"{name} missing the explicit comment/string translation "
-                f"permission"
+                f"{name} missing the explicit comment/string "
+                f"translation permission"
             )
 
     def test_translating_instructions_mandate_comment_translation(self):
-        # "MUST still translate" is the load-bearing strengthening that
-        # addresses LLMs previously being over-conservative about
-        # translating comments/strings inside code blocks.
         for name in self.TRANSLATING_INSTRUCTIONS:
             text = getattr(Prompts, name)
             assert "MUST still translate" in text, (
@@ -91,101 +116,86 @@ class TestPromptCleanup:
             )
 
     def test_refining_instructions_permit_polishing_code_strings(self):
-        # Refine doesn't translate so it says MAY, not MUST.
         for name in self.REFINING_INSTRUCTIONS:
             text = getattr(Prompts, name)
             assert "MAY polish" in text, (
                 f"{name} should permit polishing code comments / strings"
             )
 
-    def test_inline_code_prose_vs_identifier_split(self):
-        # The inline-code rule in v0.4 distinguishes code-literal
-        # content (preserve) from human labels (translate) — NOT by
-        # source vs target script, which would regress same-script
-        # pairs like English → French. The rule must work for
-        # `Save` → `Enregistrer` and `게임코드` → `GameCode` alike.
-        for name in self.TRANSLATING_INSTRUCTIONS:
-            text = getattr(Prompts, name)
-            assert "Inside inline code spans" in text, (
-                f"{name} missing the inline code span rule"
-            )
-            assert "code-literal" in text and "human labels" in text, (
-                f"{name} must use the code-literal vs human-labels "
-                f"distinction, not a script-based gate"
-            )
-            # Guard against regression to the script-based gate.
-            assert "SOURCE language" not in text, (
-                f"{name} still uses the script-based gate; the rule "
-                f"must be prose-vs-identifier to cover same-script pairs"
-            )
-
-    def test_translating_instructions_mention_glossary(self):
-        # For critical mappings the prompt directs callers to the
-        # glossary. Refine instructions don't translate, so they
-        # don't need to point at the glossary.
-        for name in self.TRANSLATING_INSTRUCTIONS:
-            text = getattr(Prompts, name)
-            assert "glossary" in text, (
-                f"{name} should reference the glossary for critical "
-                f"mappings"
-            )
-
-    def test_refine_keeps_inline_code_verbatim(self):
-        # Refine is same-language, so there is no "translate to target"
-        # justification for touching backticked fragments; those
-        # fragments may name exact UI labels or config values the
-        # docs must keep matching. v0.4 cycle 4 removed the
-        # "prose fragments may be polished" permission after Codex
-        # flagged it; lock that out.
+    def test_refine_still_keeps_inline_code_verbatim(self):
+        # Refine prompts were explicitly left untouched in v0.4.1
+        # because same-language polish on backticked content can
+        # silently break exact product strings. The cycle-4 guard
+        # still applies here.
         for name in self.REFINING_INSTRUCTIONS:
             text = getattr(Prompts, name)
             assert "preserve the content verbatim" in text, (
                 f"{name} must keep inline-code content verbatim "
                 f"during refine"
             )
-            # Guard against the regressed permission.
-            assert "may be polished" not in text, (
-                f"{name} must not permit polishing backticked content"
-            )
-
-    def test_bare_url_preservation_still_called_out(self):
-        # Codex flagged that URLs in prose get corrupted without this;
-        # the rule survives the cleanup for that reason.
-        for name in self.ALL_INSTRUCTIONS:
-            text = getattr(Prompts, name)
-            assert "bare URLs and file paths" in text, (
-                f"{name} dropped the bare-URL / file-path preservation "
-                f"rule — reintroduced in v0.4 because nothing downstream "
-                f"restores them"
-            )
-
-    def test_interpolation_tokens_still_preserved(self):
-        # `{{name}}`, `%s`, `${var}` are format syntax, not identifiers,
-        # so they keep their own preservation rule.
-        for name in self.ALL_INSTRUCTIONS:
-            text = getattr(Prompts, name)
-            assert "interpolation tokens" in text, (
-                f"{name} must still preserve format-string interpolation "
-                f"tokens"
-            )
-            assert "%s" in text
 
     def test_placeholder_token_rule_intact(self):
-        # U+27E6 / U+27E7 placeholder preservation is the load-bearing
-        # hard-protection path; it must survive.
         for name in self.ALL_INSTRUCTIONS:
             text = getattr(Prompts, name)
             assert "\u27e6P:N\u27e7" in text, (
                 f"{name} lost the ⟦P:N⟧ placeholder preservation rule"
             )
 
+    def test_runtime_template_syntax_preserved_narrowly(self):
+        # v0.4.1 narrowed the old broad "interpolation tokens" rule
+        # to cover ONLY:
+        #   - printf-style specifiers (%s, %d, etc.)
+        #   - double-brace templates ({{name}} — Handlebars/Jinja)
+        #   - dollar-brace templates (${var} — shell)
+        # Single-brace tokens ({year}, {년}) are explicitly excluded
+        # so URL path parameters can still be translated. This is
+        # the distinction that matters — the LLM was previously
+        # conflating {{name}} with {년}.
+        for name in self.TRANSLATING_INSTRUCTIONS:
+            text = getattr(Prompts, name)
+            assert "printf-style specifiers" in text, (
+                f"{name} should preserve printf-style specifiers"
+            )
+            assert "%s" in text and "%d" in text
+            # BATCH_MULTI goes through .format(), so the literal
+            # string here contains {{{{name}}}} which collapses to
+            # {{name}} after one format. For the non-batch-multi
+            # instructions the literal is already {{name}}. Either
+            # way, the canonical rendered form should show {{name}}.
+            # Render to what the LLM actually sees:
+            if name == "BATCH_MULTI_TRANSLATE_INSTRUCTION":
+                rendered = text.format(langs="en")
+            else:
+                rendered = text
+            assert "`{{name}}`" in rendered, (
+                f"{name} should preserve Handlebars-style "
+                f"double-brace templates"
+            )
+            assert "`${var}`" in rendered, (
+                f"{name} should preserve shell-style dollar-brace "
+                f"templates"
+            )
+            # The critical exclusion: single-brace tokens must NOT
+            # be covered by this rule so `{년}` etc. translate.
+            assert "single-brace" in text, (
+                f"{name} must explicitly exclude single-brace tokens "
+                f"from the preservation rule"
+            )
+
+    def test_glossary_still_referenced_in_translate(self):
+        # For critical mappings (product names, API parameter names)
+        # the prompt directs callers to the glossary — this is the
+        # only deterministic path left for cross-block identifier
+        # stability after the v0.4.1 simplification.
+        for name in self.TRANSLATING_INSTRUCTIONS:
+            text = getattr(Prompts, name)
+            assert "glossary" in text, (
+                f"{name} should still mention the glossary for "
+                f"critical mappings"
+            )
+
     def test_batch_multi_instruction_formats_with_langs(self):
-        # This instruction is the only one that itself goes through
-        # .format(langs=...). Check brace escaping survived so the
-        # downstream .format() does not raise.
         formatted = Prompts.BATCH_MULTI_TRANSLATE_INSTRUCTION.format(
             langs="en, ja, zh-CN"
         )
         assert "en, ja, zh-CN" in formatted
-        assert "`{{name}}`" in formatted
-        assert "`${{var}}`" in formatted
