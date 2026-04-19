@@ -50,6 +50,13 @@ GlossaryMode = Literal["instruction", "placeholder"]
 Mode = Literal["translate", "refine"]
 
 
+# Sentinel used by ``_current_glossary`` / ``_current_registry`` to tell
+# "TLS has not been set for this call" apart from a legitimate ``None``
+# glossary (meaning: an explicit per-file override of "no glossary").
+# Kept at module scope so identity checks work across all instances.
+_TLS_UNSET = object()
+
+
 _INPLACE_DEPRECATION_MESSAGE = (
     "`inplace=True` is deprecated and will be removed in v0.5. "
     "Use `mode='refine'` with a separate `refined_path` to produce a "
@@ -362,6 +369,25 @@ class MarkdownProcessor:
         # worker's accumulator to ``process_document`` without changing that
         # method's public signature (which existing tests monkey-patch).
         self._tls = threading.local()
+        # Per-directory glossary cascade caches (T-11). Populated on the
+        # main thread by ``process_directory`` before workers fan out;
+        # workers only read, so no lock is required.
+        self._glossary_json_cache: Dict[Path, Optional[Dict[str, Any]]] = {}
+        # Keyed by ``(source_dir_resolved, file_dir_resolved)`` so the
+        # same processor instance reused across ``process_directory``
+        # calls with different roots never returns a merge computed for
+        # a prior root — the parent walk stops at ``source_dir``, so
+        # the merged chain depends on both the leaf directory AND the
+        # tree root.  Using ``file_dir`` alone would let a first run
+        # under ``/docs`` bake ``/docs/glossary.json`` into the cache
+        # for ``/docs/subtree``, which a subsequent call treating
+        # ``/docs/subtree`` as the NEW root should not inherit.
+        self._glossary_dir_chain_cache: Dict[
+            Tuple[Path, Path], Dict[str, Any]
+        ] = {}
+        self._glossary_registry_cache: Dict[
+            Any, PlaceholderRegistry
+        ] = {}
 
     # ----- progress hook -----
 
@@ -412,6 +438,13 @@ class MarkdownProcessor:
         if glossary_path:
             raw = json.loads(Path(glossary_path).read_text(encoding="utf-8"))
             for term, value in raw.items():
+                # ``__remove__`` is the per-directory cascade's
+                # unset-parent sentinel (T-11).  Dropping it here means
+                # a glossary file authored for the cascade can still be
+                # passed to a single-file run without injecting the
+                # literal string as a replacement.
+                if value == "__remove__":
+                    continue
                 if value is None:
                     resolved[term] = None
                 elif isinstance(value, str):
@@ -420,7 +453,11 @@ class MarkdownProcessor:
                     resolved[term] = value.get(self.target_lang)
 
         if glossary:
-            resolved.update(glossary)
+            for term, value in glossary.items():
+                if value == "__remove__":
+                    resolved.pop(term, None)
+                    continue
+                resolved[term] = value
 
         return resolved or None
 
@@ -441,6 +478,12 @@ class MarkdownProcessor:
         resolved: Dict[str, Optional[str]] = {}
         if self._glossary_file is not None:
             for term, value in self._glossary_file.items():
+                # Skip the cascade's unset-parent sentinel (T-11) so it
+                # never reaches the LLM as a literal replacement in a
+                # multi-target ``process_document_multi`` call that
+                # reuses a glossary authored for the cascade.
+                if value == "__remove__":
+                    continue
                 if value is None:
                     resolved[term] = None
                 elif isinstance(value, str):
@@ -448,7 +491,11 @@ class MarkdownProcessor:
                 elif isinstance(value, dict):
                     resolved[term] = value.get(target_lang)
         if self._glossary_inline:
-            resolved.update(self._glossary_inline)
+            for term, value in self._glossary_inline.items():
+                if value == "__remove__":
+                    resolved.pop(term, None)
+                    continue
+                resolved[term] = value
         return resolved or None
 
     def _format_glossary_for_lang(
@@ -474,10 +521,11 @@ class MarkdownProcessor:
         # tokens in the user message, so the instruction-mode block is
         # redundant and would leak target-language terms that the model
         # might echo outside the protected spans.
-        if not self._glossary or self.glossary_mode != "instruction":
+        glossary = self._current_glossary()
+        if not glossary or self.glossary_mode != "instruction":
             return None
 
-        relevant = {k: v for k, v in self._glossary.items() if k in source_text}
+        relevant = {k: v for k, v in glossary.items() if k in source_text}
         if not relevant:
             return None
 
@@ -488,6 +536,271 @@ class MarkdownProcessor:
             else:
                 lines.append(f'- "{term}" \u2192 "{translation}"')
         return "Glossary (use these exact forms, do not alter):\n" + "\n".join(lines)
+
+    # ----- per-directory glossary cascade (T-11) -----
+
+    @staticmethod
+    def _safe_resolve(path: Path) -> Path:
+        """``Path.resolve(strict=False)`` with an ``OSError`` fallback.
+
+        Matches the resolution strategy used elsewhere in this module so
+        cache keys and existence probes line up byte-for-byte.
+        """
+        try:
+            return path.resolve(strict=False)
+        except OSError:
+            return path.absolute()
+
+    def _load_glossary_json_raw(
+        self, path: Path
+    ) -> Optional[Dict[str, Any]]:
+        """Load a ``glossary.json`` file (raw, pre-locale-resolution).
+
+        Returns ``None`` for missing, unreadable, non-JSON, or non-object
+        files.  A malformed per-directory glossary MUST NOT abort a
+        directory run — the cascade silently skips it and emits a
+        warning so operators can spot the typo without losing the whole
+        batch.  Results are cached per resolved path so sibling files in
+        the same tree don't re-read the same ``glossary.json`` N times.
+        """
+        resolved = self._safe_resolve(path)
+        if resolved in self._glossary_json_cache:
+            return self._glossary_json_cache[resolved]
+        raw: Optional[Dict[str, Any]] = None
+        try:
+            if resolved.is_file():
+                text = resolved.read_text(encoding="utf-8")
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    raw = parsed
+                else:
+                    logger.warning(
+                        "glossary.json at %s is not a JSON object; "
+                        "ignored.",
+                        resolved,
+                    )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "failed to read glossary.json at %s: %s; ignored.",
+                resolved,
+                exc,
+            )
+            raw = None
+        self._glossary_json_cache[resolved] = raw
+        return raw
+
+    @staticmethod
+    def _apply_cascade_level(
+        merged: Dict[str, Any], level: Dict[str, Any]
+    ) -> None:
+        """Merge a single raw cascade level into ``merged`` in place.
+
+        ``__remove__`` unsets an inherited term (child opts out of the
+        parent's mapping so the LLM translates the term freely).  When
+        both parent and child values are per-locale dicts, the merge is
+        performed at the locale-key level so languages the child did
+        NOT mention inherit from the parent — otherwise a child dict
+        that only covers ``{"ko": ...}`` would silently drop the
+        parent's ``ja`` / ``zh`` entries for runs targeting those
+        locales.  Any other value combination (``None`` / string /
+        mixed dict+scalar) overwrites wholesale per the parent → child
+        iteration rule.
+        """
+        for term, value in level.items():
+            if value == "__remove__":
+                merged.pop(term, None)
+                continue
+            existing = merged.get(term)
+            if isinstance(existing, dict) and isinstance(value, dict):
+                # Per-locale merge: child keys win per-key, missing
+                # child keys inherit the parent's locale value.
+                merged_dict: Dict[str, Any] = dict(existing)
+                merged_dict.update(value)
+                merged[term] = merged_dict
+            else:
+                merged[term] = value
+
+    def _resolve_dir_chain_raw(
+        self, file_dir: Path, source_dir_resolved: Path
+    ) -> Dict[str, Any]:
+        """Merged raw chain from ``source_dir`` down to ``file_dir`` inclusive.
+
+        Returned dict is in raw form (values may be ``None``, string, or
+        per-locale dict).  Cached per resolved directory so a deep tree
+        with many sibling files resolves each ancestor's
+        ``glossary.json`` exactly once — the recursion reuses the
+        parent's cached merge and only processes the current directory's
+        own ``glossary.json``.
+        """
+        file_dir_resolved = self._safe_resolve(file_dir)
+        cache_key = (source_dir_resolved, file_dir_resolved)
+        cached = self._glossary_dir_chain_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        # A file below the tree root shouldn't pull glossaries from
+        # OUTSIDE ``source_dir`` — that would let an unrelated
+        # filesystem neighbour of the run inject terms into every
+        # translated file, which is surprising at best and a security
+        # smell at worst.
+        try:
+            file_dir_resolved.relative_to(source_dir_resolved)
+        except ValueError:
+            self._glossary_dir_chain_cache[cache_key] = {}
+            return {}
+        if file_dir_resolved == source_dir_resolved:
+            parent_chain: Dict[str, Any] = {}
+        else:
+            parent = file_dir_resolved.parent
+            # Defensive: ``parent == file_dir_resolved`` only when
+            # ``file_dir_resolved`` is a filesystem root (``/`` or
+            # ``C:\``) that lies inside the tree, which shouldn't
+            # happen for normal source_dirs but guards against
+            # pathological inputs.
+            if parent == file_dir_resolved:
+                parent_chain = {}
+            else:
+                parent_chain = self._resolve_dir_chain_raw(
+                    parent, source_dir_resolved
+                )
+        merged: Dict[str, Any] = dict(parent_chain)
+        own_raw = self._load_glossary_json_raw(
+            file_dir_resolved / "glossary.json"
+        )
+        if own_raw:
+            self._apply_cascade_level(merged, own_raw)
+        self._glossary_dir_chain_cache[cache_key] = merged
+        return merged
+
+    @staticmethod
+    def _resolve_raw_for_lang(
+        raw: Dict[str, Any], lang: str
+    ) -> Dict[str, Optional[str]]:
+        """Collapse a raw merged chain to a ``{term: str | None}`` mapping.
+
+        ``None`` and string values are passed through; per-locale dicts
+        are looked up for ``lang``.  Any other value type is silently
+        dropped — mirrors the tolerance already applied by
+        :meth:`_resolve_glossary`.
+        """
+        resolved: Dict[str, Optional[str]] = {}
+        for term, value in raw.items():
+            if value is None:
+                resolved[term] = None
+            elif isinstance(value, str):
+                resolved[term] = value
+            elif isinstance(value, dict):
+                resolved[term] = value.get(lang)
+        return resolved
+
+    def _effective_glossary_for_file(
+        self, source_file: Path, source_dir: Path
+    ) -> Tuple[Optional[Dict[str, Optional[str]]], List[Path]]:
+        """Resolve the per-file cascade plus cwd / constructor override.
+
+        Returns ``(resolved_glossary, chain_paths)``:
+
+        - ``resolved_glossary`` is locale-collapsed (``target_lang``
+          applied to per-locale entries); ``None`` when the chain
+          yielded no terms.
+        - ``chain_paths`` lists every ``glossary.json`` and override
+          source actually applied, in parent → child order.  Consumers
+          log this under ``-v`` so operators can reproduce the merge
+          and debug surprising substitutions.
+        """
+        source_dir_resolved = self._safe_resolve(source_dir)
+        file_dir = self._safe_resolve(source_file.parent)
+        tree_chain = self._resolve_dir_chain_raw(file_dir, source_dir_resolved)
+        merged: Dict[str, Any] = dict(tree_chain)
+        chain_paths: List[Path] = []
+
+        # Build the debug chain of on-disk ``glossary.json`` files for
+        # the tree walk.  Iterate root-down so output matches the
+        # parent → child merge order.
+        visited_tree_dirs: set = set()
+        try:
+            rel = file_dir.relative_to(source_dir_resolved)
+            walk = [source_dir_resolved]
+            current = source_dir_resolved
+            for part in rel.parts:
+                current = current / part
+                walk.append(current)
+            for d in walk:
+                visited_tree_dirs.add(self._safe_resolve(d))
+                candidate = d / "glossary.json"
+                resolved_candidate = self._safe_resolve(candidate)
+                if resolved_candidate in self._glossary_json_cache and (
+                    self._glossary_json_cache[resolved_candidate] is not None
+                ):
+                    chain_paths.append(resolved_candidate)
+        except ValueError:
+            # file_dir sits outside source_dir (shouldn't normally
+            # happen — process_directory globs under source_dir).  The
+            # tree_chain dict is empty in that case; skip debug walk.
+            pass
+
+        # cwd/glossary.json — only applied if cwd is NOT already in the
+        # in-tree chain (otherwise we'd double-apply).  Keeps the
+        # "run from tree root" and "run from an unrelated dir" cases
+        # consistent: the operator sees the same effective cascade
+        # regardless of where the command was launched, as long as the
+        # cwd glossary doesn't duplicate a tree-level one.
+        cwd_resolved = self._safe_resolve(Path.cwd())
+        if cwd_resolved not in visited_tree_dirs:
+            cwd_raw = self._load_glossary_json_raw(
+                cwd_resolved / "glossary.json"
+            )
+            if cwd_raw:
+                self._apply_cascade_level(merged, cwd_raw)
+                chain_paths.append(
+                    self._safe_resolve(cwd_resolved / "glossary.json")
+                )
+
+        # Constructor-time override (the CLI's ``--glossary PATH`` lands
+        # here): topmost / closest level per brief, applied AFTER the
+        # cwd layer so it wins on conflict.  Inline dict (programmatic
+        # ``glossary=`` kwarg) wins over the file, matching today's
+        # :meth:`_resolve_glossary` precedence.
+        override_applied = False
+        if self._glossary_file is not None:
+            self._apply_cascade_level(merged, self._glossary_file)
+            override_applied = True
+        if self._glossary_inline is not None:
+            self._apply_cascade_level(merged, self._glossary_inline)
+            override_applied = True
+        if override_applied:
+            # Synthetic path entry so the debug log surfaces that the
+            # constructor-level override was in play (the actual file
+            # path may not exist for the inline dict case).
+            chain_paths.append(Path("<constructor-override>"))
+
+        if not merged:
+            return None, chain_paths
+        resolved = self._resolve_raw_for_lang(merged, self.target_lang)
+        return (resolved or None), chain_paths
+
+    def _registry_for_glossary(
+        self, glossary: Optional[Dict[str, Optional[str]]]
+    ) -> PlaceholderRegistry:
+        """Return a cached placeholder registry for ``glossary``.
+
+        Keyed by the frozen ``(term, value)`` items so files with
+        identical effective glossaries (the common case when only a
+        few subdirectories override) share one compiled registry.
+        """
+        if not glossary or self.glossary_mode != "placeholder":
+            key: Any = None
+        else:
+            key = frozenset(glossary.items())
+        cached = self._glossary_registry_cache.get(key)
+        if cached is not None:
+            return cached
+        registry = self._build_effective_registry(
+            self._placeholders,
+            glossary=glossary,
+            update_builtin_overrides=False,
+        )
+        self._glossary_registry_cache[key] = registry
+        return registry
 
     def _sibling_refine_processor(self, target_lang: str) -> "MarkdownProcessor":
         """Build a refine-mode clone sharing this processor's config.
@@ -643,12 +956,16 @@ class MarkdownProcessor:
         the mapping may be empty when no pattern matched, so callers can
         rely on ``bool(mapping)`` to tell an active encoding from a no-op.
         """
-        encoded, mapping = self._effective_registry.encode(text)
+        encoded, mapping = self._current_registry().encode(text)
         mapping = self._apply_glossary_replacements(mapping)
         return encoded, mapping
 
     def _build_effective_registry(
-        self, user_registry: Optional[PlaceholderRegistry]
+        self,
+        user_registry: Optional[PlaceholderRegistry],
+        glossary: Optional[Dict[str, Optional[str]]] = None,
+        *,
+        update_builtin_overrides: bool = True,
     ) -> PlaceholderRegistry:
         """Compose the registry the processor actually uses on every call.
 
@@ -727,14 +1044,24 @@ class MarkdownProcessor:
         # the SAME matching behaviour the user configured for encoding
         # — a stricter predicate narrows the check's match set too,
         # instead of falling back to the default and flagging spans
-        # the override never tokenized.
-        self._builtin_overrides = suppress_default
-        need_glossary = bool(self._glossary) and self.glossary_mode == "placeholder"
+        # the override never tokenized.  Per-file registry rebuilds
+        # (T-11) skip this update because ``suppress_default`` depends
+        # only on ``user_registry`` (which is constant after init); the
+        # init-time value is the authoritative one and we avoid a
+        # redundant write from worker-dispatch paths for clarity.
+        if update_builtin_overrides:
+            self._builtin_overrides = suppress_default
+        effective_glossary = (
+            glossary if glossary is not None else self._glossary
+        )
+        need_glossary = (
+            bool(effective_glossary) and self.glossary_mode == "placeholder"
+        )
         if need_glossary:
             # Sort longest-first so "pull request" gets registered before
             # "pull"; the encode overlap resolver also prefers the longer
             # match on tie, but keeping insertion order sorted is defensive.
-            terms = sorted(self._glossary.keys(), key=len, reverse=True)
+            terms = sorted(effective_glossary.keys(), key=len, reverse=True)
             for term in terms:
                 pattern = self._compile_glossary_pattern(term)
                 if pattern is None:
@@ -761,6 +1088,35 @@ class MarkdownProcessor:
             return None
         return re.compile(rf"\b{re.escape(term)}\b")
 
+    def _current_glossary(self) -> Optional[Dict[str, Optional[str]]]:
+        """Return the active glossary for the current thread / call.
+
+        ``process_directory`` installs a per-file glossary on
+        ``self._tls.per_file_glossary`` before each worker runs
+        ``process_document`` (T-11: per-directory cascade).  When that
+        slot is unset the processor falls back to the constructor-time
+        ``self._glossary`` — preserving single-file / library-call
+        semantics unchanged.
+        """
+        val = getattr(self._tls, "per_file_glossary", _TLS_UNSET)
+        if val is _TLS_UNSET:
+            return self._glossary
+        return val
+
+    def _current_registry(self) -> PlaceholderRegistry:
+        """Return the active placeholder registry for the current call.
+
+        Mirrors :meth:`_current_glossary`: when
+        ``process_directory`` has installed a per-file registry on
+        ``self._tls.per_file_registry`` (its patterns depend on the
+        per-file glossary), use it; otherwise fall back to the
+        constructor-time registry.
+        """
+        val = getattr(self._tls, "per_file_registry", _TLS_UNSET)
+        if val is _TLS_UNSET:
+            return self._effective_registry
+        return val
+
     def _apply_glossary_replacements(
         self, mapping: PlaceholderMap
     ) -> PlaceholderMap:
@@ -768,18 +1124,19 @@ class MarkdownProcessor:
 
         Pattern names of the form ``glossary:<term>`` are rewritten so
         :meth:`PlaceholderRegistry.decode` restores the token to the
-        target-language form (``self._glossary[term]``) rather than the
-        original source span.  A ``None`` glossary value means "do not
-        translate" — the replacement falls back to the matched source
-        text so decode emits the term verbatim.
+        target-language form (the active glossary's value for the term)
+        rather than the original source span.  A ``None`` glossary
+        value means "do not translate" — the replacement falls back to
+        the matched source text so decode emits the term verbatim.
 
         Non-glossary entries (user-registered patterns, pre-existing
         literal tokens) are returned untouched so their identity-decode
         behaviour is preserved.
         """
+        glossary = self._current_glossary()
         if (
             not mapping.items
-            or not self._glossary
+            or not glossary
             or self.glossary_mode != "placeholder"
         ):
             return mapping
@@ -789,7 +1146,7 @@ class MarkdownProcessor:
             if not p.pattern_name.startswith("glossary:"):
                 new_items.append(p)
                 continue
-            target = self._glossary.get(p.original)
+            target = glossary.get(p.original)
             replacement = target if target is not None else p.original
             new_items.append(
                 Placeholder(
@@ -1931,6 +2288,58 @@ class MarkdownProcessor:
         # produced.
         successful_source_posix: set = set()
 
+        # T-11: reset the cascade caches BEFORE pre-computing this
+        # run's per-file glossaries.  Otherwise a processor reused
+        # across multiple ``process_directory`` calls would keep
+        # serving stale content when any ``glossary.json`` was edited
+        # between runs — the JSON cache keys on path content, not
+        # mtime, and the dir-chain cache keys on ``(source_dir,
+        # file_dir)``, so neither spots a mid-run edit.  Clearing all
+        # three here scopes the caches to a single directory
+        # invocation, which is the longest span over which we can
+        # soundly assume the on-disk glossaries are stable.  Registry
+        # cache is content-addressed (frozen-set of resolved items) so
+        # clearing it is correctness-neutral but keeps behaviour
+        # symmetric across runs.
+        self._glossary_json_cache.clear()
+        self._glossary_dir_chain_cache.clear()
+        self._glossary_registry_cache.clear()
+
+        # T-11: pre-compute the per-file glossary cascade ON THE MAIN
+        # THREAD so workers only read from the caches.  Refine mode
+        # disables glossary entirely (see __init__), so skip the cascade
+        # walk there — leaving ``per_file_glossary`` empty means workers
+        # don't install a TLS override and fall through to
+        # ``self._glossary`` (which is ``None`` in refine mode).  One
+        # INFO log per file records the resolved chain so ``-v`` callers
+        # can debug surprising merges without turning on debug-level
+        # instrumentation across the whole run.
+        per_file_glossary: Dict[Path, Optional[Dict[str, Optional[str]]]] = {}
+        per_file_registry: Dict[Path, Optional[PlaceholderRegistry]] = {}
+        if self.mode == "translate":
+            for sf in matched_files:
+                effective, chain_paths = self._effective_glossary_for_file(
+                    sf, source_dir
+                )
+                per_file_glossary[sf] = effective
+                per_file_registry[sf] = self._registry_for_glossary(effective)
+                if logger.isEnabledFor(logging.INFO):
+                    try:
+                        rel = sf.relative_to(source_dir)
+                    except ValueError:
+                        rel = sf
+                    if chain_paths:
+                        logger.info(
+                            "glossary cascade for %s: %s",
+                            rel,
+                            " -> ".join(str(p) for p in chain_paths),
+                        )
+                    else:
+                        logger.info(
+                            "glossary cascade for %s: (empty — no glossary)",
+                            rel,
+                        )
+
         self._emit_progress(
             kind="directory_start",
             path=str(source_dir),
@@ -2001,6 +2410,21 @@ class MarkdownProcessor:
             # afterwards prevents one worker's accumulator leaking into the
             # next task that lands on this thread.
             self._tls.usage = u
+            # T-11: install the per-file glossary + registry on TLS so
+            # ``_current_glossary`` / ``_current_registry`` see the
+            # cascaded mapping for this file.  Translate-mode only; in
+            # refine mode the processor disables glossaries entirely and
+            # leaving TLS unset preserves that behaviour.  Slots are
+            # ``delattr``-cleared in the ``finally`` so sibling workers
+            # landing on the same thread never inherit stale state —
+            # setting to ``None`` would instead signal "explicit empty
+            # glossary for this file", which is a valid but distinct
+            # override.
+            per_file_glossary_installed = False
+            if self.mode == "translate" and source_file in per_file_glossary:
+                self._tls.per_file_glossary = per_file_glossary[source_file]
+                self._tls.per_file_registry = per_file_registry[source_file]
+                per_file_glossary_installed = True
             self._emit_progress(kind="file_start", path=str(source_file))
             try:
                 # Only forward refine-specific kwargs when a refine pathway
@@ -2029,6 +2453,10 @@ class MarkdownProcessor:
                 return None, u, exc
             finally:
                 self._tls.usage = None
+                if per_file_glossary_installed:
+                    for attr in ("per_file_glossary", "per_file_registry"):
+                        if hasattr(self._tls, attr):
+                            delattr(self._tls, attr)
 
         try:
             with concurrent.futures.ThreadPoolExecutor(
@@ -2541,6 +2969,18 @@ class MarkdownProcessor:
         if not remaining:
             return
 
+        # T-11: intra-file batch workers are spawned on fresh threads
+        # whose ``self._tls`` does NOT inherit from this caller's TLS.
+        # Snapshot the per-file glossary / registry installed by
+        # ``process_directory._process_one`` so each worker can plant
+        # them on its own thread before ``_translate_group`` reaches
+        # ``_encode_source`` / ``_format_glossary`` — otherwise the
+        # concurrency path falls back to ``self._glossary`` and
+        # silently translates different batches of the same file with
+        # different terminology rules.
+        parent_glossary = getattr(self._tls, "per_file_glossary", _TLS_UNSET)
+        parent_registry = getattr(self._tls, "per_file_registry", _TLS_UNSET)
+
         shared_lock = threading.Lock()
         # Signal used by workers to bail out fast once a peer fails.
         # ``future.cancel()`` alone is racy: a thread may pick up the
@@ -2587,6 +3027,16 @@ class MarkdownProcessor:
             # before iterating the rest).
             if abort_event.is_set():
                 return local_stats
+            # Install the parent thread's per-file glossary / registry
+            # snapshot on this worker's TLS so ``_current_glossary`` /
+            # ``_current_registry`` return the cascaded mapping
+            # computed for the owning source file (T-11).  Clear the
+            # slots in the ``finally`` so the next task landing on this
+            # thread never inherits stale state.
+            glossary_installed = parent_glossary is not _TLS_UNSET
+            if glossary_installed:
+                self._tls.per_file_glossary = parent_glossary
+                self._tls.per_file_registry = parent_registry
             try:
                 self._translate_group(
                     group,
@@ -2609,6 +3059,10 @@ class MarkdownProcessor:
                 raise
             finally:
                 _merge_usage(local_usage)
+                if glossary_installed:
+                    for attr in ("per_file_glossary", "per_file_registry"):
+                        if hasattr(self._tls, attr):
+                            delattr(self._tls, attr)
             return local_stats
 
         with concurrent.futures.ThreadPoolExecutor(
@@ -3730,7 +4184,7 @@ class MarkdownProcessor:
 
     def _collect_glossary_block(self, sources) -> Optional[str]:
         """Union glossary terms matched anywhere in the batch."""
-        if not self._glossary:
+        if not self._current_glossary():
             return None
         joined = "\n".join(sources)
         return self._format_glossary(joined)
@@ -3845,7 +4299,7 @@ class MarkdownProcessor:
                 entry.msgid,
                 processed,
                 target_lang=self.target_lang,
-                glossary=self._glossary,
+                glossary=self._current_glossary(),
                 mode=self.validation,
                 purpose=self.mode,
             )
