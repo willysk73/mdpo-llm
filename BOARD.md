@@ -354,4 +354,72 @@ concurrency.
     be auto-rewritten by this task — that's a separate cross-reference
     problem and scoping it here would invalidate every translated
     doc's internal links.
+
+- id: T-11
+  title: "Per-directory glossary with parent-chain resolution"
+  scope:
+    include:
+      - src/mdpo_llm/processor.py
+      - src/mdpo_llm/__main__.py
+      - tests/test_glossary_cascade.py
+      - README.md
+      - CHANGELOG.md
+    exclude: []
+  status: pending
+  priority: normal
+  depends_on: []
+  brief: .ccx/tasks/T-11.md
+  attempts: 0
+  notes: |
+    Multi-document translation often wants the SAME term handled
+    differently per subtree: `docs/api/` preserves "API" verbatim,
+    `docs/marketing/` lets the LLM translate it naturally. Today the
+    processor pins a single `self._glossary` at __init__ so this is
+    impossible without re-instantiating per file.
+
+    Add per-directory glossary discovery: when `process_directory`
+    encounters a file, walk parents from the file's directory up to
+    the tree root collecting every `glossary.json` it sees, plus
+    cwd's `./glossary.json`, plus the CLI-supplied `--glossary`
+    override. Merge parent → child so CHILD WINS per term, and
+    support a `"__remove__"` sentinel value that unsets a term
+    inherited from a parent (the child then lets the LLM translate
+    it freely). A term absent from a level inherits from its parent;
+    `null` / string values follow existing semantics (do-not-
+    translate / force specific translation).
+
+    Merge rule (parent → child iteration):
+        for level in chain:
+            for term, value in level.items():
+                if value == "__remove__":
+                    result.pop(term, None)
+                else:
+                    result[term] = value
+
+    Per-file resolution MUST cache by directory so the same parent
+    chain isn't re-read once per file in a deep tree. Placeholder
+    mode (now the default) plays nicely with per-file glossaries —
+    the glossary does not appear in the system prompt, so prompt
+    cache hit rate stays stable even when every file has a slightly
+    different effective mapping.
+
+    CLI: no new flag. Auto-detection runs whenever `--glossary` is
+    NOT passed; explicit `--glossary PATH` keeps its current
+    single-file-override semantics (used as the TOPMOST / CLOSEST
+    level, overriding any discovered chain). Emit one INFO log per
+    file under `-v` listing the resolved chain so users can debug
+    cascade behaviour.
+
+    Tests (new `tests/test_glossary_cascade.py`):
+      - walk finds nearest parent glossary.json, merges with ancestors
+      - `__remove__` sentinel unsets inherited term
+      - child overrides parent value for same term
+      - term absent from child inherits from parent
+      - `--glossary` CLI override takes precedence over discovered chain
+      - directory cache avoids re-reading parent files for siblings
+      - empty chain → glossary disabled (existing behavior preserved)
+
+    README: extend `## Glossary` with a `### Per-directory glossary
+    cascade` subsection showing the layout + merge rule + sentinel.
+    CHANGELOG: `### Added` entry under `## Unreleased`.
 ```
