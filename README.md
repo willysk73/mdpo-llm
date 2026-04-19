@@ -250,6 +250,62 @@ LLM's normal translation path. Terms whose first or last character
 isn't a word character (e.g. `.NET`, `C++`) are silently skipped for
 the same reason; use `"instruction"` mode when those matter.
 
+### Per-directory glossary cascade
+
+`translate-dir` (and any `process_directory` call) auto-discovers a
+glossary chain per file so different subtrees can treat the same term
+differently without re-instantiating the processor. For every source
+file, the resolver walks from the tree root down to the file's
+directory, layering each `glossary.json` it finds, then applies
+`./glossary.json` from the current working directory, then the
+`--glossary PATH` override (topmost).
+
+Layout:
+
+```text
+docs/
+├── glossary.json          # root: baseline terminology
+├── api/
+│   ├── glossary.json      # api/: preserve "API" verbatim
+│   └── reference.md
+└── marketing/
+    ├── glossary.json      # marketing/: let the LLM translate "API"
+    └── landing.md
+```
+
+Merge rule (parent → child, **CHILD WINS** per term):
+
+```json
+// docs/glossary.json
+{ "API": "API", "GitHub": null }
+
+// docs/marketing/glossary.json — unset the inherited "API" mapping
+{ "API": "__remove__" }
+```
+
+After merge for `docs/marketing/landing.md`: `{"GitHub": null}` — the
+root's `GitHub` do-not-translate entry is inherited, but `API` has
+been removed so the LLM is free to translate it contextually.
+
+A term missing from a child level **inherits** from its parent; a
+`null` or string value follows the existing semantics
+(do-not-translate / force a specific translation); a `"__remove__"`
+sentinel value unsets the inherited term. Per-locale dicts
+(`{"ko": "풀 리퀘스트", "ja": "プルリクエスト"}`) are resolved at each
+level before merging.
+
+The CLI needs no new flag. Auto-detection runs whenever `--glossary`
+is not passed; supplying `--glossary PATH` keeps its single-file
+override semantics but sits on top of the discovered chain, so one
+flag can still force a term for every file regardless of the
+subtree. Under `-v` a one-line INFO log per file names every
+`glossary.json` in the resolved chain so a surprising substitution
+can be debugged without rerunning.
+
+Directory-level caching resolves each ancestor's `glossary.json`
+exactly once — sibling files in the same subtree reuse the cached
+merged chain.
+
 ## Refine mode
 
 `mode="refine"` polishes a Markdown document in its **original** language:
