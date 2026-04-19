@@ -365,7 +365,7 @@ concurrency.
       - README.md
       - CHANGELOG.md
     exclude: []
-  status: assigned
+  status: merged
   priority: normal
   depends_on: []
   brief: .ccx/tasks/T-11.md
@@ -373,6 +373,8 @@ concurrency.
   worktree: /home/will/Repositories/mdpo-llm-T-11
   branch: ccx/T-11
   started_at: "2026-04-19T02:53:50Z"
+  finished_at: "2026-04-19T03:26:30Z"
+  exit_status: approved
   notes: |
     Multi-document translation often wants the SAME term handled
     differently per subtree: `docs/api/` preserves "API" verbatim,
