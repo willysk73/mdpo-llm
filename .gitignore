@@ -25,5 +25,5 @@ WARP.md
 
 docs/
 
-# ccx supervisor worker logs (supervisor-owned scratch state)
-.ccx/workers/
+# ccx supervisor scratch state
+.ccx/
