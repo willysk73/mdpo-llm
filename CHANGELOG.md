@@ -15,6 +15,24 @@
   regex cannot match.
 
 ### Added
+- **Per-directory glossary cascade (`translate-dir`)**: `process_directory`
+  auto-discovers a per-file glossary chain so different subtrees can
+  treat the same term differently without re-instantiating the
+  processor. For every source file the resolver walks from `source_dir`
+  down to the file's directory, layering each `glossary.json` it finds,
+  then applies `./glossary.json` from the current working directory,
+  then (topmost) the `--glossary PATH` CLI override. A
+  `"__remove__"` sentinel value unsets an inherited term (child opts
+  out of the parent mapping); any other value (`null` / string /
+  per-locale dict) follows existing semantics (do-not-translate /
+  force specific translation / locale-specific form). Results are
+  cached per directory so sibling files reuse the merged parent
+  chain, and per-effective-glossary so the placeholder registry's
+  compiled patterns are shared across files with identical mappings.
+  No new CLI flag — auto-detection runs whenever `--glossary` is not
+  passed; passing `--glossary PATH` keeps its single-file-override
+  semantics and slots in as the topmost cascade level. Under `-v` a
+  one-line INFO log per file lists the resolved chain for debugging.
 - **`translate-dir --translate-paths` (opt-in)**: translate filesystem
   path segments (directory names and markdown file stems) so the target
   tree uses localized filenames. Segments are tracked in a dedicated
