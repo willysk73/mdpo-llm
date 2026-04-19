@@ -93,7 +93,7 @@ def _add_translate_flags(
     parser.add_argument(
         "--glossary-mode",
         choices=["instruction", "placeholder"],
-        default="instruction",
+        default="placeholder",
         help=(
             "How to feed glossary terms to the LLM. 'instruction' "
             "(default) appends a glossary block to the system prompt. "
@@ -991,7 +991,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_multi.add_argument(
         "--glossary-mode",
         choices=["instruction", "placeholder"],
-        default="instruction",
+        default="placeholder",
         help="How to feed glossary terms to the LLM (see 'translate').",
     )
     p_multi.add_argument(

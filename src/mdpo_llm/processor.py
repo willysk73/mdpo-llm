@@ -206,7 +206,7 @@ class MarkdownProcessor:
         enable_prompt_cache: bool = False,
         progress_callback: Optional[ProgressCallback] = None,
         placeholders: Optional[PlaceholderRegistry] = None,
-        glossary_mode: GlossaryMode = "instruction",
+        glossary_mode: GlossaryMode = "placeholder",
         mode: Mode = "translate",
         **litellm_kwargs,
     ):
@@ -279,9 +279,8 @@ class MarkdownProcessor:
                 processed entry stores the refined text in ``msgstr`` and
                 the original source stays authoritative.
             glossary_mode: How the configured glossary is fed to the LLM.
-                ``"instruction"`` (default, v0.4 back-compat) appends a
-                glossary block to the system prompt.  ``"placeholder"``
-                substitutes each matching term with an opaque
+                ``"placeholder"`` (default) substitutes each matching term
+                with an opaque
                 ``\u27e6P:N\u27e7`` token before the call and restores the
                 target-language form (or the original term for
                 do-not-translate entries) afterwards.  Matching uses
@@ -291,7 +290,11 @@ class MarkdownProcessor:
                 false-positive.  Terms whose first or last character isn't
                 a word character (e.g. ``.NET``, ``C++``) are silently
                 skipped because the ``\\b`` anchors would reject them.
-                Ignored when no glossary is configured.
+                Pass ``"instruction"`` to fall back to appending a
+                glossary block to the system prompt; the LLM then sees
+                the raw source text and is asked to preserve / translate
+                each term as instructed.  Ignored when no glossary is
+                configured.
             **litellm_kwargs: Extra keyword arguments forwarded to
                 ``litellm.completion()``.
         """

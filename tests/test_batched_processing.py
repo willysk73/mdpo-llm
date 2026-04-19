@@ -2846,6 +2846,7 @@ class TestMultiTargetProcessing:
             target_lang="ko",
             batch_size=40,
             glossary_path=gloss_path,
+            glossary_mode="instruction",
         )
         p.process_document_multi(
             source,
@@ -2935,6 +2936,7 @@ class TestMultiTargetProcessing:
             target_lang="ko",
             batch_size=40,
             glossary_path=gloss_path,
+            glossary_mode="instruction",
         )
         p.process_document_multi(
             source,
@@ -3242,6 +3244,7 @@ class TestMultiTargetProcessing:
             target_lang="ko",
             batch_size=40,
             glossary_path=gloss_path,
+            glossary_mode="instruction",
             validation="strict",
         )
         result = p.process_document_multi(

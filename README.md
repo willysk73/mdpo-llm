@@ -221,15 +221,16 @@ See [`examples/glossary.json`](examples/glossary.json) for a full example with b
 `glossary_mode` (constructor kwarg, CLI `--glossary-mode`) controls how
 glossary terms reach the model:
 
-- `"instruction"` (default in v0.4, for back-compat): appends a glossary
-  block to the system prompt. The LLM sees the raw source text and is
-  asked to preserve or translate each term as specified.
-- `"placeholder"`: substitutes every glossary term with an opaque
-  `⟦P:N⟧` token **before** the call and restores the target-language
-  form (or the original term for do-not-translate entries)
+- `"placeholder"` (default): substitutes every glossary term with an
+  opaque `⟦P:N⟧` token **before** the call and restores the target-
+  language form (or the original term for do-not-translate entries)
   **after** the call. The model never sees the terms, so it cannot
   translate, renumber, or mangle them — and the round-trip check
   automatically flags any dropped token.
+- `"instruction"`: appends a glossary block to the system prompt. The
+  LLM sees the raw source text and is asked to preserve or translate
+  each term as specified. Use this when your terms contain characters
+  that `"placeholder"` cannot match (see caveats below).
 
 ```python
 processor = MdpoLLM(
@@ -248,8 +249,6 @@ neighbouring text, while a missed match simply falls through to the
 LLM's normal translation path. Terms whose first or last character
 isn't a word character (e.g. `.NET`, `C++`) are silently skipped for
 the same reason; use `"instruction"` mode when those matter.
-
-v0.5 will flip the default to `"placeholder"`.
 
 ## Refine mode
 
