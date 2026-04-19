@@ -1,8 +1,51 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-04-19
 
 ### Changed
+- **Translation prompts split the "code preservation" rule so comments
+  and user-facing string literals inside code blocks are translated
+  by default, and source-language labels inside inline code spans are
+  translated too.** The five instruction blocks (`TRANSLATE_INSTRUCTION`,
+  `BATCH_TRANSLATE_INSTRUCTION`, `REFINE_INSTRUCTION`,
+  `BATCH_MULTI_TRANSLATE_INSTRUCTION`, `BATCH_REFINE_INSTRUCTION`) now
+  tell the model:
+  1. **Inside fenced code blocks:** preserve code syntax, identifiers,
+     function and variable names, module references, API paths, type
+     names. *But you MUST translate comments and user-facing string
+     literals (messages shown to end users) inside those code blocks
+     — by default, not only on demand.* This is the strengthening
+     over pre-v0.4 behaviour: the old rule permitted comment
+     translation but most models skipped it to be safe, so
+     `print("안녕")` stayed in Korean in English builds. It now
+     becomes `print("hello")`.
+  2. **Inside inline code spans:** preserve identifiers, file paths,
+     URLs, shell commands, code-literal content. *Exception: when an
+     inline code span contains prose written in the source language
+     rather than the target-language character set (for example
+     `` `게임코드` `` in a Korean → English translation), translate it
+     naturally — the author used code styling for a human label, not
+     an identifier.* This fixes the most common complaint: target
+     documents still containing source-language text because the
+     author put Korean labels in backticks.
+  3. **For critical identifier mappings** (`getUserInfo`,
+     `/api/v1/users`, product names that must never shift), add a
+     glossary entry with `--glossary-mode placeholder` so the term
+     is hard-protected via sentinel substitution and round-trip
+     verified. This is the only fully-deterministic path for
+     cross-block identifier stability; the prompt on its own is
+     guidance the model can override.
+  4. Bare URLs and file paths outside code contexts are still
+     preserved (reintroduced in v0.4 after an initial sweep removed
+     them — nothing downstream rewrites URLs, so they must stay put
+     unless a glossary entry directs otherwise).
+  5. Anchor IDs (`{#section}`) and the HTML attribute allowlist
+     (`href`, `id`, `class`, …) remain hard-protected in
+     `placeholder.py`, unchanged, so internal links do not break.
+  6. Format-string interpolation tokens (`{{name}}`, `%s`, `${var}`)
+     still have their own preservation rule — they are format
+     syntax, not identifiers, and the glossary cannot replace them.
+
 - **Default `glossary_mode` flipped from `"instruction"` to
   `"placeholder"`** in both the `MdpoLLM` constructor and the
   `translate` / `translate-multi` CLI commands. Placeholder mode
