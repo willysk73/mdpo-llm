@@ -101,10 +101,19 @@ class TestCallLLM:
 
 
 class TestGlossary:
+    """Glossary resolution + system-prompt emission in `instruction` mode.
+
+    The default mode is ``placeholder`` (v0.4+); these tests target the
+    legacy ``instruction`` path where glossary terms appear as a block in
+    the system prompt.  Every test passes ``glossary_mode="instruction"``
+    explicitly so the assertions stay valid regardless of the default.
+    """
+
     def test_glossary_terms_in_system_message(self):
         proc = MarkdownProcessor(
             model="test-model", target_lang="ko",
             glossary={"GitHub": None, "API": "API"},
+            glossary_mode="instruction",
         )
         messages = proc._build_messages("Check the GitHub API docs.")
         system = messages[0]["content"]
@@ -116,6 +125,7 @@ class TestGlossary:
         proc = MarkdownProcessor(
             model="test-model", target_lang="ko",
             glossary={"GitHub": None, "Kubernetes": None},
+            glossary_mode="instruction",
         )
         messages = proc._build_messages("Hello world")
         system = messages[0]["content"]
@@ -126,6 +136,7 @@ class TestGlossary:
         proc = MarkdownProcessor(
             model="test-model", target_lang="ko",
             glossary={"GitHub": None},
+            glossary_mode="instruction",
         )
         messages = proc._build_messages("Visit GitHub today.")
         system = messages[0]["content"]
@@ -135,6 +146,7 @@ class TestGlossary:
         proc = MarkdownProcessor(
             model="test-model", target_lang="ko",
             glossary={"pull request": "\ud480 \ub9ac\ud018\uc2a4\ud2b8"},
+            glossary_mode="instruction",
         )
         messages = proc._build_messages("Open a pull request.")
         system = messages[0]["content"]
@@ -149,6 +161,7 @@ class TestGlossary:
         proc = MarkdownProcessor(
             model="test-model", target_lang="ko",
             glossary_path=glossary_file,
+            glossary_mode="instruction",
         )
         messages = proc._build_messages("GitHub API")
         system = messages[0]["content"]
@@ -165,12 +178,14 @@ class TestGlossary:
         )
         proc_ko = MarkdownProcessor(
             model="test-model", target_lang="ko", glossary_path=glossary_file,
+            glossary_mode="instruction",
         )
         messages = proc_ko._build_messages("Open a pull request.")
         assert '"\ud480 \ub9ac\ud018\uc2a4\ud2b8"' in messages[0]["content"]
 
         proc_ja = MarkdownProcessor(
             model="test-model", target_lang="ja", glossary_path=glossary_file,
+            glossary_mode="instruction",
         )
         messages = proc_ja._build_messages("Open a pull request.")
         assert '"\u30d7\u30eb\u30ea\u30af\u30a8\u30b9\u30c8"' in messages[0]["content"]
@@ -183,6 +198,7 @@ class TestGlossary:
         )
         proc = MarkdownProcessor(
             model="test-model", target_lang="ko", glossary_path=glossary_file,
+            glossary_mode="instruction",
         )
         # "ko" not in the dict → resolved to None (keep original)
         messages = proc._build_messages("Open a pull request.")
@@ -198,6 +214,7 @@ class TestGlossary:
             model="test-model", target_lang="ko",
             glossary_path=glossary_file,
             glossary={"GitHub": "inline-value"},
+            glossary_mode="instruction",
         )
         messages = proc._build_messages("Visit GitHub.")
         system = messages[0]["content"]

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed
+- **Default `glossary_mode` flipped from `"instruction"` to
+  `"placeholder"`** in both the `MdpoLLM` constructor and the
+  `translate` / `translate-multi` CLI commands. Placeholder mode
+  substitutes each glossary term with an opaque `⟦P:N⟧` token before
+  the LLM call and restores it after, so the model cannot mistranslate
+  or mangle protected terms. Pass `glossary_mode="instruction"`
+  (kwarg) or `--glossary-mode instruction` (CLI) to keep the old
+  prompt-block behaviour — useful for glossary terms that start/end
+  with non-word characters (`.NET`, `C++`) which the placeholder
+  regex cannot match.
+
 ### Added
 - **`translate-dir --translate-paths` (opt-in)**: translate filesystem
   path segments (directory names and markdown file stems) so the target
@@ -283,7 +295,7 @@
   matching `"API"`) is deliberately NOT matched — false-negatives are
   preferred over mid-word false-positives. Terms whose first or last
   character isn't a word character (`.NET`, `C++`) are skipped for the
-  same reason. v0.5 will flip the default to `"placeholder"`.
+  same reason.
 - **`placeholder.py` — `Placeholder.replacement` field**: optional
   override consumed by `PlaceholderRegistry.decode`. When set, decode
   restores the token to this string instead of `original`; the glossary

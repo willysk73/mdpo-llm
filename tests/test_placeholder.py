@@ -623,6 +623,7 @@ def test_sequential_path_glossary_uses_unencoded_source():
         target_lang="ko",
         placeholders=reg,
         glossary={"example.com": None},
+        glossary_mode="instruction",
     )
 
     fake_response = MagicMock()
@@ -645,9 +646,9 @@ def test_sequential_path_glossary_uses_unencoded_source():
 # ---------- glossary placeholder mode ----------
 
 
-def test_glossary_mode_defaults_to_instruction():
-    """Default mode preserves v0.4 back-compat: glossary block in the system
-    prompt, terms untouched in the user message."""
+def test_glossary_mode_defaults_to_placeholder():
+    """Default mode substitutes glossary terms with ⟦P:N⟧ tokens pre-call
+    and never leaks the raw terms into the system or user message."""
     from unittest.mock import MagicMock, patch
 
     from mdpo_llm.processor import MarkdownProcessor
@@ -656,6 +657,44 @@ def test_glossary_mode_defaults_to_instruction():
         model="test-model",
         target_lang="ko",
         glossary={"GitHub": None, "API": "API"},
+    )
+    assert proc.glossary_mode == "placeholder"
+
+    captured = {}
+
+    def _capture(*args, **kwargs):
+        captured["messages"] = kwargs["messages"]
+        resp = MagicMock()
+        resp.choices = [MagicMock(message=MagicMock(content="ok"))]
+        resp.usage = None
+        return resp
+
+    with patch("mdpo_llm.processor.litellm.completion", side_effect=_capture):
+        proc._call_llm("Visit GitHub to read the API docs")
+
+    user = captured["messages"][-1]["content"]
+    system = captured["messages"][0]["content"]
+    assert "GitHub" not in user, (
+        "placeholder mode must substitute terms out of the user message"
+    )
+    assert "\u27e6P:" in user, "placeholder mode must emit ⟦P:N⟧ tokens"
+    assert "Glossary" not in system, (
+        "placeholder mode must NOT append a glossary block to the system prompt"
+    )
+
+
+def test_glossary_mode_instruction_opt_in_restores_prompt_block():
+    """Opt-in `instruction` mode keeps the legacy behaviour: glossary block in
+    the system prompt, raw terms untouched in the user message."""
+    from unittest.mock import MagicMock, patch
+
+    from mdpo_llm.processor import MarkdownProcessor
+
+    proc = MarkdownProcessor(
+        model="test-model",
+        target_lang="ko",
+        glossary={"GitHub": None, "API": "API"},
+        glossary_mode="instruction",
     )
     assert proc.glossary_mode == "instruction"
 
