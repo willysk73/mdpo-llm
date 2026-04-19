@@ -24,3 +24,6 @@ test_sample*.po
 WARP.md
 
 docs/
+
+# ccx supervisor worker logs (supervisor-owned scratch state)
+.ccx/workers/
