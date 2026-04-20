@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.4.2 — 2026-04-20
+
+### Changed
+- **Translation prompts now carry a dedicated "Source-language content
+  inside code-like constructs" rule with concrete BEFORE/AFTER
+  examples.** v0.4.1 dropped the inline-code code-literal-vs-label
+  distinction and the format-string interpolation rule to stop the
+  model preserving `` `게임코드` ``, `<게임코드>`, `{년}` style
+  source-language tokens as if they were identifiers, but in practice
+  the LLM's prior for "this looks like a parameter name, leave it
+  alone" is strong enough to leak those tokens through even when the
+  prompt no longer tells it to preserve them. v0.4.2 flips the sign
+  by adding an explicit, example-driven rule with worked Korean →
+  English pairs:
+
+  - `` `게임코드` `` → `` `GameCode` ``
+  - `` `검색값` `` → `` `SearchValue` ``
+  - `https://api.example.com/<게임코드>/epoch` → `https://api.example.com/<GameCode>/epoch`
+  - `/{년}/{월}/{일}` → `/{year}/{month}/{day}`
+  - `` `getUserInfo()` `` and `/api/v1/users` stay unchanged.
+
+  The rule is placed *before* the fenced-code-block rule so that when
+  a fenced URL example contains `<게임코드>`, the source-language
+  translation rule wins. The fenced-code-block rule gains a
+  clarifying sentence: code-block-wide preservation covers executable
+  code syntax, but source-language words inside URLs, paths, or
+  placeholder brackets within code blocks should still be translated
+  under the new rule. Scope: `TRANSLATE_INSTRUCTION`,
+  `BATCH_TRANSLATE_INSTRUCTION`, and `BATCH_MULTI_TRANSLATE_INSTRUCTION`
+  only. Refine instructions are untouched (same-language polish
+  still has to leave backticked UI labels and config values alone).
+
+  **Caveat for users.** Prompt-level improvements are probabilistic —
+  the model's training-data prior for identifier preservation is
+  strong and even concrete BEFORE/AFTER examples do not guarantee
+  every token is translated. For deterministic identifier stability,
+  glossary placeholder mode (`--glossary-mode placeholder`) is still
+  the only round-trip-verified path: it swaps each pinned term for a
+  `⟦P:N⟧` sentinel, lets the LLM work around the sentinel, and
+  substitutes the term back afterward.
+
 ## 0.4.1 — 2026-04-19
 
 ### Changed

@@ -199,3 +199,67 @@ class TestPromptShape:
             langs="en, ja, zh-CN"
         )
         assert "en, ja, zh-CN" in formatted
+
+    def test_source_language_in_code_rule_present(self):
+        # v0.4.2 adds a dedicated rule with concrete BEFORE/AFTER
+        # examples that tells the model to translate source-language
+        # words sitting inside code-like wrappers (backticks, URLs,
+        # paths, bracket placeholders). The rule must appear in every
+        # translating instruction and must carry the exact Korean
+        # example tokens the brief calls out, because the prior-
+        # dominant behaviour we're fighting is "looks like an
+        # identifier, leave it alone".
+        required_tokens = ["게임코드", "년", "월", "일"]
+        for name in self.TRANSLATING_INSTRUCTIONS:
+            text = getattr(Prompts, name)
+            assert "Source-language content inside code-like constructs" in text, (
+                f"{name} missing the v0.4.2 source-language-in-code rule title"
+            )
+            for tok in required_tokens:
+                assert tok in text, (
+                    f"{name} missing required example token {tok!r} "
+                    f"for the source-language-in-code rule"
+                )
+
+    def test_source_language_rule_precedes_fenced_code_rule(self):
+        # Placement matters: when a fenced code block contains a URL
+        # like `https://api.example.com/<게임코드>/epoch`, rule order
+        # decides whether the model falls through to "preserve the
+        # code itself verbatim" (wrong) or applies the source-language
+        # translation rule (right). The brief mandates the source-
+        # language rule precedes the fenced-code-block rule.
+        for name in self.TRANSLATING_INSTRUCTIONS:
+            text = getattr(Prompts, name)
+            src_idx = text.find("Source-language content inside code-like constructs")
+            fence_idx = text.find("Inside fenced code blocks")
+            assert src_idx != -1, f"{name} missing source-language rule"
+            assert fence_idx != -1, f"{name} missing fenced-code-block rule"
+            assert src_idx < fence_idx, (
+                f"{name}: source-language rule must precede the "
+                f"fenced-code-block rule (found src@{src_idx}, "
+                f"fence@{fence_idx})"
+            )
+
+    def test_fenced_code_rule_defers_to_source_language_rule(self):
+        # The fenced-code-block rule picks up a clarifying sentence so
+        # the model does not re-apply blanket code preservation to
+        # URLs / paths / bracket placeholders that happen to sit
+        # inside a fenced block.
+        for name in self.TRANSLATING_INSTRUCTIONS:
+            text = getattr(Prompts, name)
+            assert "Code-block-wide preservation applies to executable code syntax" in text, (
+                f"{name} missing the fenced-code clarifying clause that "
+                f"defers source-language bracket tokens to the preceding rule"
+            )
+
+    def test_refine_instructions_unchanged_by_t12(self):
+        # T-12 is translate-only. Refine instructions must NOT grow
+        # the source-language-in-code rule — same-language polish
+        # must keep backticked content verbatim to avoid silently
+        # rewriting live product strings.
+        for name in self.REFINING_INSTRUCTIONS:
+            text = getattr(Prompts, name)
+            assert "Source-language content inside code-like constructs" not in text, (
+                f"{name} must not carry the translate-only "
+                f"source-language-in-code rule"
+            )
