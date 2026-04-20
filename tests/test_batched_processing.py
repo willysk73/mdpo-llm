@@ -1181,10 +1181,14 @@ class TestRefineMode:
         self, tmp_path, mock_completion
     ):
         # Regression: ``_sibling_refine_processor`` used to forward the
-        # translate-pass glossary into the same-language refine call.
-        # That would inject target-language terms into the source-language
-        # refine output (deterministically in placeholder mode).  Verify
-        # the sibling refine processor has no glossary.
+        # translate-pass glossary as-is into the same-language refine
+        # call, which would inject target-language terms into the
+        # source-language refine output (deterministically in placeholder
+        # mode).  T-13 updated the contract: the sibling now forwards
+        # only preserve-only entries (null / identity), so mapped
+        # translations are still dropped but null-entries survive so the
+        # refine pass tokenizes them on the placeholder registry and
+        # cannot reflow identifier whitespace.
         p = MarkdownProcessor(
             model="test-model",
             target_lang="ko",
@@ -1193,7 +1197,9 @@ class TestRefineMode:
             glossary_mode="placeholder",
         )
         sibling = p._sibling_refine_processor(target_lang="en")
-        assert sibling._glossary is None
+        # ``pull request → 풀 리퀘스트`` is dropped (would inject target
+        # text); ``GitHub → None`` is preserved so refine can protect it.
+        assert sibling._glossary == {"GitHub": None}
         assert sibling.mode == "refine"
 
     def test_refine_first_requires_refined_path(self, tmp_path):

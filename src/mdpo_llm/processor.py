@@ -347,18 +347,28 @@ class MarkdownProcessor:
                 f"mode must be 'translate' or 'refine', got {mode!r}"
             )
         self.mode: Mode = mode
-        if mode == "refine" and self._glossary:
+        if mode == "refine":
             # Translation glossaries typically map terms to a
             # target-language form (e.g. ``"pull request" → "풀 리퀘스트"``).
             # Applying those mappings during a same-language refine
             # would deterministically inject target-language strings
             # into the refined output — either via the instruction-mode
             # prompt block or via placeholder-mode decode — which
-            # violates the refine contract.  Disable glossary handling
-            # in refine mode entirely; callers who need refine-specific
-            # vocabulary enforcement should swap the glossary when they
-            # switch modes or run refine as a standalone pass.
-            self._glossary = None
+            # violates the refine contract.
+            #
+            # Null-entries (``{"게임코드": null}``) and identity mappings
+            # (``{"API": "API"}``) are the opposite case: they can ONLY
+            # preserve the source term verbatim — no target-language
+            # injection is even possible.  Keeping them lets a refine
+            # pass tokenize such identifiers on the placeholder registry
+            # so the LLM sees an opaque ``⟦P:N⟧`` span and cannot
+            # accidentally reflow whitespace / punctuation (e.g.
+            # ``게임코드`` → ``게임 코드``).  That matters because a
+            # downstream translate pass matches glossary terms by exact
+            # string; any drift in the refined source breaks the match
+            # and the refine-first → translate chain loses identifier
+            # stability.  Mapped entries remain disabled in refine mode.
+            self._glossary = self._filter_refine_glossary(self._glossary)
         # Effective registry merges user-supplied patterns with glossary
         # patterns when glossary_mode=="placeholder"; ``_encode_source``
         # calls into this (not ``_placeholders`` directly) so every
@@ -692,20 +702,42 @@ class MarkdownProcessor:
                 resolved[term] = value.get(lang)
         return resolved
 
-    def _effective_glossary_for_file(
+    @staticmethod
+    def _filter_refine_glossary(
+        glossary: Optional[Dict[str, Optional[str]]],
+    ) -> Optional[Dict[str, Optional[str]]]:
+        """Filter a locale-collapsed glossary for refine-mode safety.
+
+        Keeps only entries that cannot inject target-language text:
+        ``None`` (do-not-translate) and identity mappings
+        (``value == term``).  Drops every other mapped entry.  Returns
+        ``None`` for an empty result so downstream ``if glossary`` checks
+        match the "no glossary configured" signal used throughout the
+        processor — see :meth:`_resolve_glossary` and
+        :meth:`_current_glossary`.  Used at init, by the refine sibling
+        builder for ``refine_first=True``, and by ``process_directory``
+        when applying per-file cascades in refine mode.
+        """
+        if not glossary:
+            return None
+        filtered = {
+            term: value
+            for term, value in glossary.items()
+            if value is None or value == term
+        }
+        return filtered or None
+
+    def _merged_raw_chain_for_file(
         self, source_file: Path, source_dir: Path
-    ) -> Tuple[Optional[Dict[str, Optional[str]]], List[Path]]:
-        """Resolve the per-file cascade plus cwd / constructor override.
+    ) -> Tuple[Dict[str, Any], List[Path]]:
+        """Build the pre-locale-collapse merged glossary chain for one file.
 
-        Returns ``(resolved_glossary, chain_paths)``:
-
-        - ``resolved_glossary`` is locale-collapsed (``target_lang``
-          applied to per-locale entries); ``None`` when the chain
-          yielded no terms.
-        - ``chain_paths`` lists every ``glossary.json`` and override
-          source actually applied, in parent → child order.  Consumers
-          log this under ``-v`` so operators can reproduce the merge
-          and debug surprising substitutions.
+        Returns ``(merged_raw, chain_paths)`` where ``merged_raw``
+        preserves per-locale dicts so callers that need the glossary in
+        a DIFFERENT locale (e.g. the ``refine_first`` sibling, which
+        resolves for ``refine_lang`` rather than ``self.target_lang``)
+        can collapse it themselves.  ``chain_paths`` mirrors the debug
+        log ordering used by :meth:`_effective_glossary_for_file`.
         """
         source_dir_resolved = self._safe_resolve(source_dir)
         file_dir = self._safe_resolve(source_file.parent)
@@ -773,6 +805,26 @@ class MarkdownProcessor:
             # path may not exist for the inline dict case).
             chain_paths.append(Path("<constructor-override>"))
 
+        return merged, chain_paths
+
+    def _effective_glossary_for_file(
+        self, source_file: Path, source_dir: Path
+    ) -> Tuple[Optional[Dict[str, Optional[str]]], List[Path]]:
+        """Resolve the per-file cascade plus cwd / constructor override.
+
+        Returns ``(resolved_glossary, chain_paths)``:
+
+        - ``resolved_glossary`` is locale-collapsed (``target_lang``
+          applied to per-locale entries); ``None`` when the chain
+          yielded no terms.
+        - ``chain_paths`` lists every ``glossary.json`` and override
+          source actually applied, in parent → child order.  Consumers
+          log this under ``-v`` so operators can reproduce the merge
+          and debug surprising substitutions.
+        """
+        merged, chain_paths = self._merged_raw_chain_for_file(
+            source_file, source_dir
+        )
         if not merged:
             return None, chain_paths
         resolved = self._resolve_raw_for_lang(merged, self.target_lang)
@@ -813,14 +865,15 @@ class MarkdownProcessor:
         pass uses the same provider and the same guardrails as the
         translate pass.
 
-        The translation glossary is deliberately **not** forwarded: its
-        target-language mappings are defined for the translate pass and
-        would leak target-language terms into the source-language refine
-        output (deterministically under
-        ``glossary_mode="placeholder"``, where decode rewrites tokens to
-        the glossary replacement).  Callers who want refine-specific
-        glossary behaviour can run the refine pass standalone with its
-        own configured glossary.
+        The glossary is forwarded AFTER refine-mode filtering: only
+        preserve-only entries (null or identity) survive, mapped entries
+        are dropped.  This keeps the refine sibling from injecting
+        target-language text while still tokenizing identifiers on the
+        placeholder registry so refine cannot reflow whitespace /
+        punctuation inside them — the ``refine → translate`` chain's
+        downstream glossary match depends on byte-for-byte identifier
+        stability.  Per-locale dicts in the source glossary are resolved
+        for ``target_lang`` before filtering.
 
         The progress callback is also withheld: forwarding it would make
         one public ``process_document`` call emit TWO independent
@@ -830,13 +883,70 @@ class MarkdownProcessor:
         outer progress; refine-pass progress would double-count or
         overwrite the UI state.
         """
+        # Build a locale-collapsed, refine-filtered glossary for the
+        # sibling.  Priority:
+        #   1. ``self._tls.refine_sibling_raw`` — installed by
+        #      ``process_directory`` per file when ``refine_first=True``
+        #      is active, carrying the FULL cascade (directory-level
+        #      ``glossary.json`` files + cwd + constructor override),
+        #      still in raw per-locale form.  Without this, the sibling
+        #      would rebuild only from constructor-level state and miss
+        #      every per-directory cascade entry — the cascade would be
+        #      visible to the translate pass but not to the refine pass,
+        #      leaving identifiers exposed to whitespace reflow.
+        #   2. Constructor-level fallback — used on the single-file
+        #      ``process_document(refine_first=True)`` call path where
+        #      no cascade is computed.
+        #
+        # Pre-collapsing here (rather than letting the sibling init do
+        # it) keeps behaviour consistent whether the caller configured
+        # this processor via inline kwargs, file path, or both —
+        # ``_resolve_glossary``'s inline branch does NOT collapse
+        # per-locale dicts, only the ``glossary_path`` branch does.
+        sibling_glossary: Optional[Dict[str, Optional[str]]] = None
+        raw_chain = getattr(self._tls, "refine_sibling_raw", _TLS_UNSET)
+        # Distinguish "TLS unset (caller didn't install a cascade)" from
+        # "TLS set to an empty mapping (the cascade resolved to
+        # intentionally empty — e.g. a per-directory ``__remove__``
+        # unset the only term)".  The latter must SHORT-CIRCUIT the
+        # constructor fallback so a refine-first directory run honours
+        # per-file opt-outs: without this, an intentionally empty
+        # cascade would silently re-install the constructor glossary
+        # and the refine pass would protect a term the translate pass
+        # correctly ignores, which is exactly the divergence this
+        # propagation is meant to prevent.
+        if raw_chain is not _TLS_UNSET:
+            if raw_chain:
+                filtered_raw = {
+                    term: value
+                    for term, value in raw_chain.items()
+                    if value != "__remove__"
+                }
+                collapsed = self._resolve_raw_for_lang(filtered_raw, target_lang)
+                sibling_glossary = self._filter_refine_glossary(collapsed)
+            # else: empty cascade — leave ``sibling_glossary = None``.
+        elif self._glossary_file or self._glossary_inline:
+            raw: Dict[str, Any] = {}
+            if self._glossary_file:
+                raw.update(self._glossary_file)
+            if self._glossary_inline:
+                raw.update(self._glossary_inline)
+            # Drop the cascade's unset sentinel before per-locale
+            # collapse so it can't survive as a literal replacement.
+            raw = {
+                term: value
+                for term, value in raw.items()
+                if value != "__remove__"
+            }
+            collapsed = self._resolve_raw_for_lang(raw, target_lang)
+            sibling_glossary = self._filter_refine_glossary(collapsed)
         return MarkdownProcessor(
             model=self.model,
             target_lang=target_lang,
             max_reference_pairs=self.max_reference_pairs,
             extra_instructions=self._extra_instructions,
             post_process=self._post_process,
-            glossary=None,
+            glossary=sibling_glossary,
             batch_size=self.batch_size,
             batch_max_chars=self.batch_max_chars,
             batch_concurrency=self.batch_concurrency,
@@ -2306,39 +2416,80 @@ class MarkdownProcessor:
         self._glossary_registry_cache.clear()
 
         # T-11: pre-compute the per-file glossary cascade ON THE MAIN
-        # THREAD so workers only read from the caches.  Refine mode
-        # disables glossary entirely (see __init__), so skip the cascade
-        # walk there — leaving ``per_file_glossary`` empty means workers
-        # don't install a TLS override and fall through to
-        # ``self._glossary`` (which is ``None`` in refine mode).  One
-        # INFO log per file records the resolved chain so ``-v`` callers
-        # can debug surprising merges without turning on debug-level
-        # instrumentation across the whole run.
+        # THREAD so workers only read from the caches.  T-13: the
+        # cascade runs in refine mode too, but every per-file map is
+        # passed through :meth:`_filter_refine_glossary` so only
+        # preserve-only entries (null / identity) survive — the
+        # placeholder registry tokenizes them so refine cannot reflow
+        # whitespace inside identifiers like ``게임코드``, and no
+        # mapped entry can inject target-language text.  For
+        # ``refine_first=True`` we additionally stash the pre-collapse
+        # raw chain so the refine sibling built inside
+        # ``process_document`` can resolve it for ``refine_lang``
+        # (which differs from ``self.target_lang``) and apply the
+        # refine filter there — without this the sibling would rebuild
+        # from constructor-level state only and miss every per-directory
+        # cascade entry.  One INFO log per file records the resolved
+        # chain so ``-v`` callers can debug surprising merges without
+        # turning on debug-level instrumentation across the whole run.
         per_file_glossary: Dict[Path, Optional[Dict[str, Optional[str]]]] = {}
         per_file_registry: Dict[Path, Optional[PlaceholderRegistry]] = {}
-        if self.mode == "translate":
-            for sf in matched_files:
+        per_file_raw_chain: Dict[Path, Dict[str, Any]] = {}
+        for sf in matched_files:
+            if refine_first:
+                # Compute raw + resolved from the same cascade walk so
+                # the sibling sees the same merged chain the translate
+                # pass does — divergence here would mean refine and
+                # translate disagree on which terms are in play.
+                #
+                # Always record the raw chain for refine_first (even
+                # when empty) so ``_process_one`` can install an
+                # explicit ``_tls.refine_sibling_raw`` slot.  An empty
+                # chain is a SIGNAL — the cascade resolved to no terms
+                # for this file, often because a child
+                # ``glossary.json`` used ``__remove__`` to opt out of
+                # an inherited entry — and the sibling must honour
+                # that by NOT falling back to constructor-level state.
+                # Omitting the slot would silently re-enable the
+                # constructor glossary in refine while the translate
+                # pass correctly sees nothing.
+                merged_raw, chain_paths = self._merged_raw_chain_for_file(
+                    sf, source_dir
+                )
+                per_file_raw_chain[sf] = merged_raw
+                if merged_raw:
+                    resolved = self._resolve_raw_for_lang(
+                        merged_raw, self.target_lang
+                    )
+                    effective: Optional[Dict[str, Optional[str]]] = (
+                        resolved or None
+                    )
+                else:
+                    effective = None
+            else:
                 effective, chain_paths = self._effective_glossary_for_file(
                     sf, source_dir
                 )
-                per_file_glossary[sf] = effective
-                per_file_registry[sf] = self._registry_for_glossary(effective)
-                if logger.isEnabledFor(logging.INFO):
-                    try:
-                        rel = sf.relative_to(source_dir)
-                    except ValueError:
-                        rel = sf
-                    if chain_paths:
-                        logger.info(
-                            "glossary cascade for %s: %s",
-                            rel,
-                            " -> ".join(str(p) for p in chain_paths),
-                        )
-                    else:
-                        logger.info(
-                            "glossary cascade for %s: (empty — no glossary)",
-                            rel,
-                        )
+            if self.mode == "refine":
+                effective = self._filter_refine_glossary(effective)
+            per_file_glossary[sf] = effective
+            per_file_registry[sf] = self._registry_for_glossary(effective)
+            if logger.isEnabledFor(logging.INFO):
+                try:
+                    rel = sf.relative_to(source_dir)
+                except ValueError:
+                    rel = sf
+                if chain_paths:
+                    logger.info(
+                        "glossary cascade for %s: %s",
+                        rel,
+                        " -> ".join(str(p) for p in chain_paths),
+                    )
+                else:
+                    logger.info(
+                        "glossary cascade for %s: (empty — no glossary)",
+                        rel,
+                    )
 
         self._emit_progress(
             kind="directory_start",
@@ -2412,19 +2563,27 @@ class MarkdownProcessor:
             self._tls.usage = u
             # T-11: install the per-file glossary + registry on TLS so
             # ``_current_glossary`` / ``_current_registry`` see the
-            # cascaded mapping for this file.  Translate-mode only; in
-            # refine mode the processor disables glossaries entirely and
-            # leaving TLS unset preserves that behaviour.  Slots are
-            # ``delattr``-cleared in the ``finally`` so sibling workers
-            # landing on the same thread never inherit stale state —
-            # setting to ``None`` would instead signal "explicit empty
-            # glossary for this file", which is a valid but distinct
-            # override.
+            # cascaded mapping for this file.  T-13: also installed in
+            # refine mode, but the map is filtered to preserve-only
+            # entries upstream so no target-language text can be
+            # injected.  For ``refine_first=True`` we additionally
+            # install ``refine_sibling_raw`` so the sibling built inside
+            # ``process_document`` can resolve the cascade for
+            # ``refine_lang`` and apply the refine filter there.  Slots
+            # are ``delattr``-cleared in the ``finally`` so sibling
+            # workers landing on the same thread never inherit stale
+            # state — setting to ``None`` would instead signal "explicit
+            # empty glossary for this file", which is a valid but
+            # distinct override.
             per_file_glossary_installed = False
-            if self.mode == "translate" and source_file in per_file_glossary:
+            if source_file in per_file_glossary:
                 self._tls.per_file_glossary = per_file_glossary[source_file]
                 self._tls.per_file_registry = per_file_registry[source_file]
                 per_file_glossary_installed = True
+            refine_sibling_raw_installed = False
+            if refine_first and source_file in per_file_raw_chain:
+                self._tls.refine_sibling_raw = per_file_raw_chain[source_file]
+                refine_sibling_raw_installed = True
             self._emit_progress(kind="file_start", path=str(source_file))
             try:
                 # Only forward refine-specific kwargs when a refine pathway
@@ -2457,6 +2616,10 @@ class MarkdownProcessor:
                     for attr in ("per_file_glossary", "per_file_registry"):
                         if hasattr(self._tls, attr):
                             delattr(self._tls, attr)
+                if refine_sibling_raw_installed and hasattr(
+                    self._tls, "refine_sibling_raw"
+                ):
+                    delattr(self._tls, "refine_sibling_raw")
 
         try:
             with concurrent.futures.ThreadPoolExecutor(

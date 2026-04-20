@@ -515,6 +515,119 @@ class TestRegistryWiring:
             del proc._tls.per_file_glossary
 
 
+class TestRefineModeCascade:
+    """T-13: ``process_directory`` now applies per-file glossary cascades
+    in refine mode too, but every level is filtered so only preserve-only
+    entries survive.
+    """
+
+    def test_effective_glossary_filtered_for_refine_in_placeholder(
+        self, tmp_path
+    ):
+        """Verify the cascade-resolution + filter composition the
+        ``process_directory`` refine branch performs per file.
+        """
+        source_dir = tmp_path / "docs"
+        _write_glossary(
+            source_dir,
+            {
+                "게임코드": None,
+                "pull request": "풀 리퀘스트",
+                "API": "API",
+            },
+        )
+        file_path = source_dir / "page.md"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("x", encoding="utf-8")
+
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            mode="refine",
+            glossary_mode="placeholder",
+        )
+        effective, _ = proc._effective_glossary_for_file(file_path, source_dir)
+        filtered = proc._filter_refine_glossary(effective)
+        assert filtered == {"게임코드": None, "API": "API"}
+
+    def test_empty_after_filter_returns_none(self, tmp_path):
+        source_dir = tmp_path / "docs"
+        _write_glossary(
+            source_dir,
+            {"pull request": "풀 리퀘스트", "checkout": "체크아웃"},
+        )
+        file_path = source_dir / "page.md"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("x", encoding="utf-8")
+
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            mode="refine",
+            glossary_mode="placeholder",
+        )
+        effective, _ = proc._effective_glossary_for_file(file_path, source_dir)
+        assert proc._filter_refine_glossary(effective) is None
+
+
+class TestRefineModePerLocaleFilter:
+    """T-13: ``_resolve_glossary`` feeding into refine-mode init filters to
+    preserving entries only, including per-locale dicts loaded from file.
+    """
+
+    def test_refine_keeps_per_locale_null_for_target_lang(self, tmp_path):
+        glossary_path = tmp_path / "glossary.json"
+        glossary_path.write_text(
+            json.dumps({"API": {"ko": None, "ja": "API"}}),
+            encoding="utf-8",
+        )
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            mode="refine",
+            glossary_path=glossary_path,
+            glossary_mode="placeholder",
+        )
+        # ``ko`` resolves to ``None`` — kept (do-not-translate contract
+        # holds in refine too, and tokenization on the registry is what
+        # protects whitespace reflow).
+        assert proc._glossary == {"API": None}
+
+    def test_refine_keeps_per_locale_identity_for_target_lang(self, tmp_path):
+        glossary_path = tmp_path / "glossary.json"
+        glossary_path.write_text(
+            json.dumps({"API": {"ko": None, "ja": "API"}}),
+            encoding="utf-8",
+        )
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="ja",
+            mode="refine",
+            glossary_path=glossary_path,
+            glossary_mode="placeholder",
+        )
+        # ``ja`` resolves to ``"API"`` — identity mapping, no injection
+        # is possible, keep it.
+        assert proc._glossary == {"API": "API"}
+
+    def test_refine_drops_per_locale_mapped_for_target_lang(self, tmp_path):
+        glossary_path = tmp_path / "glossary.json"
+        glossary_path.write_text(
+            json.dumps({"API": {"ko": "에이피아이", "ja": "API"}}),
+            encoding="utf-8",
+        )
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            mode="refine",
+            glossary_path=glossary_path,
+            glossary_mode="placeholder",
+        )
+        # ``ko`` resolves to a different string — would inject
+        # target-language text during refine, drop it.
+        assert proc._glossary is None
+
+
 class TestMalformedGlossary:
     def test_non_json_file_is_ignored_with_warning(self, tmp_path, caplog):
         source_dir = tmp_path / "docs"
