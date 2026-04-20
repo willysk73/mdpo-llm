@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **Refine mode: glossary null-entries and identity mappings are kept
+  instead of being dropped wholesale.** v0.4.x refine-mode init in
+  `MarkdownProcessor` dropped the entire glossary, on the rationale
+  that translation mappings like `"pull request" → "풀 리퀘스트"`
+  would inject target-language text into same-language refined
+  output. That rationale still holds for *mapped* entries — they
+  remain dropped — but it over-corrected for entries that cannot
+  inject anything: null-entries (`{"게임코드": null}`,
+  do-not-translate) and identity mappings (`{"API": "API"}`).
+  Dropping those meant refine had no placeholder protection around
+  such terms, so a refine pass could reflow `게임코드` into
+  `게임 코드` and a downstream translate pass would then miss the
+  glossary match on `"게임코드": "GameCode"`. The new filter keeps
+  only entries whose effective value is `None` or equal to the term
+  itself; both register on the placeholder registry so refine
+  tokenizes the span and decode restores it verbatim. Per-locale
+  dicts are resolved first, so `{"API": {"ko": null, "ja": "API"}}`
+  kept under `ko` (null) and kept under `ja` (identity) while a
+  locale that resolves to a different string is dropped. Translate
+  mode is unchanged. The filter now applies at every entry point
+  that populates the refine-mode glossary: constructor init,
+  `_sibling_refine_processor` for `refine_first=True` translate
+  composition (previously hard-coded `glossary=None`), and the
+  per-file glossary cascade in `process_directory` (previously
+  gated to translate-mode only). Directory `refine_first` runs
+  additionally propagate the pre-collapse cascade chain to the
+  refine sibling via TLS, so per-directory `glossary.json` entries
+  apply to the refine pass in that locale — not just the translate
+  pass's. All paths now protect identifier stability across
+  `refine → translate` chains.
+
 ## 0.4.2 — 2026-04-20
 
 ### Changed
