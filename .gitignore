@@ -27,3 +27,6 @@ docs/
 
 # ccx supervisor scratch state
 .ccx/
+
+# agents
+.claude/
