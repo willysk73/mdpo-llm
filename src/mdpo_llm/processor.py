@@ -23,6 +23,7 @@ import litellm
 import polib
 
 from .batch import BatchTranslator, MultiTargetBatchTranslator
+from .llm_validator import BinaryGrade, LLMValidator
 from .manager import POManager
 from .parser import BlockParser, slugify_path_segment
 from .placeholder import (
@@ -48,7 +49,7 @@ from .validator import (
 )
 
 
-ValidationMode = Literal["off", "conservative", "strict"]
+ValidationMode = Literal["off", "conservative", "strict", "llm"]
 GlossaryMode = Literal["instruction", "placeholder"]
 Mode = Literal["translate", "refine"]
 
@@ -66,6 +67,29 @@ _INPLACE_DEPRECATION_MESSAGE = (
     "polished version of the source while keeping the original `msgid` "
     "intact. See README 'Refine mode' for migration details."
 )
+
+
+@dataclass(frozen=True)
+class _ValidationOutcome:
+    """One key's verdict from :meth:`_llm_validate_and_retry`.
+
+    Bundles everything the per-entry commit loop needs: the encoded
+    raw response (so the structural placeholder round-trip check sees
+    the exact text the model produced), the decoded translation (the
+    human form to commit to ``msgstr``), the placeholder mapping (so
+    ``_apply_validation`` can run its round-trip check), the final
+    pass/fail flag, and — for failures — the last rejection reason
+    that gets written into the PO entry's tcomment.
+
+    Module-private (``_``-prefixed) because callers outside the LLM
+    validation hot path have no reason to construct one.
+    """
+
+    encoded: str
+    decoded: str
+    mapping: Optional[PlaceholderMap]
+    passed: bool
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -213,6 +237,8 @@ class MarkdownProcessor:
         batch_max_chars: int = 8000,
         batch_concurrency: int = 1,
         validation: ValidationMode = "off",
+        max_retries: int = 3,
+        fallback_model: Optional[str] = None,
         enable_prompt_cache: bool = False,
         progress_callback: Optional[ProgressCallback] = None,
         placeholders: Optional[PlaceholderRegistry] = None,
@@ -253,8 +279,31 @@ class MarkdownProcessor:
                 (``batch_size == 0``) and when a document partitions into
                 a single group (nothing to parallelise after seeding).
             validation: Post-translation validation mode.  ``"off"`` (default),
-                ``"conservative"`` (structural checks), or ``"strict"`` (adds
-                inline-code count check).  Failing entries are marked fuzzy.
+                ``"conservative"`` (structural checks), ``"strict"`` (adds
+                inline-code count check), or ``"llm"`` (T-16: opt-in second
+                LLM pass that grades each translated batch and retries
+                failed keys with accumulated rejection reasons).  Failing
+                entries are marked fuzzy.  ``"llm"`` runs structural
+                ``conservative`` checks first as a cheap pre-gate, then
+                grades anything that survives.
+            max_retries: Total retry budget for the LLM-validation loop
+                (``validation="llm"`` only).  Clamped to ``0..10``.  An
+                attempt budget of N means up to ``1 + N`` total attempts
+                per batch — one initial translate plus up to N retries
+                that re-issue the failed keys with the accumulated
+                rejection reasons appended to the system prompt.  At
+                retry index ``ceil(N / 2)`` (1-based, so the midpoint of
+                the retry budget) the retry call swaps to
+                ``fallback_model`` if one is configured.  Retries that
+                exhaust the budget mark each remaining failed entry
+                fuzzy with the last rejection reason in tcomment.
+                Ignored when ``validation != "llm"``.
+            fallback_model: Optional LiteLLM model string to swap in
+                halfway through the retry budget when the primary model
+                keeps producing graded-fail outputs.  ``None`` (default)
+                means no swap fires; the primary model is used for every
+                retry.  Only consulted when ``validation == "llm"`` AND
+                ``max_retries >= 1``.
             enable_prompt_cache: Pass ``cache_control`` hints on the stable
                 system prefix so providers that support prompt caching
                 (Anthropic native, OpenAI automatic) can reuse tokens across
@@ -362,7 +411,26 @@ class MarkdownProcessor:
         # degrades to the safe sequential path instead of raising deep
         # inside the thread pool.
         self.batch_concurrency = max(1, concurrency_value)
+        if validation not in ("off", "conservative", "strict", "llm"):
+            raise ValueError(
+                "validation must be one of 'off', 'conservative', "
+                f"'strict', 'llm', got {validation!r}"
+            )
         self.validation: ValidationMode = validation
+        # ``max_retries`` is exposed as a public knob so a caller that
+        # wants to inspect the configured budget (CLI receipt rendering,
+        # diagnostics) doesn't have to re-derive it.  Clamp to 0..10 to
+        # match the brief and silently coerce non-integers down to 0 so
+        # the retry loop's ``range(...)`` cannot raise mid-batch.
+        try:
+            retries_value = int(max_retries)
+        except (TypeError, ValueError):
+            retries_value = 0
+        self.max_retries = max(0, min(10, retries_value))
+        self.fallback_model: Optional[str] = (
+            fallback_model if isinstance(fallback_model, str) and fallback_model
+            else None
+        )
         self.enable_prompt_cache = enable_prompt_cache
         self._progress_callback = progress_callback
         self._placeholders = placeholders
@@ -987,6 +1055,8 @@ class MarkdownProcessor:
             batch_max_chars=self.batch_max_chars,
             batch_concurrency=self.batch_concurrency,
             validation=self.validation,
+            max_retries=self.max_retries,
+            fallback_model=self.fallback_model,
             enable_prompt_cache=self.enable_prompt_cache,
             progress_callback=None,
             placeholders=self._placeholders,
@@ -1074,17 +1144,24 @@ class MarkdownProcessor:
             or "anthropic." in m
         )
 
-    def _supports_json_mode(self) -> bool:
-        """Return True when the current model advertises ``response_format`` support.
+    def _supports_json_mode(self, model: Optional[str] = None) -> bool:
+        """Return True when ``model`` advertises ``response_format`` support.
 
         Falls back to ``False`` when LiteLLM cannot give a concrete answer
         (older versions, custom adapters, probe exceptions).  Forcing JSON
         mode against a provider that rejects the flag drives BatchTranslator
         into a full bisection tree of failing API calls before the per-entry
         fallback fires — the exact pathology this gate exists to avoid.
+
+        ``model`` defaults to ``self.model`` so the v0.4 callsites stay
+        signature-compatible.  T-16 batch / validator callers thread
+        through ``fallback_model`` here so a fallback-model swap that
+        targets a provider with different JSON-mode support gates on the
+        right model rather than the primary.
         """
+        target = model or self.model
         try:
-            params = litellm.get_supported_openai_params(model=self.model)
+            params = litellm.get_supported_openai_params(model=target)
         except Exception:
             return False
         if isinstance(params, (list, tuple, set)):
@@ -1106,6 +1183,48 @@ class MarkdownProcessor:
         encoded, mapping = self._current_registry().encode(text)
         mapping = self._apply_glossary_replacements(mapping)
         return encoded, mapping
+
+    def _encode_source_for_lang(
+        self, text: str, target_lang: str
+    ) -> Tuple[str, PlaceholderMap]:
+        """Encode ``text`` under a registry built for ``target_lang``.
+
+        Used by the multi-target LLM-validation retry path: the
+        shared multi-target registry installed by
+        :meth:`process_document_multi` excludes target-script glyphs
+        for the **union** of all langs, so a non-constructor lang's
+        retries would otherwise re-translate against the wrong
+        placeholder mapping.  Mirrors the registry construction used
+        by :meth:`_call_lang_single` so single-target fallback and
+        retry encoding stay consistent.  ``finally`` restores the TLS
+        slot so an exception in the encode path doesn't leak the
+        per-lang registry into sibling work.
+        """
+        lang_glossary = self._resolve_glossary_for_lang(target_lang)
+        if lang_glossary:
+            lang_glossary = {
+                term: value
+                for term, value in lang_glossary.items()
+                if value != "__remove__"
+            } or None
+        lang_registry = self._build_effective_registry(
+            self._placeholders,
+            glossary=lang_glossary,
+            update_builtin_overrides=False,
+            target_langs_override=[target_lang],
+        )
+        previous_registry = getattr(self._tls, "per_file_registry", _TLS_UNSET)
+        self._tls.per_file_registry = lang_registry
+        try:
+            return self._encode_source(text)
+        finally:
+            if previous_registry is _TLS_UNSET:
+                try:
+                    del self._tls.per_file_registry
+                except AttributeError:
+                    pass
+            else:
+                self._tls.per_file_registry = previous_registry
 
     def _build_effective_registry(
         self,
@@ -1453,6 +1572,9 @@ class MarkdownProcessor:
         items: Dict[str, str],
         reference_pairs: Optional[List[tuple]] = None,
         glossary_block: Optional[str] = None,
+        *,
+        retry_reasons_by_key: Optional[Dict[str, List[str]]] = None,
+        target_lang: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if self.mode == "refine":
             instruction = Prompts.BATCH_REFINE_INSTRUCTION
@@ -1463,7 +1585,7 @@ class MarkdownProcessor:
         if self._extra_instructions:
             instruction += "\n" + self._extra_instructions
         system_content = system_template.format(
-            lang=self.target_lang,
+            lang=target_lang or self.target_lang,
             instruction=instruction,
         )
         if glossary_block:
@@ -1475,6 +1597,24 @@ class MarkdownProcessor:
             for src, tgt in reference_pairs:
                 ref_lines.append(f"- SRC: {src}\n  TGT: {tgt}")
             system_content += "\n\n" + "\n".join(ref_lines)
+        if retry_reasons_by_key:
+            # Per-key blocks: the model sees each key's full reason
+            # history scoped to that key.  Sibling keys never share
+            # reasons — that would steer the model to "fix" issues
+            # that belong to a different entry.  Keys with empty
+            # reason lists are dropped (a key that has no rejection
+            # history shouldn't render a stub block).
+            reason_lines: List[str] = [Prompts.RETRY_REASON_HEADER]
+            rendered_any = False
+            for key, reasons in retry_reasons_by_key.items():
+                if not reasons:
+                    continue
+                rendered_any = True
+                reason_lines.append(f"- key {key!r}:")
+                for reason in reasons:
+                    reason_lines.append(f"  - {reason}")
+            if rendered_any:
+                system_content += "\n\n" + "\n".join(reason_lines)
 
         user_payload = json.dumps(items, ensure_ascii=False)
         return [
@@ -1487,28 +1627,535 @@ class MarkdownProcessor:
         reference_pairs: Optional[List[tuple]],
         glossary_block: Optional[str],
         usage: Optional[_UsageAccumulator] = None,
+        *,
+        retry_reasons_by_key: Optional[Dict[str, List[str]]] = None,
+        model_override: Optional[str] = None,
+        target_lang: Optional[str] = None,
     ) -> Callable[[Dict[str, str]], str]:
-        """Return a ``call_llm`` closure suitable for ``BatchTranslator``."""
+        """Return a ``call_llm`` closure suitable for ``BatchTranslator``.
+
+        ``retry_reasons_by_key`` and ``model_override`` are LLM-
+        validation hooks (T-16): retries inside the validation loop
+        need both a different system-prompt suffix (the accumulated
+        rejection reasons, scoped per key) and the ability to swap
+        to ``fallback_model`` partway through the budget.  Threading
+        them through the caller factory keeps the hot path — retry-
+        free, primary-model — closure-equivalent to the v0.4
+        signature.  ``target_lang`` overrides ``self.target_lang`` so
+        the multi-target retry path can build per-lang single-target
+        callers without mutating the instance.
+        """
+
+        model = model_override or self.model
 
         def _call(items: Dict[str, str]) -> str:
+            # Filter the retry-reason map down to keys present in
+            # the current request.  ``BatchTranslator`` recursively
+            # bisects malformed chunks into smaller subsets; without
+            # this filter, a subset of one key would still see
+            # rejection histories for sibling keys that are no
+            # longer in ``items`` — which the comments above say
+            # is exactly what per-key scoping is supposed to
+            # prevent.
+            scoped_reasons: Optional[Dict[str, List[str]]] = None
+            if retry_reasons_by_key:
+                scoped_reasons = {
+                    k: v
+                    for k, v in retry_reasons_by_key.items()
+                    if k in items
+                }
+                if not scoped_reasons:
+                    scoped_reasons = None
             messages = self._build_batch_messages(
-                items, reference_pairs=reference_pairs, glossary_block=glossary_block
+                items,
+                reference_pairs=reference_pairs,
+                glossary_block=glossary_block,
+                retry_reasons_by_key=scoped_reasons,
+                target_lang=target_lang,
             )
             call_kwargs = dict(self._litellm_kwargs)
             # Request JSON object responses only when the configured model
             # advertises ``response_format`` support.  Providers that reject
             # the flag would otherwise fail the whole batch on every call
             # and force BatchTranslator into a costly bisection loop.
-            if self._supports_json_mode():
+            if self._supports_json_mode(model):
                 call_kwargs.setdefault("response_format", {"type": "json_object"})
             response = litellm.completion(
-                model=self.model, messages=messages, **call_kwargs
+                model=model, messages=messages, **call_kwargs
             )
             if usage is not None:
                 usage.record(response)
             return response.choices[0].message.content
 
         return _call
+
+    # ----- LLM validation (T-16) -----
+
+    def _build_validator_messages(
+        self,
+        items: Dict[str, Dict[str, str]],
+        target_lang: str,
+    ) -> List[Dict[str, Any]]:
+        """Construct the validator-LLM message list for a single chunk.
+
+        The validator runs in ``translate`` mode against
+        ``VALIDATE_TRANSLATE_CRITERIA`` and in ``refine`` mode against
+        ``VALIDATE_REFINE_CRITERIA``.  Mode is taken from the
+        processor instance (refine mode validators only ever run from
+        a refine-mode processor; the same is true for translate).
+        """
+        if self.mode == "refine":
+            criteria = Prompts.VALIDATE_REFINE_CRITERIA.format(
+                lang=target_lang
+            )
+        else:
+            criteria = Prompts.VALIDATE_TRANSLATE_CRITERIA.format(
+                lang=target_lang
+            )
+        system_content = Prompts.VALIDATE_SYSTEM + "\n\n" + criteria
+        # No prompt cache here: the criteria block is short, callers
+        # only invoke the validator under ``--validation=llm`` (an
+        # opt-in path), and provider-side caching is already amortising
+        # the stable prefix when applicable.  Skip the
+        # ``cache_control`` schema rewrite to keep the validator
+        # message portable across providers.
+        user_payload = json.dumps(items, ensure_ascii=False)
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_payload},
+        ]
+
+    def _make_validator_caller(
+        self,
+        target_lang: str,
+        usage: Optional[_UsageAccumulator] = None,
+        *,
+        model_override: Optional[str] = None,
+    ) -> Callable[[Dict[str, Dict[str, str]]], str]:
+        """Closure suitable for :class:`LLMValidator`.
+
+        Uses the primary model by default; ``model_override`` lets the
+        retry loop pin the validator to the same fallback model the
+        translator just swapped to so both halves of the call use a
+        consistent provider during the second-half retry.
+        """
+        model = model_override or self.model
+
+        def _call(items: Dict[str, Dict[str, str]]) -> str:
+            messages = self._build_validator_messages(
+                items, target_lang=target_lang
+            )
+            call_kwargs = dict(self._litellm_kwargs)
+            if self._supports_json_mode(model):
+                call_kwargs.setdefault(
+                    "response_format", {"type": "json_object"}
+                )
+            response = litellm.completion(
+                model=model, messages=messages, **call_kwargs
+            )
+            if usage is not None:
+                usage.record(response)
+            return response.choices[0].message.content
+
+        return _call
+
+    def _llm_validate_and_retry(
+        self,
+        *,
+        initial: Dict[str, Tuple[str, str]],
+        items: Dict[str, str],
+        decoded_sources: Dict[str, str],
+        mappings: Dict[str, Optional[PlaceholderMap]],
+        reference_pairs: Optional[List[tuple]],
+        glossary_block: Optional[str],
+        target_lang: str,
+        usage: Optional[_UsageAccumulator],
+        stats: Dict[str, int],
+        structural_check: Optional[
+            Callable[[str, str, str, Optional[PlaceholderMap]], Optional[str]]
+        ] = None,
+        retry_items: Optional[Dict[str, str]] = None,
+        retry_mappings: Optional[Dict[str, Optional[PlaceholderMap]]] = None,
+    ) -> Dict[str, "_ValidationOutcome"]:
+        """Grade the initial translations and retry failed keys.
+
+        ``initial`` is ``{ctx: (encoded_post_proc, decoded)}`` —
+        pre-decoded translations the caller has already produced.
+        Single-entry and per-lang single-entry fallbacks pass their
+        already-decoded outputs in this shape so post_process does
+        not run twice; the batched caller decodes once and feeds the
+        same shape.
+
+        ``items`` are the encoded sources (the ones the translator
+        sees); ``decoded_sources`` are the human-readable msgid texts
+        used by the validator so the grader judges natural-language
+        prose rather than opaque ⟦P:N⟧ tokens (which would mislead
+        the translatability gate).  Retries re-use the same encoded
+        ``items`` so placeholder protection survives across attempts.
+
+        Reference pool:  the brief calls for *passing keys* from the
+        same batch to be injected as few-shot examples on retry — a
+        free intra-batch consistency signal at zero extra LLM cost.
+        Each retry rebuilds ``reference_pairs`` as
+        ``base_references + intra_batch_pairs`` where the intra-batch
+        pairs are the (decoded source, decoded translation) pairs for
+        keys that have already passed in this batch.
+
+        ``retry_items`` and ``retry_mappings``, when provided,
+        replace ``items`` and ``mappings`` for the retry path only;
+        the initial structural check still uses the original
+        ``mappings`` so its round-trip check sees the same encoding
+        the LLM actually translated against.  Multi-target callers
+        thread the per-lang re-encoded items here; single-target
+        callers leave both ``None`` (the helper falls back to
+        ``items`` / ``mappings`` for both paths).
+
+        Returns ``{ctx: _ValidationOutcome}`` for every key.  The
+        per-key reasons accumulated across attempts stay scoped to
+        the failing key — sibling keys never see each other's
+        rejection histories — and the per-key block is rendered as
+        a structured section in the retry prompt header so the model
+        can apply each reason to its specific entry.
+        """
+        effective_retry_items = retry_items if retry_items is not None else items
+        effective_retry_mappings = (
+            retry_mappings if retry_mappings is not None else mappings
+        )
+        # Retries call BatchTranslator which returns RAW encoded
+        # output; that path needs its own post_process+decode.  The
+        # INITIAL pass is already post-processed by the caller and
+        # arrives in ``initial``.
+        def _decode_retry(ctx: str, raw: str) -> Tuple[str, str]:
+            # Retries operate against ``effective_retry_mappings`` —
+            # which may be a per-lang re-encoding mapping when the
+            # caller separated initial and retry registries.
+            mapping = effective_retry_mappings.get(ctx)
+            cooked = self._post_process(raw) if self._post_process else raw
+            decoded = self._decode_translation(cooked, mapping)
+            return cooked, decoded
+
+        encoded_attempt: Dict[str, str] = {}
+        decoded_attempt: Dict[str, str] = {}
+        for ctx, (encoded_pp, decoded) in initial.items():
+            encoded_attempt[ctx] = encoded_pp
+            decoded_attempt[ctx] = decoded
+
+        # Per-ctx history of rejection reasons.  Reasons accumulate
+        # across attempts (the brief asks for the FULL history, not
+        # just the latest) so the model sees every prior failure
+        # reason on each retry.  Storage is per-key so unrelated
+        # sibling keys don't poison each other's prompts.
+        accumulated_reasons: Dict[str, List[str]] = {}
+        outcomes: Dict[str, _ValidationOutcome] = {}
+
+        # ``batch_size=0`` is the documented per-entry opt-out — used
+        # by callers on providers that misbehave with batched JSON
+        # calls.  In that mode, both the validator grader and the
+        # retry translator must keep their per-call partitions to
+        # one key so retries don't collapse multiple keys into a
+        # single batched JSON request that the provider would
+        # reject.  ``max_entries=1`` is the per-entry semantic for
+        # both ``BatchTranslator`` and :class:`LLMValidator`.
+        retry_partition = 1 if self.batch_size == 0 else (
+            self.batch_size or 40
+        )
+        validator_caller = self._make_validator_caller(
+            target_lang=target_lang, usage=usage
+        )
+        validator = LLMValidator(
+            validator_caller,
+            max_entries=retry_partition,
+            max_chars=self.batch_max_chars,
+        )
+
+        def _grade(
+            decoded_outputs: Dict[str, str],
+            *,
+            model_override: Optional[str] = None,
+        ) -> Dict[str, BinaryGrade]:
+            grade_input = {
+                ctx: {
+                    "source": decoded_sources[ctx],
+                    "output": decoded_outputs[ctx],
+                }
+                for ctx in decoded_outputs
+            }
+            if model_override:
+                local_caller = self._make_validator_caller(
+                    target_lang=target_lang,
+                    usage=usage,
+                    model_override=model_override,
+                )
+                return LLMValidator(
+                    local_caller,
+                    max_entries=retry_partition,
+                    max_chars=self.batch_max_chars,
+                ).grade(grade_input)
+            return validator.grade(grade_input)
+
+        def _structural_for(
+            ctx: str, *, retry_phase: bool = False
+        ) -> Optional[str]:
+            """Run the optional structural pre-gate for one ctx.
+
+            ``structural_check`` is callable-of
+            ``(ctx, decoded, encoded_pp, mapping) -> Optional[str]``.
+            Returns a short reason string on fail or ``None`` on pass.
+            Folded into the same retry loop as the LLM grader so a
+            structural miss (placeholder round-trip, fence count,
+            heading drift) consumes the retry budget the same way an
+            LLM-flagged miss does — this matches the brief's
+            "Re-validate fail keys (structural + LLM)" wording.
+
+            ``retry_phase`` selects between the initial mapping (the
+            one the LLM actually translated against on the first
+            pass) and ``effective_retry_mappings`` (which may be a
+            re-encoded per-lang mapping).  Without this split, the
+            first-pass round-trip check on a multi-target run could
+            be measured against the wrong mapping and spuriously
+            reject a correct translation.
+            """
+            if structural_check is None:
+                return None
+            mapping_for_phase = (
+                effective_retry_mappings.get(ctx)
+                if retry_phase
+                else mappings.get(ctx)
+            )
+            return structural_check(
+                ctx,
+                decoded_attempt[ctx],
+                encoded_attempt[ctx],
+                mapping_for_phase,
+            )
+
+        # Initial pass: structural pre-gate per key.  Keys with
+        # structural issues skip the LLM grader on this attempt (it
+        # would burn validator tokens on output we already know is
+        # malformed); they go straight into the retry queue with
+        # the structural reason accumulated.
+        struct_initial: Dict[str, Optional[str]] = {
+            ctx: _structural_for(ctx) for ctx in decoded_attempt
+        }
+        gradeable_initial = {
+            ctx: decoded_attempt[ctx]
+            for ctx, reason in struct_initial.items()
+            if reason is None
+        }
+        grades = _grade(gradeable_initial) if gradeable_initial else {}
+
+        passed_encoded: Dict[str, str] = {}
+        passed_decoded: Dict[str, str] = {}
+        failed_keys: List[str] = []
+        for ctx in decoded_attempt:
+            struct_reason = struct_initial.get(ctx)
+            if struct_reason:
+                failed_keys.append(ctx)
+                accumulated_reasons.setdefault(ctx, []).append(
+                    f"structural: {struct_reason}"
+                )
+                continue
+            grade = grades.get(ctx)
+            if grade is not None and grade.binary_score == "yes":
+                passed_encoded[ctx] = encoded_attempt[ctx]
+                passed_decoded[ctx] = decoded_attempt[ctx]
+                outcomes[ctx] = _ValidationOutcome(
+                    encoded=encoded_attempt[ctx],
+                    decoded=decoded_attempt[ctx],
+                    mapping=mappings.get(ctx),
+                    passed=True,
+                    reason=grade.reason,
+                )
+                continue
+            failed_keys.append(ctx)
+            if grade is not None:
+                accumulated_reasons.setdefault(ctx, []).append(
+                    grade.reason or "validator returned 'no' without a reason"
+                )
+            else:
+                # Validator silence (parse failure that survived
+                # bisection) is treated as a failure so the retry
+                # budget can recover the key — silently passing
+                # ungraded outputs would defeat the validation gate.
+                accumulated_reasons.setdefault(ctx, []).append(
+                    "validator returned no parseable verdict for this key"
+                )
+
+        # Retry loop.  ``ceil(N / 2)`` fires the fallback-model swap
+        # at the midpoint of the retry budget so the second half of
+        # attempts uses the alternate model.  ``range(1, N+1)`` keeps
+        # ``attempt`` 1-based for the brief's "at retry N/2" wording.
+        midpoint = (self.max_retries + 1) // 2  # ceil(N / 2)
+        retry_failed: Dict[str, str] = {
+            ctx: effective_retry_items[ctx] for ctx in failed_keys
+        }
+
+        for attempt in range(1, self.max_retries + 1):
+            if not retry_failed:
+                break
+
+            use_fallback = (
+                self.fallback_model is not None and attempt >= midpoint
+            )
+            model_override = self.fallback_model if use_fallback else None
+
+            # Few-shot pool: prior in-context references plus every
+            # already-passing key from this same batch.
+            intra_batch_pairs: List[tuple] = [
+                (decoded_sources[ctx], passed_decoded[ctx])
+                for ctx in passed_decoded
+            ]
+            base_pairs = list(reference_pairs) if reference_pairs else []
+            retry_refs = base_pairs + intra_batch_pairs
+
+            # Per-key reasons stay scoped to their failing key — the
+            # brief is explicit that "reasons accumulate across
+            # attempts (each retry sees the full history, not just
+            # the latest reason)" PER KEY.  Concatenating across
+            # sibling keys would steer the model to "fix" reasons
+            # that belong to a different entry entirely.
+            per_key_reasons: Dict[str, List[str]] = {
+                ctx: list(accumulated_reasons.get(ctx, []))
+                for ctx in retry_failed
+            }
+
+            retry_caller = self._make_batch_caller(
+                reference_pairs=retry_refs,
+                glossary_block=glossary_block,
+                usage=usage,
+                retry_reasons_by_key=per_key_reasons,
+                model_override=model_override,
+                target_lang=target_lang,
+            )
+            retry_translator = BatchTranslator(
+                retry_caller,
+                max_entries=retry_partition,
+                max_chars=self.batch_max_chars,
+            )
+            try:
+                retry_raw = retry_translator.translate(retry_failed)
+            except Exception as exc:
+                logger.warning(
+                    "LLM-validation retry %d/%d crashed: %s",
+                    attempt,
+                    self.max_retries,
+                    exc,
+                )
+                retry_raw = {}
+
+            # Decode every key the retry translator covered; keys it
+            # could not produce a candidate for keep their PRIOR
+            # encoded/decoded values so the next attempt still has
+            # something to grade.  Losing the prior candidate would
+            # forfeit the retry budget for that key.
+            new_decoded: Dict[str, str] = {}
+            new_encoded: Dict[str, str] = {}
+            for ctx in retry_failed:
+                if ctx in retry_raw:
+                    cooked, decoded = _decode_retry(ctx, retry_raw[ctx])
+                    new_encoded[ctx] = cooked
+                    new_decoded[ctx] = decoded
+                else:
+                    new_encoded[ctx] = encoded_attempt[ctx]
+                    new_decoded[ctx] = decoded_attempt[ctx]
+            encoded_attempt.update(new_encoded)
+            decoded_attempt.update(new_decoded)
+
+            # Re-run structural per retry candidate first; only keys
+            # that survive the structural gate continue into the LLM
+            # grader for this attempt.  Both checks accumulate into
+            # the same per-key reason history.  ``retry_phase=True``
+            # routes the round-trip check through the per-lang
+            # retry mapping so the check matches the encoding the
+            # retry translator actually produced.
+            struct_retry: Dict[str, Optional[str]] = {
+                ctx: _structural_for(ctx, retry_phase=True)
+                for ctx in retry_failed
+            }
+            gradeable_retry = {
+                ctx: new_decoded[ctx]
+                for ctx, reason in struct_retry.items()
+                if reason is None
+            }
+            grades = (
+                _grade(gradeable_retry, model_override=model_override)
+                if gradeable_retry
+                else {}
+            )
+            still_failed: Dict[str, str] = {}
+            for ctx in retry_failed:
+                struct_reason = struct_retry.get(ctx)
+                if struct_reason:
+                    still_failed[ctx] = effective_retry_items[ctx]
+                    accumulated_reasons.setdefault(ctx, []).append(
+                        f"structural: {struct_reason}"
+                    )
+                    continue
+                grade = grades.get(ctx)
+                if grade is not None and grade.binary_score == "yes":
+                    passed_encoded[ctx] = encoded_attempt[ctx]
+                    passed_decoded[ctx] = decoded_attempt[ctx]
+                    # Retry produced this candidate against the retry
+                    # mapping, so the outcome's mapping (used by
+                    # ``_apply_validation`` later) must be the retry
+                    # mapping — not the initial shared one.
+                    outcomes[ctx] = _ValidationOutcome(
+                        encoded=encoded_attempt[ctx],
+                        decoded=decoded_attempt[ctx],
+                        mapping=effective_retry_mappings.get(ctx),
+                        passed=True,
+                        reason=grade.reason,
+                    )
+                    accumulated_reasons.pop(ctx, None)
+                    continue
+                still_failed[ctx] = effective_retry_items[ctx]
+                if grade is not None:
+                    accumulated_reasons.setdefault(ctx, []).append(
+                        grade.reason
+                        or "validator returned 'no' without a reason"
+                    )
+                else:
+                    accumulated_reasons.setdefault(ctx, []).append(
+                        "validator returned no parseable verdict on retry"
+                    )
+
+            retry_failed = still_failed
+
+        # Residual failures: surface the LAST rejection reason for
+        # each so ``_apply_validation`` can stuff it into the PO
+        # entry's tcomment per the brief.  The mapping picked here
+        # tracks whether the residual encoded form came from a
+        # retry attempt (``effective_retry_mappings``) or from the
+        # initial pass (``mappings``).  ``retry_visited`` is the
+        # set of keys that ever passed through the retry loop.
+        retry_visited = {
+            ctx for ctx in failed_keys
+        }  # every initially-failed key entered the retry loop
+        for ctx in retry_failed:
+            reasons = accumulated_reasons.get(ctx, [])
+            mapping_for_outcome = (
+                effective_retry_mappings.get(ctx)
+                if ctx in retry_visited
+                else mappings.get(ctx)
+            )
+            outcomes[ctx] = _ValidationOutcome(
+                encoded=encoded_attempt[ctx],
+                decoded=decoded_attempt[ctx],
+                mapping=mapping_for_outcome,
+                passed=False,
+                reason=reasons[-1] if reasons else (
+                    "LLM validator rejected this batch entry"
+                ),
+            )
+
+        # ``validated`` is incremented exactly once per entry in
+        # ``_apply_validation`` (which still runs for every key the
+        # LLM grader passed) — incrementing it here would double-count
+        # successful entries under ``validation="llm"``.  The brief's
+        # ``validation_failed`` accounting is owned by the caller via
+        # ``_mark_llm_validation_failed`` for the same reason: a
+        # single source of truth per stat field.
+        return outcomes
 
     # ----- main orchestration -----
 
@@ -3095,6 +3742,76 @@ class MarkdownProcessor:
                             entry.msgctxt,
                         )
 
+                # T-16: under ``validation="llm"`` the sequential
+                # path runs the same grader + retry loop as the
+                # batched path so callers on ``batch_size=0`` (a
+                # documented opt-out, e.g. providers that misbehave
+                # with JSON-mode) still get the advertised LLM
+                # validation gate.  The single-entry batch flowing
+                # through ``_llm_validate_and_retry`` is intentional —
+                # the bisection-friendly wire format handles a
+                # one-key dict identically to a many-key one.
+                if self.validation == "llm" and processed is not None:
+                    encoded_pp = getattr(
+                        self._tls, "last_encoded_response", None
+                    )
+                    mapping_pp = getattr(
+                        self._tls, "last_placeholder_map", None
+                    )
+                    encoded_source, source_mapping = self._encode_source(
+                        entry_obj.msgid
+                    )
+
+                    def _struct_check_seq(
+                        ctx: str,
+                        decoded_text: str,
+                        encoded_pp_arg: str,
+                        mapping_arg: Optional[PlaceholderMap],
+                    ) -> Optional[str]:
+                        return self._structural_issues_for(
+                            entry_obj.msgid,
+                            decoded_text,
+                            encoded_pp_arg,
+                            mapping_arg,
+                            target_lang=self.target_lang,
+                        )
+
+                    seq_outcome = self._llm_validate_and_retry(
+                        initial={
+                            entry_obj.msgctxt: (
+                                encoded_pp if encoded_pp is not None else processed,
+                                processed,
+                            )
+                        },
+                        items={entry_obj.msgctxt: encoded_source},
+                        decoded_sources={entry_obj.msgctxt: entry_obj.msgid},
+                        mappings={
+                            entry_obj.msgctxt: (
+                                mapping_pp if mapping_pp is not None
+                                else source_mapping
+                            )
+                        },
+                        reference_pairs=similar or None,
+                        glossary_block=self._format_glossary(entry_obj.msgid),
+                        target_lang=self.target_lang,
+                        usage=usage,
+                        stats=stats,
+                        structural_check=_struct_check_seq,
+                    ).get(entry_obj.msgctxt)
+
+                    if seq_outcome is not None:
+                        self._tls.last_encoded_response = seq_outcome.encoded
+                        self._tls.last_placeholder_map = seq_outcome.mapping
+                        if not seq_outcome.passed:
+                            self._mark_llm_validation_failed(
+                                entry_obj, seq_outcome.reason, stats
+                            )
+                            stats["failed"] += 1
+                            self._tls.last_encoded_response = None
+                            self._tls.last_placeholder_map = None
+                            continue
+                        processed = seq_outcome.decoded
+
                 if not self._apply_validation(entry_obj, processed, inplace, pool):
                     stats["failed"] += 1
                     continue
@@ -3533,34 +4250,132 @@ class MarkdownProcessor:
         finally:
             stats["batched_calls"] = stats.get("batched_calls", 0) + call_count
 
+        # T-16 LLM validation runs as a single pass over EVERY key
+        # that produced a candidate — both batched and per-entry
+        # fallback — so a missing key from the batched response
+        # still gets graded after its single-target fallback runs.
+        # Build the per-key initial-decode map first, then hand the
+        # whole thing to the validator/retry helper.
+        llm_outcomes: Dict[str, _ValidationOutcome] = {}
+        # Per-ctx pre-decoded initial state populated below: the
+        # batched path post-processes + decodes inline, then the
+        # per-entry fallback fills any holes the batch translator
+        # left.  When ``validation == "llm"`` we collect the whole
+        # set into ``initial_for_llm`` and grade it once.
+        decoded_by_ctx: Dict[str, str] = {}
+        encoded_post_proc_by_ctx: Dict[str, str] = {}
+        per_entry_call_failures: set = set()
+
         for ctx, entry in entry_by_ctx.items():
-            processed: Optional[str] = None
             mapping = mappings.get(ctx)
             if ctx in translated:
                 raw = translated[ctx]
-                # Run ``post_process`` BEFORE decoding so a hook cannot
-                # silently rewrite a restored protected span — the stash
-                # below must contain the exact text that will be stored.
-                # Matches the ordering used in ``_call_llm``.
                 if self._post_process:
                     raw = self._post_process(raw)
-                self._tls.last_encoded_response = raw
+                encoded_post_proc_by_ctx[ctx] = raw
+                decoded_by_ctx[ctx] = self._decode_translation(raw, mapping)
+                continue
+            stats["per_entry_calls"] += 1
+            with pool_cm:
+                similar = pool.find_similar(entry.msgid)
+            try:
+                processed_single = self._call_llm(
+                    entry.msgid, reference_pairs=similar or None, usage=usage
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Per-entry fallback failed for %s: %s", ctx, exc
+                )
+                per_entry_call_failures.add(ctx)
+                continue
+            if processed_single is None:
+                per_entry_call_failures.add(ctx)
+                continue
+            # ``_call_llm`` stashes the post-processed encoded raw
+            # plus the mapping in TLS for ``_apply_validation`` to
+            # consume.  We pull the same values here so the LLM-
+            # validation path treats the per-entry result identically
+            # to a batched response.
+            stashed_encoded = getattr(self._tls, "last_encoded_response", None)
+            stashed_mapping = getattr(self._tls, "last_placeholder_map", None)
+            if stashed_encoded is not None:
+                encoded_post_proc_by_ctx[ctx] = stashed_encoded
+            if stashed_mapping is not None:
+                # Override the up-front bracket mapping with whatever
+                # ``_call_llm`` actually used so the round-trip / LLM
+                # retry decode lines up.
+                mappings[ctx] = stashed_mapping
+            decoded_by_ctx[ctx] = processed_single
+
+        # Single LLM-validation + retry pass over every produced key.
+        if self.validation == "llm" and decoded_by_ctx:
+            decoded_sources_for_llm = {
+                ctx: entry_by_ctx[ctx].msgid for ctx in decoded_by_ctx
+            }
+            initial_for_llm: Dict[str, Tuple[str, str]] = {
+                ctx: (
+                    encoded_post_proc_by_ctx.get(ctx, decoded_by_ctx[ctx]),
+                    decoded_by_ctx[ctx],
+                )
+                for ctx in decoded_by_ctx
+            }
+            target_lang_for_llm = self.target_lang
+
+            def _struct_check(
+                ctx: str,
+                decoded_text: str,
+                encoded_pp: str,
+                mapping_arg: Optional[PlaceholderMap],
+            ) -> Optional[str]:
+                return self._structural_issues_for(
+                    entry_by_ctx[ctx].msgid,
+                    decoded_text,
+                    encoded_pp,
+                    mapping_arg,
+                    target_lang=target_lang_for_llm,
+                )
+
+            llm_outcomes = self._llm_validate_and_retry(
+                initial=initial_for_llm,
+                items={ctx: items.get(ctx, entry_by_ctx[ctx].msgid)
+                       for ctx in decoded_by_ctx},
+                decoded_sources=decoded_sources_for_llm,
+                mappings={ctx: mappings.get(ctx) for ctx in decoded_by_ctx},
+                reference_pairs=references,
+                glossary_block=glossary_block,
+                target_lang=self.target_lang,
+                usage=usage,
+                stats=stats,
+                structural_check=_struct_check,
+            )
+
+        for ctx, entry in entry_by_ctx.items():
+            mapping = mappings.get(ctx)
+            llm_outcome = llm_outcomes.get(ctx)
+            if ctx in per_entry_call_failures:
+                stats["failed"] += 1
+                continue
+            processed: Optional[str] = None
+            if llm_outcome is not None:
+                # LLM-validation path: the outcome already encapsulates
+                # post_process + decode for every retry attempt, so we
+                # skip the inline decode below and reuse the outcome.
+                self._tls.last_encoded_response = llm_outcome.encoded
+                self._tls.last_placeholder_map = llm_outcome.mapping
+                processed = llm_outcome.decoded
+            elif ctx in decoded_by_ctx:
+                # Validation disabled or LLM mode skipped this ctx
+                # (empty validator response): fall back to the
+                # already-decoded value with stash for structural.
+                self._tls.last_encoded_response = encoded_post_proc_by_ctx.get(
+                    ctx
+                )
                 self._tls.last_placeholder_map = mapping
-                processed = self._decode_translation(raw, mapping)
+                processed = decoded_by_ctx[ctx]
             else:
-                stats["per_entry_calls"] += 1
-                with pool_cm:
-                    similar = pool.find_similar(entry.msgid)
-                try:
-                    processed = self._call_llm(
-                        entry.msgid, reference_pairs=similar or None, usage=usage
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Per-entry fallback failed for %s: %s", ctx, exc
-                    )
-                    stats["failed"] += 1
-                    continue
+                # Neither batch nor per-entry produced a candidate.
+                stats["failed"] += 1
+                continue
 
             if processed is None:
                 stats["failed"] += 1
@@ -3578,6 +4393,23 @@ class MarkdownProcessor:
                     logger.warning(
                         "LLM returned untranslated output for entry %s", entry.msgctxt
                     )
+
+            # When LLM validation rejected this key after exhausting
+            # the retry budget, mark it fuzzy with the last reason via
+            # the same tcomment / fuzzy-flag path the structural
+            # validator uses.  Skip the structural ``_apply_validation``
+            # call for these keys — the LLM-rejected entry should not
+            # also be re-graded by structural and double-counted.
+            if llm_outcome is not None and not llm_outcome.passed:
+                self._mark_llm_validation_failed(
+                    entry, llm_outcome.reason, stats
+                )
+                stats["failed"] += 1
+                # Clear stash so the next per-entry call doesn't
+                # inherit an LLM-rejected ctx's mapping.
+                self._tls.last_encoded_response = None
+                self._tls.last_placeholder_map = None
+                continue
 
             if not self._apply_validation(entry, processed, inplace, pool, stats):
                 stats["failed"] += 1
@@ -4214,22 +5046,31 @@ class MarkdownProcessor:
             finally:
                 stats["batched_calls"] = stats.get("batched_calls", 0) + call_count
 
-        # Fan-out commit: per-lang PO writes.  A block that came back
-        # with full coverage commits to every pending lang; otherwise
-        # each lang falls back to the single-target per-entry call.
+        # T-16: build the per-(ctx, lang) initial state in a single
+        # pass — drawing first from the multi-target batched response
+        # and falling back to per-lang single-target calls for any
+        # (ctx, lang) the batch missed.  When ``validation == "llm"``,
+        # the entire collected initial set then flows through the
+        # per-lang validator+retry helper so per-lang fallbacks no
+        # longer skip grading.
+        decoded_by_ctx_lang: Dict[str, Dict[str, str]] = {
+            lang: {} for lang in langs
+        }
+        encoded_pp_by_ctx_lang: Dict[str, Dict[str, str]] = {
+            lang: {} for lang in langs
+        }
+        mapping_by_ctx_lang: Dict[str, Dict[str, Optional[PlaceholderMap]]] = {
+            lang: {} for lang in langs
+        }
+        per_lang_call_failures: Dict[str, set] = {lang: set() for lang in langs}
+
         for ctx, encoded in items.items():
-            entry_any = ctx_entries[ctx]
             mapping = mappings.get(ctx)
             returned = translated.get(ctx)
             for lang in langs:
                 if ctx not in pending_ctx_by_lang[lang]:
                     continue
-                entry = entry_by_ctx_by_lang[lang].get(ctx)
-                if entry is None:
-                    # The block is not present in this lang's PO —
-                    # nothing to commit.  This can happen when
-                    # ``sync_po`` drops entries under a rare race, but
-                    # is effectively a no-op here.
+                if entry_by_ctx_by_lang[lang].get(ctx) is None:
                     continue
 
                 raw: Optional[str] = None
@@ -4238,30 +5079,184 @@ class MarkdownProcessor:
                     if isinstance(lang_val, str):
                         raw = lang_val
 
-                if raw is None:
-                    # Per-lang fallback: run the single-target per-entry
-                    # call against the same pool the multi-target path
-                    # uses, so reference continuity is preserved.
-                    stats["per_entry_calls"] = stats.get("per_entry_calls", 0) + 1
-                    stats[f"_lang_per_entry_calls_{lang}"] = (
-                        stats.get(f"_lang_per_entry_calls_{lang}", 0) + 1
+                if raw is not None:
+                    if self._post_process:
+                        raw = self._post_process(raw)
+                    encoded_pp_by_ctx_lang[lang][ctx] = raw
+                    mapping_by_ctx_lang[lang][ctx] = mapping
+                    decoded_by_ctx_lang[lang][ctx] = self._decode_translation(
+                        raw, mapping
                     )
-                    similar = pools[lang].find_similar(entry.msgid)
-                    processed = self._call_lang_single(
-                        entry.msgid,
+                    continue
+
+                # Per-lang fallback: single-target per-entry call.
+                stats["per_entry_calls"] = stats.get("per_entry_calls", 0) + 1
+                stats[f"_lang_per_entry_calls_{lang}"] = (
+                    stats.get(f"_lang_per_entry_calls_{lang}", 0) + 1
+                )
+                similar = pools[lang].find_similar(ctx_entries[ctx].msgid)
+                processed_single = self._call_lang_single(
+                    ctx_entries[ctx].msgid,
+                    target_lang=lang,
+                    reference_pairs=similar or None,
+                    usage=usage,
+                )
+                if processed_single is None:
+                    per_lang_call_failures[lang].add(ctx)
+                    continue
+                stashed_encoded = getattr(
+                    self._tls, "last_encoded_response", None
+                )
+                stashed_mapping = getattr(
+                    self._tls, "last_placeholder_map", None
+                )
+                if stashed_encoded is not None:
+                    encoded_pp_by_ctx_lang[lang][ctx] = stashed_encoded
+                else:
+                    encoded_pp_by_ctx_lang[lang][ctx] = processed_single
+                mapping_by_ctx_lang[lang][ctx] = (
+                    stashed_mapping if stashed_mapping is not None else mapping
+                )
+                decoded_by_ctx_lang[lang][ctx] = processed_single
+
+        per_lang_outcomes: Dict[str, Dict[str, _ValidationOutcome]] = {
+            lang: {} for lang in langs
+        }
+        if self.validation == "llm":
+            for lang in langs:
+                lang_decoded = decoded_by_ctx_lang[lang]
+                if not lang_decoded:
+                    continue
+                lang_decoded_sources = {
+                    ctx: ctx_entries[ctx].msgid for ctx in lang_decoded
+                }
+                # Re-encode each source under THIS language's
+                # registry for the retry path — the shared multi-
+                # target ``items[ctx]`` was built against the union
+                # registry installed by ``process_document_multi``,
+                # which excludes only glyphs that are non-target for
+                # EVERY lang.  A retry on a non-constructor lang
+                # (e.g. ko in an [en, ko] run) would otherwise
+                # re-translate from the wrong placeholder/glossary
+                # mapping.  We keep the per-lang re-encode SEPARATE
+                # from the initial mapping so the first-pass
+                # round-trip check stays consistent with the
+                # encoding the LLM actually translated against on
+                # that pass; only the retry path uses the per-lang
+                # re-encoded mapping.
+                lang_retry_items: Dict[str, str] = {}
+                lang_retry_mappings: Dict[str, Optional[PlaceholderMap]] = {}
+                for ctx in lang_decoded:
+                    enc, mp = self._encode_source_for_lang(
+                        ctx_entries[ctx].msgid, lang
+                    )
+                    lang_retry_items[ctx] = enc
+                    lang_retry_mappings[ctx] = mp
+                lang_items = {ctx: items[ctx] for ctx in lang_decoded}
+                lang_mappings = mapping_by_ctx_lang[lang]
+                lang_initial: Dict[str, Tuple[str, str]] = {
+                    ctx: (
+                        encoded_pp_by_ctx_lang[lang].get(
+                            ctx, lang_decoded[ctx]
+                        ),
+                        lang_decoded[ctx],
+                    )
+                    for ctx in lang_decoded
+                }
+                # Per-lang validation: temporarily pin
+                # ``self.target_lang`` so ``_llm_validate_and_retry``'s
+                # validator + retry helpers target this language.
+                # Restored in the ``finally`` so an exception doesn't
+                # leak per-lang state into sibling lang grading.
+                # ``lang_glossary`` is the per-locale resolved
+                # glossary for THIS language so the structural
+                # pre-gate's glossary-preservation check sees the
+                # right mapping (Codex cycle-3 P1: the constructor's
+                # ``self._current_glossary`` is pinned to a single
+                # locale and would mis-report glossary preservation
+                # for every non-constructor language otherwise).
+                original_target = self.target_lang
+                self.target_lang = lang
+                lang_glossary = self._resolve_glossary_for_lang(lang)
+
+                def _struct_check_lang(
+                    ctx: str,
+                    decoded_text: str,
+                    encoded_pp: str,
+                    mapping_arg: Optional[PlaceholderMap],
+                    _lang: str = lang,
+                    _glossary: Optional[Dict[str, Optional[str]]] = lang_glossary,
+                ) -> Optional[str]:
+                    return self._structural_issues_for(
+                        ctx_entries[ctx].msgid,
+                        decoded_text,
+                        encoded_pp,
+                        mapping_arg,
+                        target_lang=_lang,
+                        glossary=_glossary,
+                    )
+
+                try:
+                    per_lang_outcomes[lang] = self._llm_validate_and_retry(
+                        initial=lang_initial,
+                        items=lang_items,
+                        decoded_sources=lang_decoded_sources,
+                        mappings=lang_mappings,
+                        reference_pairs=per_lang_references.get(lang),
+                        glossary_block=(
+                            per_lang_glossary_blocks.get(lang)
+                            if per_lang_glossary_blocks
+                            else None
+                        ),
                         target_lang=lang,
-                        reference_pairs=similar or None,
                         usage=usage,
+                        stats=stats,
+                        structural_check=_struct_check_lang,
+                        retry_items=lang_retry_items,
+                        retry_mappings=lang_retry_mappings,
                     )
-                    if processed is None:
+                finally:
+                    self.target_lang = original_target
+
+        # Fan-out commit: per-lang PO writes.  Each (ctx, lang) pair
+        # routes through the LLM-validation outcome when one exists,
+        # otherwise the pre-decoded value from the initial pass.
+        for ctx, encoded in items.items():
+            for lang in langs:
+                if ctx not in pending_ctx_by_lang[lang]:
+                    continue
+                entry = entry_by_ctx_by_lang[lang].get(ctx)
+                if entry is None:
+                    continue
+
+                if ctx in per_lang_call_failures[lang]:
+                    stats["failed"] = stats.get("failed", 0) + 1
+                    stats[f"_lang_failed_{lang}"] = (
+                        stats.get(f"_lang_failed_{lang}", 0) + 1
+                    )
+                    continue
+
+                lang_outcome = per_lang_outcomes.get(lang, {}).get(ctx)
+                if lang_outcome is not None:
+                    self._tls.last_encoded_response = lang_outcome.encoded
+                    self._tls.last_placeholder_map = lang_outcome.mapping
+                    if not lang_outcome.passed:
+                        self._mark_llm_validation_failed(
+                            entry, lang_outcome.reason, stats
+                        )
                         stats["failed"] = stats.get("failed", 0) + 1
                         stats[f"_lang_failed_{lang}"] = (
                             stats.get(f"_lang_failed_{lang}", 0) + 1
                         )
+                        stats[f"_lang_validation_failed_{lang}"] = (
+                            stats.get(f"_lang_validation_failed_{lang}", 0) + 1
+                        )
+                        self._tls.last_encoded_response = None
+                        self._tls.last_placeholder_map = None
                         continue
                     self._commit_multi_entry(
                         entry=entry,
-                        processed=processed,
+                        processed=lang_outcome.decoded,
                         lang=lang,
                         po_manager=po_managers[lang],
                         pool=pools[lang],
@@ -4269,13 +5264,20 @@ class MarkdownProcessor:
                     )
                     continue
 
-                # Normal path: post_process, round-trip stash for
-                # validation, decode, commit.
-                if self._post_process:
-                    raw = self._post_process(raw)
-                self._tls.last_encoded_response = raw
-                self._tls.last_placeholder_map = mapping
-                processed = self._decode_translation(raw, mapping)
+                if ctx not in decoded_by_ctx_lang[lang]:
+                    # Neither batch nor per-lang fallback produced a
+                    # candidate (and it was not an explicit failure
+                    # — that path was taken above).  Treat as
+                    # missing, leave the entry pending.
+                    continue
+
+                processed = decoded_by_ctx_lang[lang][ctx]
+                self._tls.last_encoded_response = encoded_pp_by_ctx_lang[
+                    lang
+                ].get(ctx)
+                self._tls.last_placeholder_map = mapping_by_ctx_lang[
+                    lang
+                ].get(ctx)
                 self._commit_multi_entry(
                     entry=entry,
                     processed=processed,
@@ -4686,12 +5688,23 @@ class MarkdownProcessor:
                 issues.append(stability)
 
         if self.validation != "off":
+            # Structural validator only knows ``conservative`` /
+            # ``strict``; ``llm`` is a wholly separate gate (the
+            # second-pass grader) that runs *before* this method.
+            # Keep the cheap structural checks running as a pre-gate
+            # under ``llm`` mode (heading-level / fence-count /
+            # placeholder round-trip / language stability) but
+            # without the strict inline-code-count check that is only
+            # opt-in.
+            structural_mode = (
+                "conservative" if self.validation == "llm" else self.validation
+            )
             result = validate_translation(
                 entry.msgid,
                 processed,
                 target_lang=self.target_lang,
                 glossary=self._current_glossary(),
-                mode=self.validation,
+                mode=structural_mode,
                 purpose=self.mode,
             )
             # Deduplicate: when ``validation != "off"`` the refine-purpose
@@ -4729,6 +5742,137 @@ class MarkdownProcessor:
         if stats is not None:
             stats["validation_failed"] = stats.get("validation_failed", 0) + 1
         return False
+
+    def _structural_issues_for(
+        self,
+        entry_msgid: str,
+        processed: str,
+        encoded_response: Optional[str],
+        mapping: Optional[PlaceholderMap],
+        target_lang: str,
+        glossary: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Optional[str]:
+        """Return a one-line structural reason on fail or ``None`` on pass.
+
+        Side-effect-free counterpart to :meth:`_apply_validation` that
+        reports issues without writing to the PO entry, the reference
+        pool, or ``stats``.  Used by the LLM retry loop as a pre-gate
+        so structurally bad output (placeholder round-trip, fence
+        count, heading drift, refine language stability) consumes the
+        retry budget the same way an LLM-flagged miss does.
+
+        ``encoded_response`` is the post-processed encoded raw output
+        (the same thing ``_apply_validation`` reads from TLS).  When
+        no placeholder mapping is active or the encoded form is
+        unavailable the round-trip portion silently no-ops.
+
+        ``glossary`` overrides :meth:`_current_glossary` so the
+        per-lang multi-target retry loop can pre-gate against the
+        right locale's glossary mapping (resolved via
+        :meth:`_resolve_glossary_for_lang`) instead of the
+        constructor-time pinning.  ``None`` (default) preserves the
+        single-target behaviour.
+        """
+        issues: List[ValidationIssue] = []
+
+        if mapping and encoded_response is not None:
+            reason = check_round_trip(encoded_response, mapping)
+            if reason:
+                issues.append(ValidationIssue("placeholder_roundtrip", reason))
+
+            anchor_overrides = self._builtin_overrides.get(
+                "anchor", [(ANCHOR_PATTERN, None)]
+            )
+            html_attr_overrides = self._builtin_overrides.get(
+                "html_attr", [(HTML_ATTR_PATTERN, None)]
+            )
+            position_reasons: List[str] = []
+            for a_regex, a_pred in anchor_overrides:
+                r = check_structural_position(
+                    entry_msgid,
+                    processed,
+                    anchor_pattern=a_regex,
+                    anchor_predicate=a_pred,
+                    check_html_attr=False,
+                )
+                if r:
+                    position_reasons.append(r)
+            for h_regex, h_pred in html_attr_overrides:
+                r = check_structural_position(
+                    entry_msgid,
+                    processed,
+                    html_attr_pattern=h_regex,
+                    html_attr_predicate=h_pred,
+                    check_anchor=False,
+                )
+                if r:
+                    position_reasons.append(r)
+            if position_reasons:
+                issues.append(
+                    ValidationIssue(
+                        "placeholder_position",
+                        "; ".join(position_reasons),
+                    )
+                )
+
+        # Refine mode language-stability check fires regardless of
+        # the validation knob — same contract as ``_apply_validation``.
+        if self.mode == "refine":
+            stability = check_language_stability(entry_msgid, processed)
+            if stability is not None:
+                issues.append(stability)
+
+        if self.validation != "off":
+            structural_mode = (
+                "conservative" if self.validation == "llm" else self.validation
+            )
+            effective_glossary = (
+                glossary if glossary is not None else self._current_glossary()
+            )
+            result = validate_translation(
+                entry_msgid,
+                processed,
+                target_lang=target_lang,
+                glossary=effective_glossary,
+                mode=structural_mode,
+                purpose=self.mode,
+            )
+            seen_checks = {i.check for i in issues}
+            for issue in result.issues:
+                if issue.check in seen_checks:
+                    continue
+                issues.append(issue)
+
+        if not issues:
+            return None
+        return "; ".join(f"{i.check}: {i.detail}" for i in issues)
+
+    def _mark_llm_validation_failed(
+        self,
+        entry: polib.POEntry,
+        reason: str,
+        stats: Optional[Dict[str, int]] = None,
+    ) -> None:
+        """Mark ``entry`` fuzzy after LLM validation exhausted its retries.
+
+        Mirrors the failure path of :meth:`_apply_validation`: stamps a
+        ``validator: llm: <reason>`` line into tcomment, raises the
+        ``fuzzy`` flag, blanks msgstr (so ``rebuild_markdown`` falls
+        back to the source until a human resolves the entry), and
+        increments ``validation_failed``.  Centralised here so the
+        single-target and multi-target paths produce identical PO
+        artefacts when the LLM grader rejects a translation.
+        """
+        prefixed = f"validator: llm: {reason}"
+        existing = entry.tcomment or ""
+        entry.tcomment = (
+            f"{existing}\n{prefixed}".strip() if existing else prefixed
+        )
+        if "fuzzy" not in entry.flags:
+            entry.flags.append("fuzzy")
+        entry.msgstr = ""
+        if stats is not None:
+            stats["validation_failed"] = stats.get("validation_failed", 0) + 1
 
     # ----- helpers -----
 

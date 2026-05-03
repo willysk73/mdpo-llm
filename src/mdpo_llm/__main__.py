@@ -107,9 +107,42 @@ def _add_translate_flags(
     )
     parser.add_argument(
         "--validation",
-        choices=["off", "conservative", "strict"],
+        choices=["off", "conservative", "strict", "llm"],
         default="off",
-        help="Post-translation structural validation.",
+        help=(
+            "Post-translation validation mode. 'off' (default), "
+            "'conservative' / 'strict' run structural checks, "
+            "'llm' (T-16) adds a second LLM grading pass with a "
+            "bounded retry loop driven by --max-retries / "
+            "--fallback-model. 'llm' implies the conservative "
+            "structural checks as a cheap pre-gate."
+        ),
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "Retry budget for --validation=llm. Clamped to 0..10. "
+            "Each batch runs at most 1 + N attempts; the validator's "
+            "rejection reasons accumulate across attempts and are "
+            "appended to the system prompt under "
+            "'**PREVIOUS ATTEMPT REJECTED — REASONS:**'. Ignored "
+            "when --validation is not 'llm'. Default: 3."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-model",
+        type=str,
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Optional LiteLLM model string used for retry attempts "
+            "from index ceil(N/2) onward when --validation=llm. "
+            "Unset (default) keeps every retry on the primary "
+            "--model."
+        ),
     )
     parser.add_argument(
         "--glossary",
@@ -199,6 +232,8 @@ def _build_processor(
         batch_max_chars=args.batch_max_chars,
         batch_concurrency=getattr(args, "batch_concurrency", 1),
         validation=getattr(args, "validation", "off"),
+        max_retries=getattr(args, "max_retries", 3),
+        fallback_model=getattr(args, "fallback_model", None),
         max_reference_pairs=args.max_reference_pairs,
         extra_instructions=getattr(args, "extra_instructions", None),
         glossary_path=getattr(args, "glossary", None),
@@ -1051,9 +1086,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_multi.add_argument(
         "--validation",
-        choices=["off", "conservative", "strict"],
+        choices=["off", "conservative", "strict", "llm"],
         default="off",
-        help="Post-translation structural validation.",
+        help=(
+            "Post-translation validation mode. 'llm' (T-16) adds a "
+            "second LLM grading pass with a bounded retry loop. "
+            "Each language runs its own validator call and "
+            "independent retry budget."
+        ),
+    )
+    p_multi.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "Retry budget for --validation=llm. Clamped to 0..10. "
+            "Ignored when --validation is not 'llm'. Default: 3."
+        ),
+    )
+    p_multi.add_argument(
+        "--fallback-model",
+        type=str,
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Optional LiteLLM model string used for retry attempts "
+            "from index ceil(N/2) onward when --validation=llm."
+        ),
     )
     p_multi.add_argument(
         "--glossary",

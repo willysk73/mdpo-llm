@@ -5,6 +5,7 @@ with GNU gettext PO files for efficient translation workflows.
 """
 
 from .batch import BatchTranslator, MultiTargetBatchTranslator
+from .llm_validator import BinaryGrade, LLMValidator
 from .processor import MarkdownProcessor, Mode
 from .prompts import Prompts
 from .reference_pool import ReferencePool
@@ -18,6 +19,8 @@ __all__ = [
     "ReferencePool",
     "BatchTranslator",
     "MultiTargetBatchTranslator",
+    "BinaryGrade",
+    "LLMValidator",
 ]
 
 # Create main class alias for better naming

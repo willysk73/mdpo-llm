@@ -9,6 +9,20 @@
 
 mdpo-llm splits your Markdown into blocks, tracks each one in a PO file, and sends only new or changed blocks to your LLM. Edit one paragraph in a 50-block document? One API call, not fifty.
 
+## What's new in v0.5
+
+- **LLM validation + bounded retry loop** (T-16). Opt in with
+  `validation="llm"` to add a second-pass grader LLM that scores each
+  translated batch against the source. Failed keys retry with the
+  full history of rejection reasons appended to the system prompt
+  (`**PREVIOUS ATTEMPT REJECTED — REASONS:**`); at retry index
+  `ceil(max_retries / 2)` the loop swaps to `fallback_model` if one
+  is configured. Residual failures after the budget exhausts are
+  marked fuzzy with the last reason in tcomment. Defaults: 3 retries,
+  no fallback model. Configure via `--max-retries` /
+  `--fallback-model` (or the matching constructor kwargs).
+  Structural `conservative` checks still run as a cheap pre-gate.
+
 ## What's new in v0.3
 
 - **Batched JSON-mode translation** (default on). A 50-block first-run collapses from 50 serial calls to ~2 batched calls.
@@ -400,6 +414,72 @@ span still wins on decode.
 
 Reach for this only when neither auto-bracket (T-14) nor glossary
 covers your token shape — those should be your first stop.
+
+## LLM validation + bounded retry loop (T-16)
+
+The default `validation="conservative"` / `"strict"` checks are
+cheap structural assertions (heading levels match, fence counts
+match, glossary preservation holds). They catch shape regressions
+but not subtle quality issues like a translation that picked the
+wrong term, dropped a clause, or quietly left a sentence in the
+source language.
+
+`validation="llm"` (opt-in) adds a *second* LLM pass that grades
+each translated batch against its source and retries the failed
+keys only:
+
+```bash
+python -m mdpo_llm translate \
+  --model gpt-4o \
+  --target ko \
+  --validation llm \
+  --max-retries 3 \
+  --fallback-model "anthropic/claude-sonnet-4-5-20250929" \
+  source.md target.md
+```
+
+Pipeline per batch:
+
+1. Translate (existing path).
+2. Run the structural validator as a cheap pre-gate.
+3. Send each `{source, output}` pair to a validator LLM that returns
+   `{key: {binary_score, reason}}` via JSON mode.
+4. Partition pass / fail keys.
+5. Retry only the failed keys; the **full history** of rejection
+   reasons is appended to the system prompt under
+   `**PREVIOUS ATTEMPT REJECTED — REASONS:**`.
+6. At retry index `ceil(max_retries / 2)`, the loop swaps to
+   `--fallback-model` (when one is configured).
+7. Re-grade the retry candidates.
+8. After `max_retries` retries, residual failures are marked fuzzy
+   with the **last** rejection reason recorded in `tcomment`.
+
+Tunables:
+
+- `--max-retries N` (default `3`, clamped to `0..10`). `N=0` runs
+  the grader once and marks any failure fuzzy without retrying;
+  larger values trade tokens for quality.
+- `--fallback-model MODEL` (default unset). When unset, every
+  retry stays on `--model`. When set, the swap fires at the
+  midpoint of the retry budget so the second half of attempts
+  uses the alternate model — useful when the primary model
+  consistently misses a class of translations and a different
+  model is more likely to recover.
+- `validation="llm"` implies the structural `conservative` checks;
+  you don't need to run a separate `validation="conservative"` pass.
+
+Reference pool on retry:  every key that has *already passed* in
+this batch becomes a few-shot example for the keys that have not
+— a free intra-batch consistency signal at zero extra LLM cost.
+
+Multi-target (`process_document_multi`):  each language fans out
+to its own validator call (the grader judges in that language's
+context) and runs an independent retry budget per lang.
+
+Cost note:  LLM validation roughly doubles input tokens per batch
+and adds output tokens. Expected use is publishing / CI flows;
+`validation="conservative"` (or `"off"`) stays the right default
+for daily iterative work.
 
 ## Refine mode
 

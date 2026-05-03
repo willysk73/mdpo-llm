@@ -3,6 +3,45 @@
 ## Unreleased
 
 ### Added
+- **LLM validation + bounded retry loop (T-16).** New opt-in
+  `validation="llm"` mode wires a second-pass grader LLM and a
+  bounded retry loop into the per-batch translate path:
+  - Every translated batch is sent to a validator LLM that returns
+    `{key: {binary_score: "yes"|"no", reason: str}}` via JSON mode.
+    Pass / fail is partitioned per key.
+  - Failed keys are retried via `BatchTranslator` with the **full
+    history** of rejection reasons appended to the system prompt
+    under `**PREVIOUS ATTEMPT REJECTED — REASONS:**`. Reasons are
+    per-key (sibling failures don't poison each other's prompts)
+    and accumulate across attempts.
+  - At retry index `ceil(max_retries / 2)`, retries swap to
+    `fallback_model` when one is configured. Validator calls in
+    that half also pin to the fallback so the grader stays
+    consistent with the translator.
+  - Already-passing keys from the same batch are injected as
+    few-shot reference pairs on retry — a free intra-batch
+    consistency signal at zero extra LLM cost.
+  - Residual failures after the budget is exhausted are marked
+    fuzzy with the **last** rejection reason in `tcomment` (prefix
+    `validator: llm:`).
+  - Multi-target `process_document_multi` runs a per-language
+    validator call (the grader judges in each language's context)
+    with independent per-lang retry budgets.
+  - Validator wire format degrades gracefully: malformed JSON
+    bisects down to single keys and individual key failures drop
+    out so the surrounding retry budget can recover them.
+  - Translatability gating: the validator prompt explicitly allows
+    identical-output PASS for code-only / URL-only blocks, so
+    pure-code passages don't burn the retry budget.
+  - New constructor kwargs: `max_retries: int = 3` (clamped
+    `0..10`), `fallback_model: Optional[str] = None`. New CLI flags
+    `--max-retries N` and `--fallback-model MODEL` on every LLM-
+    issuing subcommand. Updated `--validation` choices to include
+    `llm`.
+  - New public symbols: `mdpo_llm.LLMValidator`,
+    `mdpo_llm.BinaryGrade` (re-exports of
+    `mdpo_llm.llm_validator.{LLMValidator, BinaryGrade}`), plus a
+    new `Prompts.VALIDATE_*` family of validator prompt constants.
 - **CLI plumbing for custom placeholder patterns.** New
   `--placeholder-rules PATH` flag on the LLM-issuing subcommands
   (`translate`, `translate-dir`, `translate-multi`, `refine`,
