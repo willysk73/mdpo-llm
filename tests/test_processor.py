@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mdpo_llm.placeholder import PlaceholderRegistry
 from mdpo_llm.processor import MarkdownProcessor
 
 
@@ -910,3 +911,501 @@ class TestRefineGlossaryFilter:
             refined, translated, tmp_path / "translate.po"
         )
         assert "게임코드" in translated.read_text(encoding="utf-8")
+
+
+class TestAutoBracketPlaceholders:
+    """T-14: auto-register source-language bracket placeholders."""
+
+    def test_auto_register_defaults_on_and_tokenizes_non_ascii_bracket(
+        self, mock_completion
+    ):
+        proc = MarkdownProcessor(model="test-model", target_lang="en")
+        assert proc.auto_bracket_placeholders is True
+        source = "UI label <\uc804\uc1a1> triggers submit."
+        encoded, mapping = proc._encode_source(source)
+        assert "<\uc804\uc1a1>" not in encoded
+        assert any(
+            p.pattern_name == "auto_bracket_angle" and p.original == "<\uc804\uc1a1>"
+            for p in mapping
+        )
+
+    def test_auto_register_tokenizes_brace_url_parameter(self, mock_completion):
+        proc = MarkdownProcessor(model="test-model", target_lang="en")
+        source = "path /users/{\uac8c\uc784\ucf54\ub4dc}/profile"
+        encoded, mapping = proc._encode_source(source)
+        assert "{\uac8c\uc784\ucf54\ub4dc}" not in encoded
+        assert any(
+            p.pattern_name == "auto_bracket_brace"
+            and p.original == "{\uac8c\uc784\ucf54\ub4dc}"
+            for p in mapping
+        )
+
+    def test_auto_register_leaves_ascii_brackets_alone_for_latin_target(
+        self, mock_completion
+    ):
+        # For a Latin/ASCII target (``en``) the detection rule is
+        # "content has a word char NOT in the Latin/ASCII range", so
+        # pure-ASCII brackets are target-script and flow through the
+        # translate prompt.  Under a CJK target the same brackets
+        # would count as non-target-script identifiers and DO match
+        # — that case is covered by
+        # :meth:`test_auto_register_respects_target_script_for_cjk_target`.
+        proc = MarkdownProcessor(model="test-model", target_lang="en")
+        source = "path /{page_id}/edit uses {template}."
+        encoded, mapping = proc._encode_source(source)
+        auto_matches = [
+            p for p in mapping if p.pattern_name.startswith("auto_bracket_")
+        ]
+        assert auto_matches == []
+        assert encoded == source
+
+    def test_auto_register_leaves_mustache_templates_alone(self, mock_completion):
+        # ``{{한글}}`` would match a naive inner ``{한글}`` pattern; the
+        # lookbehind / lookahead guard keeps the runtime template intact
+        # so the template engine still sees its own delimiters.
+        proc = MarkdownProcessor(model="test-model", target_lang="en")
+        source = "template {{\ud55c\uae00}} substitution"
+        encoded, mapping = proc._encode_source(source)
+        auto_matches = [
+            p for p in mapping if p.pattern_name.startswith("auto_bracket_")
+        ]
+        assert auto_matches == []
+        assert encoded == source
+
+    def test_auto_register_opt_out_via_kwarg(self, mock_completion):
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            auto_bracket_placeholders=False,
+        )
+        assert proc.auto_bracket_placeholders is False
+        source = "Do not tokenize <\uc804\uc1a1> here."
+        encoded, mapping = proc._encode_source(source)
+        auto_matches = [
+            p for p in mapping if p.pattern_name.startswith("auto_bracket_")
+        ]
+        assert auto_matches == []
+        assert encoded == source
+
+    def test_env_var_overrides_kwarg_to_disable(self, monkeypatch, mock_completion):
+        monkeypatch.setenv("MDPO_AUTO_BRACKET_PLACEHOLDERS", "0")
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            auto_bracket_placeholders=True,
+        )
+        assert proc.auto_bracket_placeholders is False
+
+    def test_env_var_overrides_kwarg_to_enable(self, monkeypatch, mock_completion):
+        monkeypatch.setenv("MDPO_AUTO_BRACKET_PLACEHOLDERS", "yes")
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            auto_bracket_placeholders=False,
+        )
+        assert proc.auto_bracket_placeholders is True
+
+    def test_env_var_unrecognised_value_falls_back_to_kwarg(
+        self, monkeypatch, mock_completion
+    ):
+        # Typos in the env var must not silently flip the setting — the
+        # constructor kwarg stays authoritative unless the env value is
+        # a recognised on/off keyword.
+        monkeypatch.setenv("MDPO_AUTO_BRACKET_PLACEHOLDERS", "maybe")
+        proc_on = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            auto_bracket_placeholders=True,
+        )
+        assert proc_on.auto_bracket_placeholders is True
+        proc_off = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            auto_bracket_placeholders=False,
+        )
+        assert proc_off.auto_bracket_placeholders is False
+
+    def test_glossary_entry_wins_over_auto_register(self, mock_completion):
+        # When a caller-supplied glossary term covers the inner span of a
+        # bracket, glossary wins: auto-register defers so the glossary
+        # pattern gets to tokenize (and, for mapped entries, decode to
+        # the target form).  Without this the outer auto-bracket span
+        # would swallow the inner glossary match via overlap resolution.
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            glossary={"\uac8c\uc784\ucf54\ub4dc": None},
+            glossary_mode="placeholder",
+        )
+        source = "use {\uac8c\uc784\ucf54\ub4dc} to identify the entry"
+        encoded, mapping = proc._encode_source(source)
+        names = [p.pattern_name for p in mapping]
+        # Glossary tokenized the bare term; auto-bracket stayed out.
+        assert any(n == "glossary:\uac8c\uc784\ucf54\ub4dc" for n in names)
+        assert not any(n.startswith("auto_bracket_") for n in names)
+        assert "{\uac8c\uc784\ucf54\ub4dc}" not in encoded
+        # Brackets survive in the encoded text; only the inner term is a token.
+        assert "{" in encoded and "}" in encoded
+
+    def test_unrelated_glossary_entries_do_not_block_auto_register(
+        self, mock_completion
+    ):
+        # A glossary term that does NOT appear inside the bracket must
+        # not prevent auto-register from firing — glossary-defers is
+        # scoped to the specific bracket span.
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            glossary={"unrelated": None},
+            glossary_mode="placeholder",
+        )
+        source = "prefix <\uc804\uc1a1> suffix"
+        encoded, mapping = proc._encode_source(source)
+        assert "<\uc804\uc1a1>" not in encoded
+        assert any(p.pattern_name == "auto_bracket_angle" for p in mapping)
+
+    def test_round_trip_after_llm_preserves_token(self, mock_completion):
+        # End-to-end with the mock LLM: the mocked completion prefixes
+        # ``[TRANSLATED] `` onto whatever the user content was — since
+        # the content is already the encoded source with a placeholder
+        # token, the token survives the round trip and decode restores
+        # the original bracket.
+        proc = MarkdownProcessor(model="test-model", target_lang="en", batch_size=0)
+        source = "See <\uc804\uc1a1> label."
+        result = proc._call_llm(source)
+        assert "<\uc804\uc1a1>" in result
+        assert result.startswith("[TRANSLATED] ")
+
+    def test_user_pattern_wins_tie_with_auto_register(self, mock_completion):
+        # A user-supplied pattern whose match exactly coincides with an
+        # auto-bracket match gets priority via registration order (user
+        # patterns first, auto-register last), so the ``pattern_name``
+        # on the resulting placeholder comes from the user.
+        user_reg = PlaceholderRegistry()
+        user_reg.register("explicit_angle", r"<[^<>]+>")
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            placeholders=user_reg,
+        )
+        source = "See <\uc804\uc1a1> label."
+        _, mapping = proc._encode_source(source)
+        assert len(mapping) == 1
+        assert mapping.items[0].pattern_name == "explicit_angle"
+
+    def test_instruction_glossary_null_entry_is_protected_by_auto_register(
+        self, mock_completion
+    ):
+        # Regression guard for a cycle-1 P2 finding: in instruction
+        # mode ``_build_effective_registry`` does NOT register
+        # ``glossary:<term>`` patterns (only placeholder mode does).
+        # For null-entries the caller's intent is "preserve verbatim",
+        # which is exactly what auto-bracket provides — so it must
+        # fire instead of deferring to nothing.
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            glossary={"\uac8c\uc784\ucf54\ub4dc": None},
+            glossary_mode="instruction",
+        )
+        source = "use {\uac8c\uc784\ucf54\ub4dc} to identify the entry"
+        encoded, mapping = proc._encode_source(source)
+        names = [p.pattern_name for p in mapping]
+        assert any(n == "auto_bracket_brace" for n in names)
+        assert "{\uac8c\uc784\ucf54\ub4dc}" not in encoded
+
+    def test_instruction_glossary_mapped_entry_defers_auto_register(
+        self, mock_completion
+    ):
+        # Regression guard for a cycle-7 P1 finding: an explicit
+        # ``"\uac8c\uc784\ucf54\ub4dc" -> "GameCode"`` mapping in
+        # instruction mode means the LLM should SEE the source term
+        # and render the mapping.  Auto-bracketing the whole
+        # ``{\uac8c\uc784\ucf54\ub4dc}`` span would freeze the source
+        # and silently prevent the caller's translation instruction
+        # from applying.  The predicate must defer to mapped-entry
+        # terms so the glossary prompt block can drive the output.
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            glossary={"\uac8c\uc784\ucf54\ub4dc": "GameCode"},
+            glossary_mode="instruction",
+        )
+        source = "use {\uac8c\uc784\ucf54\ub4dc} to identify the entry"
+        encoded, mapping = proc._encode_source(source)
+        names = [p.pattern_name for p in mapping]
+        assert not any(n.startswith("auto_bracket_") for n in names)
+        assert encoded == source
+
+    def test_instruction_glossary_identity_mapping_is_protected(
+        self, mock_completion
+    ):
+        # Identity mappings (``"API" -> "API"``) also have a
+        # "preserve verbatim" effect in instruction mode, so they
+        # stay in the auto-bracket protection path instead of
+        # deferring.  A bracketed identity-mapped term with an
+        # otherwise non-target-script context still tokenizes.
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            glossary={"\uac8c\uc784\ucf54\ub4dc": "\uac8c\uc784\ucf54\ub4dc"},
+            glossary_mode="instruction",
+        )
+        source = "use {\uac8c\uc784\ucf54\ub4dc} here"
+        _, mapping = proc._encode_source(source)
+        assert any(
+            p.pattern_name == "auto_bracket_brace" for p in mapping
+        )
+
+    def test_registry_cache_key_includes_instruction_mode_mapped_terms(
+        self, mock_completion
+    ):
+        # Regression guard for a cycle-9 P2 finding: the auto-bracket
+        # predicate now depends on the mapped-term subset of the
+        # active glossary even in instruction mode (cycle-7 fix).
+        # ``_registry_for_glossary`` used to cache every instruction-
+        # mode registry under ``None`` so two per-file glossaries
+        # that differ ONLY in their mappings would share the wrong
+        # cached registry during a ``process_directory`` run — a
+        # mapped term from one file would suppress auto-bracket in
+        # another file, or vice versa.
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            glossary_mode="instruction",
+        )
+        reg_mapped = proc._registry_for_glossary(
+            {"\uac8c\uc784\ucf54\ub4dc": "GameCode"}
+        )
+        reg_null = proc._registry_for_glossary(
+            {"\uac8c\uc784\ucf54\ub4dc": None}
+        )
+        # Different glossaries → distinct cached registries (by
+        # identity, because the cache key set differs).  If the fix
+        # were missing, both keys would collapse to ``None`` and the
+        # second call would return the same registry as the first.
+        assert reg_mapped is not reg_null
+
+    def test_multi_target_fallback_resolves_glossary_for_fallback_lang(
+        self, mock_completion
+    ):
+        # Regression guard for a cycle-19 P1 finding: when the
+        # multi-target fallback rebuilds its placeholder registry
+        # it must resolve the glossary for the FALLBACK language,
+        # not the processor's constructor locale.  Locale-specific
+        # mappings (``{"게임코드": {"en": null, "ja": "GameCode"}}``)
+        # otherwise silently drop out of the fallback's defer set
+        # and the ja pass never sees the raw term needed to apply
+        # the mapping.
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            glossary={"\uac8c\uc784\ucf54\ub4dc": {"en": None, "ja": "GameCode"}},
+            glossary_mode="instruction",
+        )
+        result = proc._call_lang_single(
+            "use {\uac8c\uc784\ucf54\ub4dc} here", target_lang="ja"
+        )
+        # The ja fallback's predicate defers for the mapped term,
+        # so auto-bracket does NOT fire.  The mock returns the
+        # bracketed source unchanged (prefixed with ``[TRANSLATED] ``)
+        # because the encoded text equals the raw source.
+        assert result is not None
+        assert "{\uac8c\uc784\ucf54\ub4dc}" in result
+        # And the en fallback's null-entry keeps auto-bracket
+        # protection, so the bracketed term is tokenized before the
+        # mock sees it and then decoded back — end-to-end
+        # preservation.
+        result_en = proc._call_lang_single(
+            "use {\uac8c\uc784\ucf54\ub4dc} here", target_lang="en"
+        )
+        assert result_en is not None
+        assert "{\uac8c\uc784\ucf54\ub4dc}" in result_en
+
+    def test_multi_target_per_lang_fallback_uses_per_lang_registry(
+        self, mock_completion
+    ):
+        # Regression guard for a cycle-18 P1 finding: the union
+        # registry installed for the shared-encoding path leaks
+        # into the per-lang fallback (``_call_lang_single``) via
+        # TLS.  That would cause an English fallback on an
+        # ``[en, ko]`` run to still union ``ko``'s Hangul into the
+        # target-script, so ``{\uc804\uc1a1}`` would reach the
+        # model unprotected even though a direct ``target_lang="en"``
+        # call would tokenize it.  The fallback must swap TLS to a
+        # per-lang registry for the duration of the call.
+        proc = MarkdownProcessor(model="test-model", target_lang="en")
+        # Install the multi-target union registry to simulate what
+        # process_document_multi does, then call the fallback.
+        proc._tls.per_file_registry = proc._build_effective_registry(
+            proc._placeholders,
+            glossary=None,
+            update_builtin_overrides=False,
+            target_langs_override=["en", "ko"],
+        )
+        try:
+            result = proc._call_lang_single(
+                "use {\uc804\uc1a1} here", target_lang="en"
+            )
+        finally:
+            del proc._tls.per_file_registry
+        # Fallback ran with the per-lang English registry, where
+        # Hangul IS non-target-script and ``{\uc804\uc1a1}`` gets
+        # tokenized before the mock ``litellm.completion`` sees it.
+        # The mock returns ``[TRANSLATED] `` + the encoded text,
+        # which should then decode back to include the original
+        # ``{\uc804\uc1a1}`` verbatim.
+        assert result is not None
+        assert "{\uc804\uc1a1}" in result
+
+    def test_multi_target_unions_mapped_glossary_across_langs(
+        self, mock_completion
+    ):
+        # Regression guard for a cycle-10 P1 finding: the shared
+        # predicate in ``process_document_multi`` must defer for a
+        # term that is MAPPED in ANY requested lang, not just the
+        # constructor locale.  A per-locale glossary like
+        # ``{"\uac8c\uc784\ucf54\ub4dc": {"en": None, "ja": "GameCode"}}``
+        # says "preserve for en, map for ja"; auto-bracket must
+        # defer so the ja pass sees the raw term and can apply the
+        # mapping, even though the constructor was built for ``en``.
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            glossary={"\uac8c\uc784\ucf54\ub4dc": {"en": None, "ja": "GameCode"}},
+            glossary_mode="instruction",
+        )
+        # Replicate the multi-target install: collect mapped terms
+        # across langs and hand them to ``_build_effective_registry``
+        # the same way ``process_document_multi`` does.
+        raw_chain = dict(proc._glossary_inline or {})
+        defer: list = []
+        for lang in ("en", "ja"):
+            resolved = proc._resolve_raw_for_lang(raw_chain, lang)
+            for t, v in resolved.items():
+                if v is not None and v != t:
+                    defer.append(t)
+        proc._tls.per_file_registry = proc._build_effective_registry(
+            proc._placeholders,
+            glossary=None,
+            update_builtin_overrides=False,
+            target_langs_override=["en", "ja"],
+            auto_bracket_defer_terms=defer,
+        )
+        try:
+            # The mapped term appears only in ja; the shared encoding
+            # must defer auto-bracket so the ja pass can render the
+            # GameCode mapping.
+            source = "use {\uac8c\uc784\ucf54\ub4dc} here"
+            encoded, mapping = proc._encode_source(source)
+            assert not any(
+                p.pattern_name.startswith("auto_bracket_") for p in mapping
+            )
+            assert encoded == source
+        finally:
+            del proc._tls.per_file_registry
+
+    def test_multi_target_encoding_unions_script_ranges(
+        self, mock_completion, tmp_path
+    ):
+        # Regression guard for a cycle-9 P1 finding: shared encoding
+        # must protect neither source-Hangul nor source-Latin so
+        # each per-lang pass (en, ko) can translate / refine its
+        # target-script content.  Verified by installing the multi-
+        # target registry on the TLS slot directly, then encoding.
+        proc = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            glossary_mode="instruction",
+        )
+        # ``_build_effective_registry`` with the multi-target
+        # override is what ``process_document_multi`` installs on
+        # TLS; use the same hook to verify end-to-end encoding
+        # behaviour without running the full save loop.
+        proc._tls.per_file_registry = proc._build_effective_registry(
+            proc._placeholders,
+            glossary=None,
+            update_builtin_overrides=False,
+            target_langs_override=["en", "ko"],
+        )
+        try:
+            # Bare-Latin / bare-Hangul: both target-script for one of
+            # the langs, so neither auto-brackets.
+            for source in (
+                "see {game_id} here",
+                "see {\uc804\uc1a1} here",
+            ):
+                _, mapping = proc._encode_source(source)
+                assert not any(
+                    p.pattern_name.startswith("auto_bracket_") for p in mapping
+                ), source
+            # Cross-script content (Japanese Hiragana, Cyrillic) is
+            # non-target-script for both ko and en → still tokenized.
+            _, mapping = proc._encode_source(
+                "see {\u3053\u3093\u306b\u3061\u306f} and {\u0441\u043b\u043e\u0432\u043e}"
+            )
+            auto = [
+                p.original for p in mapping
+                if p.pattern_name.startswith("auto_bracket_")
+            ]
+            assert "{\u3053\u3093\u306b\u3061\u306f}" in auto
+            assert "{\u0441\u043b\u043e\u0432\u043e}" in auto
+        finally:
+            del proc._tls.per_file_registry
+
+    def test_auto_register_respects_target_script_for_cjk_target(
+        self, mock_completion
+    ):
+        # Regression guard for a cycle-6 P1 finding: a CJK target
+        # must not freeze CJK-only bracket spans — otherwise the
+        # refine pass never polishes them and a ko→ja translate
+        # pass freezes target-script brackets that should re-render.
+        # Mixed-script or ASCII-only bracket content still tokenizes
+        # because those are legitimate non-target-script identifiers.
+        proc = MarkdownProcessor(model="test-model", target_lang="ko")
+        source_cjk_only = "prefix {\uc804\uc1a1} suffix"
+        _, mapping = proc._encode_source(source_cjk_only)
+        assert not any(
+            p.pattern_name.startswith("auto_bracket_") for p in mapping
+        )
+
+        source_mixed = "prefix {id_\uac8c\uc784\ucf54\ub4dc} suffix"
+        _, mapping = proc._encode_source(source_mixed)
+        assert any(
+            p.pattern_name == "auto_bracket_brace"
+            and p.original == "{id_\uac8c\uc784\ucf54\ub4dc}"
+            for p in mapping
+        )
+
+    def test_auto_register_refine_mode_on_korean_leaves_cjk_brackets(
+        self, mock_completion
+    ):
+        # End-to-end: refine mode with Korean source/target must
+        # leave ``{전송}`` / ``<다음>`` for the refine prompt.
+        # Before target-script gating was introduced these spans
+        # were frozen and the refiner never saw them — that broke
+        # the refine contract for any non-ASCII source language.
+        proc = MarkdownProcessor(
+            model="test-model", target_lang="ko", mode="refine"
+        )
+        source = "Label <\ub2e4\uc74c> button and {\uc804\uc1a1} action."
+        _, mapping = proc._encode_source(source)
+        assert not any(
+            p.pattern_name.startswith("auto_bracket_") for p in mapping
+        )
+
+    def test_refine_first_sibling_inherits_auto_bracket_setting(
+        self, mock_completion
+    ):
+        # ``refine_first=True`` builds a refine-mode sibling processor;
+        # forgetting to propagate ``auto_bracket_placeholders`` would
+        # leave refine unprotected while translate was protected, so
+        # the two passes would disagree about which spans survive
+        # verbatim — exactly the divergence T-13 was built to prevent.
+        parent = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            auto_bracket_placeholders=False,
+        )
+        sibling = parent._sibling_refine_processor(target_lang="en")
+        assert sibling.auto_bracket_placeholders is False

@@ -306,6 +306,74 @@ Directory-level caching resolves each ancestor's `glossary.json`
 exactly once — sibling files in the same subtree reuse the cached
 merged chain.
 
+## Auto source-language bracket placeholders
+
+Bracket tokens that hold source-language identifiers — `<전송>`,
+`{게임코드}`, `<1단계>`, `/users/{한글id}` path parameters — are
+auto-registered on the per-file placeholder registry before every
+LLM call, so they survive a translate pass verbatim without the
+caller having to enumerate each one in `glossary`. On by default;
+pass `auto_bracket_placeholders=False` to turn it off.
+
+Detection rule — a Unicode word character **outside the target
+language's primary script** inside a single-angle `<…>` or
+single-brace `{…}` span whose content is identifier-shaped (word
+characters plus `-`, `_`, `.`; no whitespace, no punctuation). The
+target-script lookup is keyed on the BCP 47 primary-language prefix
+of `target_lang` (e.g. `ko`/`ja`/`zh` → CJK, `ru`/`uk`/`bg` →
+Cyrillic, `ar`/`fa` → Arabic, `en`/`fr`/`de`/unknown → Latin/ASCII),
+so a Korean refine pass (`target_lang="ko"`) correctly leaves
+`{전송}` and `<다음>` for the refiner, while an English target
+protects the same spans as before. Mixed-script identifiers like
+`<id_게임코드>` still match for a Korean target because the Latin
+prefix is non-target-script content. A bracket whose content is
+entirely target-script (`{page_id}` with English target, `<전송>`
+with Korean target) and multi-word UI labels (`{상태 변경}`,
+`<확인 버튼>`) flow through the translate prompt normally — callers
+who need to pin those specifically can register their own pattern
+via `placeholders=PlaceholderRegistry(...)`.
+
+The regex is deliberately conservative so it does not over-protect:
+
+- **`{{…}}` Mustache / Jinja templates** are excluded — a lookbehind
+  / lookahead guard keeps the inner single-brace from being
+  tokenized away from under the template engine.
+- **Real HTML opening / closing tags** (`<a href="/한글">`,
+  `</한글>`, `<!-- 한글 -->`, `<?xml ?>`) are excluded — the
+  `html_attr` built-in retains its allowlist-based protection
+  contract so translatable attributes like `title` / `alt` /
+  `aria-label` still reach the translate prompt.
+- **Inline code** (`` `{한글}` ``) is skipped so documentation that
+  illustrates bracket syntax literally does not freeze the example.
+- **Caller-supplied glossary entries win** — when a glossary term
+  sits inside the bracket span, the glossary pattern tokenizes the
+  inner term and auto-register defers; the LLM sees the bracket
+  structure with the glossary token inside. Useful when a term has
+  an explicit target-language mapping (`{"게임코드": "GameCode"}`)
+  and the bracket structure should still be translatable around it.
+
+```python
+processor = MdpoLLM(
+    model="gpt-4",
+    target_lang="en",
+    auto_bracket_placeholders=True,  # default
+)
+# Source "/api/{게임코드}/profile" round-trips byte-for-byte;
+# the LLM never sees "게임코드" and cannot rewrite it.
+```
+
+Opt out per instance via `auto_bracket_placeholders=False`, or
+globally for ops overrides via the `MDPO_AUTO_BRACKET_PLACEHOLDERS`
+env var (`1` / `0` / `true` / `false` / `yes` / `no` / `on` / `off`,
+case-insensitive). Unrecognised env values fall through to the
+kwarg so typos don't silently flip behaviour.
+
+Dedicated custom placeholder patterns (via
+`placeholders=PlaceholderRegistry(...)`) take priority over
+auto-register on exact-span ties, so a caller who has their own
+protection for a specific shape can still override the default
+pattern without disabling the feature globally.
+
 ## Refine mode
 
 `mode="refine"` polishes a Markdown document in its **original** language:
@@ -538,6 +606,7 @@ MdpoLLM(
     progress_callback=None,    # Callable[[ProgressEvent], None] — see "Progress hook"
     mode="translate",          # "translate" (cross-language) or "refine" (same-language polish)
     batch_concurrency=1,       # experimental: intra-file parallel batches (see "Batch concurrency")
+    auto_bracket_placeholders=True,  # auto-protect <cjk>/{cjk} tokens — see "Auto source-language bracket placeholders"
     **litellm_kwargs,          # temperature, api_key, api_base, etc.
 )
 ```

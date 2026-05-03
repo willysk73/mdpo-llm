@@ -8,12 +8,17 @@ import pytest
 
 from mdpo_llm.placeholder import (
     ANCHOR_PATTERN,
+    AUTO_BRACKET_ANGLE_PATTERN,
+    AUTO_BRACKET_BRACE_PATTERN,
+    AUTO_BRACKET_PATTERNS,
     BUILTIN_PATTERNS,
     HTML_ATTR_PATTERN,
     Placeholder,
     PlaceholderMap,
     PlaceholderRegistry,
     TOKEN_RE,
+    auto_bracket_predicate_factory,
+    build_auto_bracket_patterns,
     check_round_trip,
     check_structural_position,
     format_token,
@@ -2079,3 +2084,648 @@ def test_builtin_layered_with_user_and_glossary_patterns():
     # Decode restores every protected span so the full document is a
     # byte-for-byte round trip (do-not-translate glossary term included).
     assert PlaceholderRegistry.decode(encoded, mapping) == text
+
+
+# ---------- T-14 auto source-language bracket placeholders ----------
+
+
+def test_auto_bracket_patterns_tuple_has_both_members():
+    names = [name for name, _ in AUTO_BRACKET_PATTERNS]
+    assert names == ["auto_bracket_angle", "auto_bracket_brace"]
+
+
+def test_auto_bracket_angle_matches_non_ascii_content():
+    # Bare CJK in angle brackets — the canonical T-14 source-language token.
+    assert AUTO_BRACKET_ANGLE_PATTERN.fullmatch("<\uc804\uc1a1>") is not None
+    # Digit-prefixed CJK spans are also protected — ``(?![A-Za-z/!?])``
+    # only keeps real HTML-tag / comment / PI openers out, so numerics
+    # and punctuation leading a source-language label still match.
+    m = AUTO_BRACKET_ANGLE_PATTERN.search("prefix <1\ub2e8\uacc4> suffix")
+    assert m is not None and m.group(0) == "<1\ub2e8\uacc4>"
+
+
+def test_auto_bracket_angle_skips_pure_ascii():
+    # Real HTML-looking tokens and ASCII placeholders must not match — the
+    # target-script content path in the brief explicitly flows through
+    # normal translation.
+    for text in ("<Submit>", "<div>", "<a>", "<>", "<123>"):
+        assert AUTO_BRACKET_ANGLE_PATTERN.search(text) is None
+
+
+def test_auto_bracket_angle_excludes_html_open_and_close_tags():
+    # ``<a href="/\ud55c\uae00">`` has non-ASCII content but is a real
+    # HTML tag; the narrow content class (``[\w.\-]``) already rejects
+    # spaces, ``"`` / ``=`` / ``/``, so the tag shape fails the regex
+    # before the predicate even runs.  Close tags (``</...>``),
+    # comments (``<!-- ... -->``), and XML processing instructions
+    # (``<?xml ?>``) also fail because ``/`` / ``!`` / ``?`` are not
+    # in the class.  No lookahead is needed, which keeps mixed-script
+    # identifiers like ``<id_\uac8c\uc784\ucf54\ub4dc>`` matchable.
+    for text in (
+        '<a href="/\ud55c\uae00">',
+        "</\ud55c\uae00>",
+        "<!-- \ud55c\uae00 -->",
+        "<?xml \ud55c\uae00 ?>",
+    ):
+        assert AUTO_BRACKET_ANGLE_PATTERN.search(text) is None, text
+
+
+def test_auto_bracket_angle_matches_mixed_script_identifier_starting_with_ascii():
+    # Regression guard for a cycle-5 P2 finding: a previous
+    # ``(?![A-Za-z/!?])`` lookahead blocked identifier-shape spans
+    # that happened to start with an ASCII letter, even though every
+    # other character was a word char and the token held a non-ASCII
+    # segment.  Mixed-script IDs are a common source-language shape
+    # ("prefix the JS id with an English namespace") and must match.
+    for text in ("<id_\uac8c\uc784\ucf54\ub4dc>", "<user\u041f\u0440\u0438\u043c\u0435\u0440>"):
+        assert AUTO_BRACKET_ANGLE_PATTERN.fullmatch(text) is not None, text
+
+
+def test_auto_bracket_angle_rejects_double_delimiters():
+    # ``<<\ud55c>>`` must not be split into a spurious inner ``<\ud55c>``
+    # match — this is the angle-bracket analogue of the ``{{…}}`` Mustache
+    # guard on the brace pattern.
+    assert AUTO_BRACKET_ANGLE_PATTERN.search("<<\ud55c\uae00>>") is None
+
+
+def test_auto_bracket_brace_matches_non_ascii_content():
+    assert AUTO_BRACKET_BRACE_PATTERN.fullmatch("{\uac8c\uc784\ucf54\ub4dc}") is not None
+    m = AUTO_BRACKET_BRACE_PATTERN.search("path /{id}/{\ud55c\uae00id}/end")
+    assert m is not None and m.group(0) == "{\ud55c\uae00id}"
+
+
+def test_auto_bracket_brace_skips_pure_ascii():
+    for text in ("{id}", "{page_id}", "{}", "{123}"):
+        assert AUTO_BRACKET_BRACE_PATTERN.search(text) is None
+
+
+def test_auto_bracket_brace_rejects_json_and_prose_content():
+    # Regression guard for a cycle-1 P2 finding: a permissive
+    # ``[^{}]*`` content class would freeze arbitrary brace runs that
+    # happen to hold a CJK word — inline JSON (``{"이름":"값"}``) and
+    # prose-ish braces (``{ 상태: 한글 }``) would stop reaching the
+    # translate prompt even though every byte of them is translatable.
+    # The narrower identifier-shape class (``[\w\s.\-]``) must reject
+    # these shapes.
+    for text in (
+        '{"\uc774\ub984":"\uac12"}',
+        "{ \uc0c1\ud0dc: \ud55c\uae00 }",
+        "{a=\ud55c\uae00}",
+        "{\uc774\ub984; \uac12}",
+    ):
+        assert AUTO_BRACKET_BRACE_PATTERN.search(text) is None, text
+
+
+def test_auto_bracket_brace_allows_identifier_punctuation():
+    # Identifier-shape punctuation (``-``, ``_``, ``.``) is common in
+    # path parameters, dotted names, and kebab-case IDs, so the narrow
+    # class must still accept ``{a.b.\ud55c\uae00}``, ``{\ud55c-\uae00}``,
+    # etc.
+    for text in (
+        "{\ud55c-\uae00}",
+        "{a.b.\ud55c\uae00}",
+        "{user_\ud55c\uae00}",
+    ):
+        assert AUTO_BRACKET_BRACE_PATTERN.fullmatch(text) is not None, text
+
+
+def test_auto_bracket_rejects_multi_word_bracketed_prose():
+    # Whitespace in the content class would let multi-word bracketed
+    # UI labels (``{\uc0c1\ud0dc \ubcc0\uacbd}``,
+    # ``<\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 \u0448\u0430\u0433>``)
+    # match.  Since auto-register is on by default, that would silently
+    # suppress translation of ordinary translatable prose wrapped in
+    # brackets — exactly the regression cycle-2 review called out.
+    brace_cases = (
+        "{\uc0c1\ud0dc \ubcc0\uacbd}",
+        "{ \uac8c\uc784\ucf54\ub4dc }",
+    )
+    for text in brace_cases:
+        assert AUTO_BRACKET_BRACE_PATTERN.search(text) is None, text
+    angle_cases = (
+        "<\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 \u0448\u0430\u0433>",
+        "<\ud655\uc778 \ubc84\ud2bc>",
+    )
+    for text in angle_cases:
+        assert AUTO_BRACKET_ANGLE_PATTERN.search(text) is None, text
+
+
+def test_auto_bracket_angle_rejects_prose_content():
+    # Same narrowness guard for the angle pattern — prose-like content
+    # that happens to hold a CJK word must not be frozen.
+    for text in (
+        "<a=\ud55c\uae00>",
+        "<\uc0c1\ud0dc: \ud55c\uae00>",
+        '<"\ud55c\uae00","\uac12">',
+    ):
+        assert AUTO_BRACKET_ANGLE_PATTERN.search(text) is None, text
+
+
+def test_auto_bracket_brace_excludes_mustache_runtime_templates():
+    # ``{{...}}`` Mustache / Jinja templates must not have their inner
+    # ``{...}`` tokenized away from under the template engine — a naive
+    # regex without the lookbehind / lookahead would match ``{\ud55c}``
+    # at offset 1 inside ``{{\ud55c}}``.
+    assert AUTO_BRACKET_BRACE_PATTERN.search("{{\ud55c\uae00}}") is None
+    # Asymmetric double-opens / double-closes are malformed and must not
+    # match either — better to leave them alone than half-tokenize.
+    assert AUTO_BRACKET_BRACE_PATTERN.search("{{\ud55c\uae00}") is None
+    assert AUTO_BRACKET_BRACE_PATTERN.search("{\ud55c\uae00}}") is None
+
+
+def test_auto_bracket_predicate_skips_quoted_html_attribute_value():
+    # Regression guard for a cycle-3 P2 finding: the ``html_attr``
+    # built-in deliberately leaves translatable attributes like
+    # ``title`` / ``alt`` / ``aria-label`` out of its allowlist so
+    # their content keeps flowing through the translate prompt.
+    # Auto-bracket must honour the same contract — otherwise the
+    # inner ``<\u7b49\u95ee>`` in ``title="<\u7b49\u95ee> \ubc84\ud2bc"``
+    # gets frozen and the attribute comes back partially untranslated.
+    predicate = auto_bracket_predicate_factory(None)
+
+    text_angle = '<a title="<\u7b49\u95ee> \ubc84\ud2bc">link</a>'
+    m = AUTO_BRACKET_ANGLE_PATTERN.search(text_angle)
+    assert m is not None and m.group(0) == "<\u7b49\u95ee>"
+    assert predicate(text_angle, m.start(), m.end()) is False
+
+    text_brace = '<a aria-label="{\uac8c\uc784\ucf54\ub4dc}">link</a>'
+    m = AUTO_BRACKET_BRACE_PATTERN.search(text_brace)
+    assert m is not None and m.group(0) == "{\uac8c\uc784\ucf54\ub4dc}"
+    assert predicate(text_brace, m.start(), m.end()) is False
+
+
+def test_auto_bracket_predicate_skips_unquoted_and_jsx_attribute_values():
+    # Regression guard for a cycle-4 P2 finding: unquoted HTML attrs
+    # and JSX-style ``attr={expr}`` were still getting auto-bracketed
+    # when the earlier guard only checked quoted values.  The
+    # broadened "anywhere inside an HTML opening tag" check must
+    # cover both shapes so the translatable attr contract survives
+    # on raw HTML / MDX inputs.
+    predicate = auto_bracket_predicate_factory(None)
+
+    # JSX-style ``aria-label={...}`` (single-brace JS expression).
+    text_jsx = "<Button aria-label={\uac8c\uc784\ucf54\ub4dc}>click</Button>"
+    m = AUTO_BRACKET_BRACE_PATTERN.search(text_jsx)
+    assert m is not None and m.group(0) == "{\uac8c\uc784\ucf54\ub4dc}"
+    assert predicate(text_jsx, m.start(), m.end()) is False
+
+    # Single-quoted value shape.
+    text_sq = "<a title='<\u7b49\u95ee>'>link</a>"
+    m = AUTO_BRACKET_ANGLE_PATTERN.search(text_sq)
+    assert m is not None and m.group(0) == "<\u7b49\u95ee>"
+    assert predicate(text_sq, m.start(), m.end()) is False
+
+
+def test_auto_bracket_predicate_rejects_structural_html_without_closer():
+    # Regression guard for a cycle-20 P1 finding: Markdown batching
+    # splits ``<div> ... </div>`` across blocks, so a paired-closer
+    # check alone would freeze standalone ``<div>`` / ``<span>`` /
+    # ``<ul>`` openers under non-Latin targets.  Structural
+    # containers are on the always-reject allowlist.
+    predicate = auto_bracket_predicate_factory(None)
+    angle_ko = build_auto_bracket_patterns("ko")[0][1]
+    for text in ("<div>", "<span>", "<section>", "<ul>"):
+        m = angle_ko.search(text)
+        assert m is not None, text
+        assert predicate(text, m.start(), m.end()) is False, text
+
+
+def test_auto_bracket_predicate_skips_non_word_boundary_glossary_terms_literal():
+    # Regression guard for a cycle-20 P2 finding: glossary terms
+    # like ``.NET`` fail ``\b`` anchors so they never enter the
+    # compiled defer regex, but the caller's explicit instruction-
+    # mode mapping still needs to reach the LLM.  The predicate
+    # must defer when such a term literally appears inside the
+    # auto-bracket span.  Use the Korean-target regex so bare-ASCII
+    # ``{.NET-\ubaa8\ub4c8}`` satisfies the non-target-script core
+    # check the default Latin-target regex would reject.
+    brace_ko = build_auto_bracket_patterns("ko")[1][1]
+    predicate = auto_bracket_predicate_factory([".NET"])
+    text = "use {.NET-id} here"
+    m = brace_ko.search(text)
+    assert m is not None and m.group(0) == "{.NET-id}"
+    assert predicate(text, m.start(), m.end()) is False
+
+
+def test_auto_bracket_predicate_rejects_void_html_elements():
+    # Regression guard for cycle-12 + cycle-18 P2: void HTML elements
+    # (``<br>``, ``<img>``, ``<hr>``) have no closer to pair with,
+    # so the predicate must reject them unconditionally even when
+    # they appear alone in a text block.  Non-void HTML names
+    # (``<div>``, ``<title>``, ``<label>``) are ambiguous in
+    # isolation and go through the paired-closer branch instead.
+    predicate = auto_bracket_predicate_factory(None)
+    angle_ko = build_auto_bracket_patterns("ko")[0][1]
+    for text in ("<br>", "<img>", "<hr>", "<input>", "<meta>"):
+        m = angle_ko.search(text)
+        assert m is not None and m.group(0) == text, text
+        assert predicate(text, m.start(), m.end()) is False, text
+
+
+def test_auto_bracket_predicate_rejects_html_named_ascii_spans():
+    # Cycle-21 review: HTML safety wins over ASCII placeholder
+    # protection.  Cross-batch markup like ``<a> ... </a>`` would
+    # otherwise tokenize the opener when the closer lives in a
+    # different LLM call; the only robust fix is to treat any
+    # ASCII tag-name-shape as HTML by default.  Authors who really
+    # want a literal ASCII bracket placeholder (``<title>`` as a
+    # documentation token) should pin it via the glossary — that
+    # path wins over auto-register and remains deterministic.
+    # Source-language brackets (``<\uac8c\uc784\ucf54\ub4dc>``,
+    # ``<\u30d4\u30c3\u30c1>``, ``<\u3010\u9001\u4fe1\u3011>``) are
+    # unaffected because they don't match the ASCII tag-name shape.
+    predicate = auto_bracket_predicate_factory(None)
+    angle_ko = build_auto_bracket_patterns("ko")[0][1]
+    for text in (
+        "path /docs/<title>/edit",
+        "Use <label> for the field.",
+        "The <button> marks a UI token here.",
+        "<a> sets a link.",
+        "<code> wraps a literal.",
+    ):
+        m = angle_ko.search(text)
+        assert m is not None, text
+        assert predicate(text, m.start(), m.end()) is False, text
+
+
+def test_auto_bracket_predicate_rejects_paired_html_like_name():
+    # Complement of the above — the same token reverts to "real
+    # HTML / JSX" classification as soon as a matching closer
+    # appears after it in the same text.
+    predicate = auto_bracket_predicate_factory(None)
+    angle_ko = build_auto_bracket_patterns("ko")[0][1]
+    text = "<div>content</div>"
+    m = angle_ko.search(text)
+    assert m is not None and m.group(0) == "<div>"
+    assert predicate(text, m.start(), m.end()) is False
+
+
+def test_auto_bracket_predicate_pairs_case_insensitively():
+    # Regression guard for a cycle-19 P2 finding: HTML tag names
+    # are case-insensitive, so ``<DIV>…</div>`` / ``<Foo>…</foo>``
+    # still describe a real tag pair and must reject.
+    predicate = auto_bracket_predicate_factory(None)
+    angle_ko = build_auto_bracket_patterns("ko")[0][1]
+    for text in ("<DIV>content</div>", "<Foo>content</foo>"):
+        m = angle_ko.search(text)
+        assert m is not None, text
+        assert predicate(text, m.start(), m.end()) is False, text
+
+
+def test_auto_bracket_predicate_rejects_paired_lowercase_custom_element():
+    # A lowercase hyphenated custom element ``<my-element>`` is
+    # ambiguous in isolation — could be HTML or a placeholder — so
+    # the predicate only rejects when a matching closer is present
+    # after the opener.  The same pairing heuristic covers
+    # lowercase identifiers like ``<game-id></game-id>``.
+    predicate = auto_bracket_predicate_factory(None)
+    angle_ko = build_auto_bracket_patterns("ko")[0][1]
+    text = "<my-element>content</my-element>"
+    m = angle_ko.search(text)
+    assert m is not None and m.group(0) == "<my-element>"
+    assert predicate(text, m.start(), m.end()) is False
+
+
+def test_auto_bracket_predicate_allows_pascalcase_and_mixed_script_ids():
+    # Regression guard for a cycle-13 P2 finding: PascalCase tokens
+    # in prose (``<Submit>``, ``<GameCode>``, ``<MyComponent>``
+    # WITHOUT a matching closer) are source-language placeholders,
+    # not HTML / JSX, so auto-bracket must still fire on them.
+    # Mixed-script IDs and digit-prefixed spans fall through the
+    # same allow path.
+    predicate = auto_bracket_predicate_factory(None)
+    angle_ko = build_auto_bracket_patterns("ko")[0][1]
+    for text in (
+        "<Submit>",
+        "<GameCode>",
+        "<MyComponent>",
+        "<id_\uac8c\uc784\ucf54\ub4dc>",
+        "<user\u041f\u0440\u0438\u043c\u0435\u0440>",
+        "<1\ub2e8\uacc4>",
+    ):
+        m = angle_ko.search(text)
+        assert m is not None, text
+        assert predicate(text, m.start(), m.end()) is True, text
+
+
+def test_auto_bracket_predicate_rejects_paired_jsx_open_tag():
+    # Regression guard for a cycle-16 P2 finding: MDX / JSX inputs
+    # may have a PascalCase opener ``<MyComponent>`` followed by
+    # its closer ``</MyComponent>``.  Auto-bracketing only the
+    # opener would leave the closer orphaned and desync the tag
+    # structure the model sees, so the paired case must reject.
+    predicate = auto_bracket_predicate_factory(None)
+    angle_ko = build_auto_bracket_patterns("ko")[0][1]
+    text = "<MyComponent>content</MyComponent>"
+    m = angle_ko.search(text)
+    assert m is not None and m.group(0) == "<MyComponent>"
+    assert predicate(text, m.start(), m.end()) is False
+
+
+def test_auto_bracket_predicate_ignores_unrelated_earlier_closer():
+    # Regression guard for a cycle-17 P2 finding: a prose
+    # placeholder ``<Submit>`` whose document happens to mention
+    # ``</Submit>`` in an earlier unrelated block must NOT be
+    # suppressed.  The closer-proximity check is scoped to
+    # positions AFTER the opener so unrelated earlier closers
+    # don't break auto-protection.
+    predicate = auto_bracket_predicate_factory(None)
+    angle_ko = build_auto_bracket_patterns("ko")[0][1]
+    text = "Earlier </Submit> mention. Use <Submit> here."
+    m = angle_ko.search(text)
+    assert m is not None and m.group(0) == "<Submit>"
+    assert predicate(text, m.start(), m.end()) is True
+
+
+def test_auto_bracket_predicate_allows_standalone_lowercase_custom_names():
+    # Regression guard for a cycle-17 P1 finding: a lowercase
+    # hyphenated identifier ``<game-id>`` / ``<user-name>`` that
+    # ISN'T in the standard HTML element allowlist and has NO
+    # paired closer is a source-language placeholder, not HTML.
+    # Auto-bracket must still fire so the LLM doesn't rewrite it.
+    predicate = auto_bracket_predicate_factory(None)
+    angle_ko = build_auto_bracket_patterns("ko")[0][1]
+    for text in ("<game-id>", "<user-name>", "<my-token>"):
+        m = angle_ko.search(text)
+        assert m is not None, text
+        assert predicate(text, m.start(), m.end()) is True, text
+
+
+def test_auto_bracket_predicate_allows_bracket_outside_tag_body():
+    # Sanity check: the in-tag guard must not leak outside the tag.
+    # Bracket spans in prose immediately before or after a tag are
+    # still protected — e.g. the inter-tag position in
+    # ``<a>\uc804\uc1a1 <\uc804\uc1a1></a>`` and a plain span after
+    # a self-closing tag.
+    predicate = auto_bracket_predicate_factory(None)
+    for text in (
+        '<img src="/static/foo.png"> see <\u7b49\u95ee>',
+        "<p><\u7b49\u95ee></p>",
+    ):
+        m = AUTO_BRACKET_ANGLE_PATTERN.search(text)
+        assert m is not None and m.group(0) == "<\u7b49\u95ee>"
+        assert predicate(text, m.start(), m.end()) is True, text
+
+
+def test_auto_bracket_predicate_factory_without_glossary_skips_inline_code():
+    # Documentation that explains the auto-bracket syntax literally via
+    # inline code (``Use `{\ud55c}` here``) must not freeze the example —
+    # same guard T-6 ``anchor`` / ``html_attr`` built-ins apply.
+    text = "Use `{\ud55c\uae00}` inside prose"
+    predicate = auto_bracket_predicate_factory(None)
+    m = AUTO_BRACKET_BRACE_PATTERN.search(text)
+    assert m is not None
+    assert predicate(text, m.start(), m.end()) is False
+
+
+def test_auto_bracket_predicate_factory_defers_to_glossary_match():
+    # Glossary wins over auto-register when a term sits inside the bracket.
+    # Otherwise auto-register would tokenize the outer span and hide the
+    # glossary term from its own pattern via the overlap resolver.
+    predicate = auto_bracket_predicate_factory(["\uac8c\uc784\ucf54\ub4dc"])
+    text = "ref {\uac8c\uc784\ucf54\ub4dc} end"
+    m = AUTO_BRACKET_BRACE_PATTERN.search(text)
+    assert m is not None
+    assert predicate(text, m.start(), m.end()) is False
+
+
+def test_auto_bracket_predicate_factory_ignores_unrelated_glossary_terms():
+    # A glossary term that does not appear inside the bracket does not
+    # block auto-registration.
+    predicate = auto_bracket_predicate_factory(["unrelated"])
+    text = "ref {\uac8c\uc784\ucf54\ub4dc} end"
+    m = AUTO_BRACKET_BRACE_PATTERN.search(text)
+    assert m is not None
+    assert predicate(text, m.start(), m.end()) is True
+
+
+def test_auto_bracket_predicate_factory_non_word_boundary_terms_dont_false_positive():
+    # ``_compile_glossary_pattern`` cannot build a ``\b`` regex for terms
+    # whose first / last character is non-word (``.NET``, ``C++``).  The
+    # factory still guards against literal substring presence (see
+    # :func:`test_auto_bracket_predicate_skips_non_word_boundary_glossary_terms_literal`)
+    # but must NOT defer on unrelated bracket spans that don't contain
+    # the term — otherwise every auto-bracket match in a document
+    # whose glossary happens to list ``.NET`` would be suppressed.
+    predicate = auto_bracket_predicate_factory([".NET", "C++"])
+    text = "see {\ud55c\uae00}"
+    m = AUTO_BRACKET_BRACE_PATTERN.search(text)
+    assert m is not None
+    assert predicate(text, m.start(), m.end()) is True
+
+
+def test_build_auto_bracket_patterns_latin_target_matches_non_ascii():
+    # Default (Latin / ASCII target) patterns preserve CJK / Cyrillic /
+    # Hebrew / Arabic word content — the historical T-14 rule.
+    _, angle = build_auto_bracket_patterns("en")[0]
+    _, brace = build_auto_bracket_patterns("en")[1]
+    for text in ("<\uc804\uc1a1>", "{\uac8c\uc784\ucf54\ub4dc}", "<user\u041f\u0440\u0438\u043c\u0435\u0440>"):
+        pat = angle if text[0] == "<" else brace
+        assert pat.fullmatch(text) is not None, text
+
+
+def test_build_auto_bracket_patterns_korean_target_skips_only_hangul():
+    # Regression guard for cycle-6 P1 + cycle-8 P1: a Korean target
+    # (Hangul script) must leave Hangul bracket content alone but
+    # STILL protect cross-CJK identifiers — a ``{\u3053\u3093\u306b\u3061\u306f}``
+    # Hiragana span in a Korean document is a Japanese source token
+    # the caller wants preserved, not target-script content.  The
+    # earlier shared ``_SCRIPT_RANGE_CJK`` bucket incorrectly treated
+    # all CJK scripts as Korean target-script.
+    angle = build_auto_bracket_patterns("ko")[0][1]
+    brace = build_auto_bracket_patterns("ko")[1][1]
+    # Bare-Hangul stays for the translate / refine prompt.
+    assert angle.search("<\uc804\uc1a1>") is None
+    assert brace.search("{\uc804\uc1a1}") is None
+    # Japanese scripts and Chinese Hanzi still tokenize for ko.
+    assert brace.search("{\u3053\u3093\u306b\u3061\u306f}") is not None
+    assert brace.search("{\u4e2d\u6587}") is not None
+    # Latin identifier prefix also still tokenizes.
+    assert angle.search("<id_\uac8c\uc784\ucf54\ub4dc>") is not None
+    assert brace.search("{game_id}") is not None
+
+
+def test_build_auto_bracket_patterns_japanese_target_skips_japanese_scripts():
+    # Japanese target protects Hiragana / Katakana / Kanji (because
+    # Japanese writing uses all three) but still tokenizes Hangul
+    # (non-target-script).  The shared CJK bucket used to swallow
+    # Hangul spans under a Japanese target too — this guards the
+    # cycle-8 regression.
+    angle = build_auto_bracket_patterns("ja")[0][1]
+    brace = build_auto_bracket_patterns("ja")[1][1]
+    # Japanese scripts stay for the prompt.
+    assert brace.search("{\u3053\u3093\u306b\u3061\u306f}") is None
+    assert brace.search("{\u30c7\u30fc\u30bf}") is None
+    assert brace.search("{\u4e2d\u6587}") is None  # Kanji shared
+    # Hangul under a Japanese target IS non-target-script → match.
+    assert brace.search("{\uc804\uc1a1}") is not None
+    assert angle.search("<\uc804\uc1a1>") is not None
+
+
+def test_build_auto_bracket_patterns_chinese_target_skips_only_hanzi():
+    # Chinese target only protects Hanzi (CJK Unified); Hiragana /
+    # Katakana / Hangul remain non-target-script identifiers.
+    brace = build_auto_bracket_patterns("zh")[1][1]
+    assert brace.search("{\u4e2d\u6587}") is None
+    assert brace.search("{\u3053\u3093\u306b\u3061\u306f}") is not None
+    assert brace.search("{\u30c7\u30fc\u30bf}") is not None
+    assert brace.search("{\uc804\uc1a1}") is not None
+
+
+def test_build_auto_bracket_patterns_cyrillic_target_skips_cyrillic_content():
+    # Cyrillic targets (``ru``, ``uk``, …) must leave bare-Cyrillic
+    # bracket spans for the model — auto-register is for
+    # non-target-script identifiers only.
+    angle = build_auto_bracket_patterns("ru")[0][1]
+    brace = build_auto_bracket_patterns("ru")[1][1]
+    assert angle.search("<\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439>") is None
+    assert brace.search("{\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439}") is None
+    # CJK / ASCII content still matches for Cyrillic target.
+    assert angle.search("<\uc804\uc1a1>") is not None
+    assert brace.search("{game_id}") is not None
+
+
+def test_build_auto_bracket_patterns_accepts_combining_mark_scripts():
+    # Regression guard for a cycle-15 P1 finding: identifiers in
+    # scripts that use combining marks (Devanagari vowel signs,
+    # Arabic harakat, Hebrew points, Thai tone marks, ...) used to
+    # fail the content class because Python's ``\w`` excludes
+    # ``Mn`` / ``Mc`` / ``Me`` marks.  Under a Latin target, these
+    # identifiers must tokenize so the source-language preservation
+    # contract holds for every script the lookup table advertises.
+    brace_en = build_auto_bracket_patterns("en")[1][1]
+    # Hindi "kitaab" (book) — Devanagari letters with combining
+    # vowel signs ``ि`` / ``ा``.
+    assert brace_en.search("{\u0915\u093f\u0924\u093e\u092c}") is not None
+    # Arabic "salaam" with fathas (combining marks ``َ``).
+    assert brace_en.search("{\u0633\u064e\u0644\u064e\u0627\u0645}") is not None
+    # Hebrew "shalom" with niqqud (combining vowel points).
+    assert (
+        brace_en.search(
+            "{\u05e9\u05c1\u05b8\u05dc\u05d5\u05b9\u05dd}"
+        )
+        is not None
+    )
+    # Thai word with combining tone mark.
+    assert brace_en.search("{\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35}") is not None
+
+
+def test_build_auto_bracket_patterns_tibetan_target_uses_tibetan_script():
+    # Regression guard for a cycle-7 P3 finding: ``bo`` is Tibetan,
+    # not Devanagari.  A Tibetan target must leave bare-Tibetan
+    # bracket spans (``{\u0f56\u0f7c\u0f51}``) for the translate /
+    # refine prompt, not freeze them as non-target-script.  Under
+    # the old mis-mapping the Devanagari range was checked so
+    # Tibetan chars counted as non-target-script.
+    brace = build_auto_bracket_patterns("bo")[1][1]
+    assert brace.search("{\u0f56\u0f7c\u0f51}") is None
+    # Latin / CJK still match as non-target-script identifiers.
+    assert brace.search("{game_id}") is not None
+    assert brace.search("{\uac8c\uc784\ucf54\ub4dc}") is not None
+
+
+def test_build_auto_bracket_patterns_bcp47_script_subtag_overrides():
+    # Regression guard for a cycle-14 P2 finding: BCP 47 script
+    # subtags must override the primary-language default.  ``sr``
+    # defaults to Cyrillic, but ``sr-Latn`` is Latin-script Serbian
+    # and Latin bracket content (``{Pregled}``, ``<Submit>``) is
+    # target-script — must NOT auto-bracket.  Conversely ``sr-Cyrl``
+    # still uses Cyrillic and bare-Cyrillic spans are target-script.
+    brace_latn = build_auto_bracket_patterns("sr-Latn")[1][1]
+    assert brace_latn.search("{Pregled}") is None
+    assert brace_latn.search("{\u0441\u043b\u043e\u0432\u043e}") is not None
+    brace_cyrl = build_auto_bracket_patterns("sr-Cyrl")[1][1]
+    assert brace_cyrl.search("{\u0441\u043b\u043e\u0432\u043e}") is None
+    assert brace_cyrl.search("{Pregled}") is not None
+
+    # ``zh-Hant`` / ``zh-Hans`` / ``Jpan`` / ``Hang`` route to the
+    # same ranges the primary-language codes already use.
+    brace_hant = build_auto_bracket_patterns("zh-Hant")[1][1]
+    assert brace_hant.search("{\u4e2d\u6587}") is None
+    brace_hans = build_auto_bracket_patterns("zh-Hans")[1][1]
+    assert brace_hans.search("{\u4e2d\u6587}") is None
+    brace_jpan = build_auto_bracket_patterns("und-Jpan")[1][1]
+    assert brace_jpan.search("{\u3053\u3093\u306b\u3061\u306f}") is None
+    brace_hang = build_auto_bracket_patterns("und-Hang")[1][1]
+    assert brace_hang.search("{\uc804\uc1a1}") is None
+
+    # Region subtags are ignored — ``en-US`` still routes to Latin,
+    # not some region-specific bucket, so accented content stays
+    # target-script and bare-CJK still tokenizes.
+    angle_en_us = build_auto_bracket_patterns("en-US")[0][1]
+    assert angle_en_us.search("<\u00e9tape>") is None
+    assert angle_en_us.search("<\uc804\uc1a1>") is not None
+
+
+def test_build_auto_bracket_patterns_unknown_target_falls_back_to_latin():
+    # Unlisted language codes (``xx``, empty, garbled) fall back to
+    # the Latin range so existing English-target workflows keep
+    # their historical matching behaviour.
+    for lang in (None, "", "xx", "klingon"):
+        angle = build_auto_bracket_patterns(lang)[0][1]
+        assert angle.search("<\uc804\uc1a1>") is not None, repr(lang)
+
+
+def test_build_auto_bracket_patterns_latin_target_covers_accented_letters():
+    # Regression guard for a cycle-11 P1 finding: Latin-script
+    # targets that rely on the default fallback (``fr``, ``de``,
+    # ``es``, ``pt``, ...) MUST treat Latin-1 / Latin Extended
+    # characters as target-script.  A narrow Basic-Latin-only range
+    # would auto-tokenize ``{étape}`` / ``<Überblick>`` / ``{año}``
+    # / ``{año_id}`` and silently freeze perfectly translatable
+    # accented bracket content.
+    for lang in ("en", "fr", "de", "es", "pt", "it", "pl"):
+        angle = build_auto_bracket_patterns(lang)[0][1]
+        brace = build_auto_bracket_patterns(lang)[1][1]
+        for text in ("{\u00e9tape}", "<\u00dcberblick>", "{a\u00f1o}"):
+            pat = angle if text[0] == "<" else brace
+            assert pat.search(text) is None, (lang, text)
+        # Non-Latin content still tokenizes — Cyrillic, CJK, etc.
+        assert angle.search("<\uc804\uc1a1>") is not None, lang
+        assert brace.search("{\u0441\u043b\u043e\u0432\u043e}") is not None, lang
+
+
+def test_build_auto_bracket_patterns_multi_target_unions_script_ranges():
+    # Regression guard for a cycle-9 P1 finding: a multi-target run
+    # encodes the source ONCE and fans the encoded text out to every
+    # requested lang, so the auto-bracket patterns must be gated on
+    # the UNION of every target's primary script.  ``["en", "ko"]``
+    # must leave bare-Latin AND bare-Hangul out of the token stream
+    # so each per-lang pass can still translate / refine them; only
+    # cross-script content (Japanese kana, Cyrillic, Hanzi, ...)
+    # gets preserved because it is non-target-script for both langs.
+    brace = build_auto_bracket_patterns(["en", "ko"])[1][1]
+    assert brace.search("{game_id}") is None
+    assert brace.search("{\uc804\uc1a1}") is None
+    assert brace.search("{\u3053\u3093\u306b\u3061\u306f}") is not None
+    assert brace.search("{\u0441\u043b\u043e\u0432\u043e}") is not None
+
+    # Iterable input: a list with a single target is equivalent to
+    # passing the string directly — no script-range drift from the
+    # iterable code path.
+    single = build_auto_bracket_patterns(["ko"])[1][1]
+    assert single.search("{\uc804\uc1a1}") is None
+    assert single.search("{game_id}") is not None
+
+    # Empty iterable falls back to Latin (same as ``None``) so
+    # callers that accidentally pass ``[]`` still get sensible
+    # defaults instead of a pattern that matches every word char.
+    empty = build_auto_bracket_patterns([])[1][1]
+    assert empty.search("{\uc804\uc1a1}") is not None
+
+
+def test_auto_bracket_registry_end_to_end_round_trip():
+    # Wire the patterns into a PlaceholderRegistry the same way the
+    # processor does and confirm encode / decode / round-trip all line up.
+    reg = PlaceholderRegistry()
+    for name, pattern in AUTO_BRACKET_PATTERNS:
+        reg.register(name, pattern, predicate=auto_bracket_predicate_factory(None))
+    text = "Send <\uc804\uc1a1> for the {\uac8c\uc784\ucf54\ub4dc} token."
+    encoded, mapping = reg.encode(text)
+    assert "<\uc804\uc1a1>" not in encoded
+    assert "{\uac8c\uc784\ucf54\ub4dc}" not in encoded
+    assert len(mapping) == 2
+    names = sorted({p.pattern_name for p in mapping})
+    assert names == ["auto_bracket_angle", "auto_bracket_brace"]
+    assert reg.decode(encoded, mapping) == text
+    assert check_round_trip(encoded, mapping) is None
