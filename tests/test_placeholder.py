@@ -22,6 +22,7 @@ from mdpo_llm.placeholder import (
     check_round_trip,
     check_structural_position,
     format_token,
+    load_placeholder_rules,
 )
 from mdpo_llm.validator import validate
 
@@ -2729,3 +2730,148 @@ def test_auto_bracket_registry_end_to_end_round_trip():
     assert names == ["auto_bracket_angle", "auto_bracket_brace"]
     assert reg.decode(encoded, mapping) == text
     assert check_round_trip(encoded, mapping) is None
+
+
+# ---------- load_placeholder_rules (T-15 CLI escape hatch) ----------
+
+
+def _write_rules(tmp_path, payload):
+    """Serialise ``payload`` to ``rules.json`` under ``tmp_path`` and return
+    the resulting :class:`pathlib.Path`. Wrapper used by every loader test
+    so the pytest tmp_path fixture handles cleanup and parallel safety.
+    """
+    import json
+
+    rules_file = tmp_path / "rules.json"
+    rules_file.write_text(json.dumps(payload), encoding="utf-8")
+    return rules_file
+
+
+def test_load_placeholder_rules_compiles_and_registers(tmp_path):
+    rules_file = _write_rules(
+        tmp_path,
+        [
+            {"name": "env_var", "regex": r"\$\{[A-Z_]+\}"},
+            {"name": "kanji_label", "regex": "<[一-鿿]+>"},
+        ],
+    )
+
+    reg = load_placeholder_rules(rules_file)
+
+    assert isinstance(reg, PlaceholderRegistry)
+    assert [p.name for p in reg.patterns] == ["env_var", "kanji_label"]
+    encoded, mapping = reg.encode("set ${HOME} for <中文>")
+    assert "${HOME}" not in encoded
+    assert "<中文>" not in encoded
+    pattern_names = [p.pattern_name for p in mapping]
+    assert pattern_names == ["env_var", "kanji_label"]
+    assert reg.decode(encoded, mapping) == "set ${HOME} for <中文>"
+
+
+def test_load_placeholder_rules_accepts_str_path(tmp_path):
+    # ``Path`` is canonical but argparse's ``type=Path`` is the only call
+    # site today. Accept str so hand-written tests / library callers can
+    # pass a plain string without an extra Path() wrapper.
+    rules_file = _write_rules(tmp_path, [{"name": "n", "regex": "x"}])
+    reg = load_placeholder_rules(str(rules_file))
+    assert len(reg) == 1
+
+
+def test_load_placeholder_rules_empty_array_is_noop(tmp_path):
+    rules_file = _write_rules(tmp_path, [])
+    reg = load_placeholder_rules(rules_file)
+    assert isinstance(reg, PlaceholderRegistry)
+    assert len(reg) == 0
+
+
+def test_load_placeholder_rules_rejects_top_level_object(tmp_path):
+    rules_file = _write_rules(tmp_path, {"rules": []})
+    with pytest.raises(ValueError, match="top-level value must be a JSON array"):
+        load_placeholder_rules(rules_file)
+
+
+def test_load_placeholder_rules_rejects_non_object_entry(tmp_path):
+    rules_file = _write_rules(tmp_path, ["not-an-object"])
+    with pytest.raises(ValueError, match=r"entry 1: must be a JSON object"):
+        load_placeholder_rules(rules_file)
+
+
+def test_load_placeholder_rules_rejects_missing_name(tmp_path):
+    rules_file = _write_rules(tmp_path, [{"regex": "x"}])
+    with pytest.raises(
+        ValueError, match=r"entry 1: missing required field 'name'"
+    ):
+        load_placeholder_rules(rules_file)
+
+
+def test_load_placeholder_rules_rejects_blank_name(tmp_path):
+    rules_file = _write_rules(tmp_path, [{"name": "", "regex": "x"}])
+    with pytest.raises(
+        ValueError, match=r"entry 1: 'name' must be a non-empty string"
+    ):
+        load_placeholder_rules(rules_file)
+
+
+def test_load_placeholder_rules_rejects_missing_regex(tmp_path):
+    rules_file = _write_rules(tmp_path, [{"name": "env_var"}])
+    with pytest.raises(
+        ValueError,
+        match=r"entry 1 \(name=env_var\): missing required field 'regex'",
+    ):
+        load_placeholder_rules(rules_file)
+
+
+def test_load_placeholder_rules_rejects_non_string_regex(tmp_path):
+    rules_file = _write_rules(tmp_path, [{"name": "env_var", "regex": 7}])
+    with pytest.raises(
+        ValueError, match=r"entry 1 \(name=env_var\): 'regex' must be a string"
+    ):
+        load_placeholder_rules(rules_file)
+
+
+def test_load_placeholder_rules_rejects_unknown_field(tmp_path):
+    # The Decisions section calls this out explicitly: a typo like
+    # ``"pattern"`` instead of ``"regex"`` should fail the run, not
+    # silently produce a no-op rule.
+    rules_file = _write_rules(
+        tmp_path, [{"name": "n", "regex": "x", "pattern": "y", "flags": "i"}]
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"entry 1 \(name=n\): unknown field\(s\): flags, pattern",
+    ):
+        load_placeholder_rules(rules_file)
+
+
+def test_load_placeholder_rules_surfaces_regex_compile_error(tmp_path):
+    rules_file = _write_rules(tmp_path, [{"name": "broken", "regex": "(unbalanced"}])
+    with pytest.raises(
+        ValueError,
+        match=r"entry 1 \(name=broken\): regex compile failed:",
+    ):
+        load_placeholder_rules(rules_file)
+
+
+def test_load_placeholder_rules_reports_offending_index_for_later_entry(tmp_path):
+    rules_file = _write_rules(
+        tmp_path,
+        [
+            {"name": "ok", "regex": "x"},
+            {"name": "broken", "regex": "(unbalanced"},
+        ],
+    )
+    with pytest.raises(ValueError, match=r"entry 2 \(name=broken\)"):
+        load_placeholder_rules(rules_file)
+
+
+def test_load_placeholder_rules_invalid_json_raises_with_path(tmp_path):
+    rules_file = tmp_path / "rules.json"
+    rules_file.write_text("not json", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"invalid JSON in"):
+        load_placeholder_rules(rules_file)
+
+
+def test_load_placeholder_rules_missing_file_raises(tmp_path):
+    missing = tmp_path / "does-not-exist.json"
+    with pytest.raises(ValueError, match=r"cannot read"):
+        load_placeholder_rules(missing)

@@ -3,6 +3,23 @@
 ## Unreleased
 
 ### Added
+- **CLI plumbing for custom placeholder patterns.** New
+  `--placeholder-rules PATH` flag on the LLM-issuing subcommands
+  (`translate`, `translate-dir`, `translate-multi`, `refine`,
+  `refine-dir`) accepts a JSON file of `{"name": ..., "regex": ...}`
+  rule objects, compiles each regex eagerly, and composes them onto
+  the same placeholder registry slot the constructor's `placeholders`
+  kwarg already populates. Reach for it when neither auto-bracket
+  (T-14) nor glossary covers a token shape — env var refs
+  (`${VAR}`), custom DSL brackets, etc. Each rule needs a non-empty
+  string `name` and a Python `re` `regex` string; any extra field is
+  rejected with a clear message so typos like `pattern` instead of
+  `regex` fail loudly. Regex compile errors surface as
+  `--placeholder-rules entry N (name=<name>): regex compile failed:
+  ...` and the CLI exits with code 2 BEFORE any LLM call or PO load.
+  A new public helper `mdpo_llm.placeholder.load_placeholder_rules`
+  exposes the same loader for library callers building their own
+  driver scripts.
 - **Auto source-language bracket placeholders.** Tokens shaped
   `<source-lang-word>` or `{source-lang-word}` whose content holds
   at least one non-ASCII word character (`\w` minus `[\u0000-\u007F]`)

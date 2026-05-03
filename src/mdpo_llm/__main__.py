@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from . import __version__
+from .placeholder import PlaceholderRegistry, load_placeholder_rules
 from .processor import MarkdownProcessor, ProgressEvent
 
 
@@ -58,6 +59,32 @@ def _add_shared_flags(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=5,
         help="Max similar reference pairs per entry/batch.",
+    )
+
+
+def _add_placeholder_rules_flag(parser: argparse.ArgumentParser) -> None:
+    """Register ``--placeholder-rules`` on a translate / refine subparser.
+
+    Centralised so every LLM-issuing subcommand exposes the same flag
+    with identical help text — the CLI escape hatch for niche regex
+    patterns that auto-bracket (T-14) and glossary do not catch.
+    """
+    parser.add_argument(
+        "--placeholder-rules",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Optional path to a JSON file with custom placeholder regex "
+            "rules. Shape: a JSON array of {\"name\": \"...\", "
+            "\"regex\": \"...\"} objects. Each regex is compiled with "
+            "Python's `re` and registered on the per-call placeholder "
+            "registry alongside auto-bracket (T-14) and glossary "
+            "patterns. Compile errors fail the run before any LLM call. "
+            "Reach for this only when neither auto-bracket nor glossary "
+            "covers your token shape (env var refs ${VAR}, custom DSL "
+            "brackets, etc.)."
+        ),
     )
 
 
@@ -140,6 +167,7 @@ def _add_translate_flags(
             "MDPO_NO_PROGRESS is set."
         ),
     )
+    _add_placeholder_rules_flag(parser)
 
 
 def _add_estimate_flags(parser: argparse.ArgumentParser) -> None:
@@ -162,6 +190,7 @@ def _build_processor(
     progress_callback: Optional[Callable[[ProgressEvent], None]] = None,
     *,
     mode: str = "translate",
+    placeholders: Optional[PlaceholderRegistry] = None,
 ) -> MarkdownProcessor:
     return MarkdownProcessor(
         model=args.model,
@@ -175,9 +204,27 @@ def _build_processor(
         glossary_path=getattr(args, "glossary", None),
         glossary_mode=getattr(args, "glossary_mode", "instruction"),
         enable_prompt_cache=getattr(args, "prompt_cache", False),
+        placeholders=placeholders,
         progress_callback=progress_callback,
         mode=mode,
     )
+
+
+def _resolve_placeholder_registry(
+    args: argparse.Namespace,
+) -> Optional[PlaceholderRegistry]:
+    """Return a :class:`PlaceholderRegistry` built from
+    ``--placeholder-rules`` when supplied, else ``None``.
+
+    Failures (unreadable file, malformed JSON, regex compile errors)
+    surface as :class:`ValueError`; the caller converts them to a CLI
+    usage error via :func:`_handle_usage_error` so the run exits with
+    code 2 BEFORE any LLM call or PO load.
+    """
+    rules_path = getattr(args, "placeholder_rules", None)
+    if rules_path is None:
+        return None
+    return load_placeholder_rules(rules_path)
 
 
 def _progress_enabled(args: argparse.Namespace) -> bool:
@@ -391,8 +438,14 @@ def _handle_usage_error(exc: ValueError) -> int:
 
 
 def cmd_translate(args: argparse.Namespace) -> int:
+    try:
+        user_registry = _resolve_placeholder_registry(args)
+    except ValueError as exc:
+        return _handle_usage_error(exc)
     hook, closer = _make_progress_hook(args, kind="file")
-    processor = _build_processor(args, progress_callback=hook)
+    processor = _build_processor(
+        args, progress_callback=hook, placeholders=user_registry
+    )
     json_receipt = getattr(args, "json_receipt", None)
     refine_first = getattr(args, "refine_first", False)
     refined_path = getattr(args, "refined_path", None)
@@ -456,8 +509,14 @@ def cmd_translate(args: argparse.Namespace) -> int:
 
 
 def cmd_translate_dir(args: argparse.Namespace) -> int:
+    try:
+        user_registry = _resolve_placeholder_registry(args)
+    except ValueError as exc:
+        return _handle_usage_error(exc)
     hook, closer = _make_progress_hook(args, kind="directory")
-    processor = _build_processor(args, progress_callback=hook)
+    processor = _build_processor(
+        args, progress_callback=hook, placeholders=user_registry
+    )
     json_receipt = getattr(args, "json_receipt", None)
     refine_first = getattr(args, "refine_first", False)
     refined_dir = getattr(args, "refined_dir", None)
@@ -538,8 +597,14 @@ def cmd_refine(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        user_registry = _resolve_placeholder_registry(args)
+    except ValueError as exc:
+        return _handle_usage_error(exc)
     hook, closer = _make_progress_hook(args, kind="file")
-    processor = _build_processor(args, progress_callback=hook, mode="refine")
+    processor = _build_processor(
+        args, progress_callback=hook, mode="refine", placeholders=user_registry
+    )
     json_receipt = getattr(args, "json_receipt", None)
     try:
         try:
@@ -581,8 +646,14 @@ def cmd_refine_dir(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        user_registry = _resolve_placeholder_registry(args)
+    except ValueError as exc:
+        return _handle_usage_error(exc)
     hook, closer = _make_progress_hook(args, kind="directory")
-    processor = _build_processor(args, progress_callback=hook, mode="refine")
+    processor = _build_processor(
+        args, progress_callback=hook, mode="refine", placeholders=user_registry
+    )
     json_receipt = getattr(args, "json_receipt", None)
     try:
         try:
@@ -709,8 +780,15 @@ def cmd_translate_multi(args: argparse.Namespace) -> int:
     # as a harmless placeholder so the validator helpers still resolve.
     setattr(args, "target", getattr(args, "target", None) or langs[0])
 
+    try:
+        user_registry = _resolve_placeholder_registry(args)
+    except ValueError as exc:
+        return _handle_usage_error(exc)
+
     hook, closer = _make_progress_hook(args, kind="file")
-    processor = _build_processor(args, progress_callback=hook)
+    processor = _build_processor(
+        args, progress_callback=hook, placeholders=user_registry
+    )
     json_receipt = getattr(args, "json_receipt", None)
     try:
         try:
@@ -1017,6 +1095,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable the progress bar even on a TTY.",
     )
+    _add_placeholder_rules_flag(p_multi)
     p_multi.add_argument("source", help="Source markdown file.")
     p_multi.set_defaults(func=cmd_translate_multi)
 

@@ -374,6 +374,33 @@ auto-register on exact-span ties, so a caller who has their own
 protection for a specific shape can still override the default
 pattern without disabling the feature globally.
 
+### Custom placeholder rules (advanced)
+
+For shapes auto-bracket and glossary do not catch — environment
+variable references (`${VAR}`), backtick + script-class tokens, custom
+DSL brackets, etc. — the CLI accepts `--placeholder-rules rules.json`
+on every LLM-issuing subcommand (`translate`, `translate-dir`,
+`translate-multi`, `refine`, `refine-dir`). The file is a flat JSON
+array of rule objects:
+
+```json
+[
+  {"name": "env_var_refs", "regex": "\\$\\{[A-Z_]+\\}"}
+]
+```
+
+Each rule needs a non-empty string `name` and a Python `re` `regex`
+string; any extra field is rejected so a typo like `pattern` instead
+of `regex` fails the run instead of silently producing a no-op.
+Regexes are compiled eagerly so a malformed pattern surfaces with
+exit code 2 before any LLM call. Rules compose with the existing
+registration order (caller `placeholders` ⟶ T-6 anchors / `html_attr`
+⟶ glossary ⟶ T-14 auto-bracket); a glossary entry covering the same
+span still wins on decode.
+
+Reach for this only when neither auto-bracket (T-14) nor glossary
+covers your token shape — those should be your first stop.
+
 ## Refine mode
 
 `mode="refine"` polishes a Markdown document in its **original** language:

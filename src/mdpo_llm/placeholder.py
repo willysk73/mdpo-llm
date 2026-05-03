@@ -15,9 +15,11 @@ terms, T-6 reference-link anchors, etc.) on a shared
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import (
     Callable,
     Dict,
@@ -1153,6 +1155,99 @@ class PlaceholderRegistry:
             return lookup.get(m.group(0), m.group(0))
 
         return TOKEN_RE.sub(replace, text)
+
+
+_PLACEHOLDER_RULE_FIELDS = ("name", "regex")
+
+
+def load_placeholder_rules(path: Union[str, Path]) -> PlaceholderRegistry:
+    """Load custom placeholder rules from a JSON file into a fresh
+    :class:`PlaceholderRegistry`.
+
+    The file MUST be a JSON array of rule objects, each shaped::
+
+        {"name": "<identifier>", "regex": "<python re pattern>"}
+
+    Both fields are required non-empty strings; any extra field is
+    rejected so a typo such as ``"pattern"`` instead of ``"regex"``
+    surfaces immediately rather than silently producing a no-op rule.
+    Each ``regex`` is compiled with :mod:`re` eagerly so a malformed
+    pattern fails the run before any LLM call.
+
+    Empty files (``[]``) return an empty registry — a no-op equivalent
+    to omitting the flag.
+
+    Raises :class:`ValueError` with a single-line, actionable message
+    on every error path (file unreadable, invalid JSON, top-level not
+    a list, malformed entry, regex compile error). Callers that own a
+    CLI surface should catch it and exit with the argparse convention
+    code 2.
+    """
+    rules_path = Path(path)
+    try:
+        raw = rules_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(
+            f"--placeholder-rules: cannot read {rules_path}: {exc}"
+        ) from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"--placeholder-rules: invalid JSON in {rules_path}: {exc}"
+        ) from exc
+
+    if not isinstance(data, list):
+        raise ValueError(
+            "--placeholder-rules: top-level value must be a JSON array of "
+            "rule objects"
+        )
+
+    allowed = set(_PLACEHOLDER_RULE_FIELDS)
+    registry = PlaceholderRegistry()
+    for index, entry in enumerate(data, start=1):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"--placeholder-rules entry {index}: must be a JSON object"
+            )
+        if "name" not in entry:
+            raise ValueError(
+                f"--placeholder-rules entry {index}: missing required "
+                "field 'name'"
+            )
+        name = entry["name"]
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                f"--placeholder-rules entry {index}: 'name' must be a "
+                "non-empty string"
+            )
+        if "regex" not in entry:
+            raise ValueError(
+                f"--placeholder-rules entry {index} (name={name}): "
+                "missing required field 'regex'"
+            )
+        regex = entry["regex"]
+        if not isinstance(regex, str):
+            raise ValueError(
+                f"--placeholder-rules entry {index} (name={name}): "
+                "'regex' must be a string"
+            )
+        unknown = sorted(set(entry) - allowed)
+        if unknown:
+            raise ValueError(
+                f"--placeholder-rules entry {index} (name={name}): "
+                f"unknown field(s): {', '.join(unknown)}"
+            )
+        try:
+            compiled = re.compile(regex)
+        except re.error as exc:
+            raise ValueError(
+                f"--placeholder-rules entry {index} (name={name}): "
+                f"regex compile failed: {exc}"
+            ) from exc
+        registry.register(name, compiled)
+    return registry
 
 
 def _anchor_positions(
