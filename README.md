@@ -415,6 +415,41 @@ span still wins on decode.
 Reach for this only when neither auto-bracket (T-14) nor glossary
 covers your token shape — those should be your first stop.
 
+### Residue post-processing (advanced)
+
+`--residue-pass on` (T-17) adds an opt-in *post-translation* sweep
+that detects source-language characters left inside fenced code
+blocks or inline code spans and re-translates only the affected
+spans through specialised prompts:
+
+- Fenced code block → preserve identifiers + comments, translate
+  user-facing string literals only.
+- Filename-shaped inline code (e.g. `회원목록.md`) →
+  transliterate to `UPPER_SNAKE_CASE` ASCII.
+- Other inline code → translate the source-language text to the
+  target locale.
+
+```bash
+python -m mdpo_llm translate \
+  --model gpt-4o \
+  --target en \
+  --residue-pass on \
+  source.md target.md
+```
+
+The pass runs AFTER LLM validation so it sees the final committed
+`msgstr`, skips entries already marked fuzzy by the retry budget
+(re-running known-bad output is waste), and skips refine mode
+entirely (refine is same-language, so "source-language residue" is
+undefined). It is best-effort: any failure (LLM exception,
+post-repair placeholder-token round-trip rejection) keeps the
+pass-1 translation verbatim and logs a warning.
+
+Default is `off` pending soak time. False-positive risk on
+edge-case docs (mixed-script identifiers, source script kept
+intentionally for branding) is low but real, so the flag is opt-in
+until a release of real-world use settles its sensitivity.
+
 ## LLM validation + bounded retry loop (T-16)
 
 The default `validation="conservative"` / `"strict"` checks are

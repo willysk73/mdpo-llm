@@ -188,6 +188,404 @@ class TestLLMFailureHandling:
         assert po_path.exists()
 
 
+class TestResiduePassIntegration:
+    """T-17: opt-in source-language residue post-processing pass.
+
+    Covers the minimal integration touch point called for in the brief:
+    the ``residue_pass`` constructor flag actually invokes (or skips)
+    the new pass on entries with residue in code spans.
+    """
+
+    KOREAN_RESIDUE_MD = "# 한국어 제목\n\n`한국어 함수` 설명.\n"
+
+    def _residue_aware_side_effect(self, on_residue_call):
+        """Return a litellm side-effect that distinguishes residue calls.
+
+        The residue pass uses a single-message system + user payload
+        (no batched JSON), distinct from both the batched translate
+        path (JSON object as user content) and the sequential
+        translate path (plain source text).  We tag every call by the
+        system prompt's first marker so the test can assert which
+        pipeline emitted it.
+        """
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            system_content = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_content = msg["content"]
+                elif msg["role"] == "user":
+                    user_content = msg["content"]
+            mock_response = MagicMock()
+            if "repairing a translated" in system_content:
+                # Residue pass call — return ASCII-only repair so the
+                # placeholder-token count check passes.
+                on_residue_call(system_content, user_content)
+                if "fenced code block" in system_content:
+                    mock_response.choices[0].message.content = (
+                        user_content
+                        # Replace any Korean characters with ASCII so
+                        # the residue detector accepts the result on
+                        # any subsequent scan and won't loop.
+                    )
+                else:
+                    mock_response.choices[0].message.content = "REPAIRED"
+            else:
+                # Initial translate path; for the per-entry source we
+                # echo a Korean-bearing translated form so the residue
+                # pass has something to detect.  Source content varies
+                # between heading / paragraph / code-bearing entries —
+                # `[TRANSLATED] {source}` keeps the Korean in place.
+                mock_response.choices[0].message.content = (
+                    f"[TRANSLATED] {user_content}"
+                )
+            return mock_response
+
+        return _side_effect
+
+    def test_residue_pass_off_by_default(self, tmp_path):
+        source = tmp_path / "source.md"
+        source.write_text(self.KOREAN_RESIDUE_MD, encoding="utf-8")
+        residue_calls = []
+        with patch("mdpo_llm.processor.litellm") as mock_litellm:
+            mock_litellm.completion.side_effect = (
+                self._residue_aware_side_effect(
+                    lambda sysmsg, usr: residue_calls.append((sysmsg, usr))
+                )
+            )
+            mock_litellm.get_supported_openai_params.return_value = []
+            processor = MarkdownProcessor(
+                model="test-model", target_lang="en", batch_size=0
+            )
+            processor.process_document(
+                source, tmp_path / "target.md", tmp_path / "messages.po"
+            )
+        assert residue_calls == []
+
+    def test_residue_pass_runs_on_code_only_entries(self, tmp_path):
+        """Codex cycle-5 P1: stripping code spans before
+        ``detect_languages`` makes a code-only entry look
+        language-less.  But code-only entries are exactly what T-17
+        is meant to repair — verify the residue pass still triggers
+        via the strip-fallback path.
+        """
+        # Single-paragraph document that's nothing but an inline
+        # code span containing source-language characters.  Stripping
+        # code spans from the msgid leaves an empty string; the
+        # fallback path scans the whole msgid and picks up Korean.
+        md = "`한국어`\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        residue_calls = []
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            system_content = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_content = msg["content"]
+                elif msg["role"] == "user":
+                    user_content = msg["content"]
+            mock_response = MagicMock()
+            if "repairing a translated" in system_content:
+                residue_calls.append(user_content)
+                mock_response.choices[0].message.content = "Korean"
+            else:
+                mock_response.choices[0].message.content = (
+                    f"[TRANSLATED] {user_content}"
+                )
+            return mock_response
+
+        with patch("mdpo_llm.processor.litellm") as mock_litellm:
+            mock_litellm.completion.side_effect = _side_effect
+            mock_litellm.get_supported_openai_params.return_value = []
+            processor = MarkdownProcessor(
+                model="test-model",
+                target_lang="en",
+                batch_size=0,
+                residue_pass=True,
+            )
+            processor.process_document(
+                source, tmp_path / "target.md", tmp_path / "messages.po"
+            )
+        assert len(residue_calls) == 1
+
+    def test_residue_pass_runs_on_kanji_only_japanese_source(self, tmp_path):
+        """Codex cycle-5 P2: ``detect_languages`` recognises Japanese
+        only via kana, so a kanji-only Japanese source (e.g. ``名前``)
+        gets classified as ``zh``.  T-17 still needs to scan for ja
+        residue in that case — the processor expands {zh} → {ja, zh}
+        so kanji-only Japanese entries with kana / kanji residue in
+        their translated code spans get repaired.
+        """
+        # Paragraph whose natural text is kanji-only (so
+        # detect_languages → {"zh"} alone) but whose code span
+        # carries leftover katakana the residue pass should pick up
+        # only if the {zh}→{ja, zh} expansion actually fires.
+        md = "名前 `データ` end.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        residue_calls = []
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            system_content = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_content = msg["content"]
+                elif msg["role"] == "user":
+                    user_content = msg["content"]
+            mock_response = MagicMock()
+            if "repairing a translated" in system_content:
+                residue_calls.append((system_content, user_content))
+                mock_response.choices[0].message.content = "REPAIRED"
+            else:
+                mock_response.choices[0].message.content = (
+                    f"[TRANSLATED] {user_content}"
+                )
+            return mock_response
+
+        with patch("mdpo_llm.processor.litellm") as mock_litellm:
+            mock_litellm.completion.side_effect = _side_effect
+            mock_litellm.get_supported_openai_params.return_value = []
+            processor = MarkdownProcessor(
+                model="test-model",
+                target_lang="en",
+                batch_size=0,
+                residue_pass=True,
+            )
+            processor.process_document(
+                source, tmp_path / "target.md", tmp_path / "messages.po"
+            )
+        # Residue pass MUST have run on the paragraph entry's
+        # `あいう` inline span.  Without the {zh}→{ja, zh} expansion
+        # this assertion would fail because detect_languages on
+        # ``名前`` returns {"zh"} and ja's hiragana pattern would
+        # never be applied.
+        assert len(residue_calls) >= 1
+
+    def test_residue_pass_skips_intentional_non_source_cjk_in_code(
+        self, tmp_path
+    ):
+        """Codex cycle-4 P1: an English-source document with an
+        intentional CJK code token (e.g. `` `用户.md` ``) must NOT be
+        sent through the residue prompts — the source had no CJK
+        residue to repair, the token is meaningful content.  The
+        msgid-stripped source-lang detection guarantees this:
+        ``_strip_code_spans`` removes the code span before language
+        detection, so the entry's natural text is identified as
+        English-only and ``apply_residue_pass()`` never runs.
+
+        Mixed entries (prose + a CJK code token) are
+        intentionally false-negatived rather than false-positived
+        because the downstream pass cannot distinguish a legitimate
+        identifier from a translation leak.  Glossary placeholder
+        mode and ``--placeholder-rules`` are the deterministic
+        paths when mixed-entry handling matters.
+        """
+        md = "# Heading\n\nSee `用户.md` for details.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        residue_calls = []
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            system_content = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_content = msg["content"]
+                elif msg["role"] == "user":
+                    user_content = msg["content"]
+            mock_response = MagicMock()
+            if "repairing a translated" in system_content:
+                residue_calls.append(user_content)
+                mock_response.choices[0].message.content = "USER.md"
+            else:
+                mock_response.choices[0].message.content = (
+                    f"[TRANSLATED] {user_content}"
+                )
+            return mock_response
+
+        with patch("mdpo_llm.processor.litellm") as mock_litellm:
+            mock_litellm.completion.side_effect = _side_effect
+            mock_litellm.get_supported_openai_params.return_value = []
+            processor = MarkdownProcessor(
+                model="test-model",
+                target_lang="ko",
+                batch_size=0,
+                residue_pass=True,
+            )
+            processor.process_document(
+                source, tmp_path / "target.md", tmp_path / "messages.po"
+            )
+        # The English source had no CJK residue to repair (the CJK
+        # token in the code span is intentional content, not a
+        # translation leftover).  Zero LLM repair calls.
+        assert residue_calls == []
+
+    def test_residue_pass_uses_strict_validator_when_processor_is_strict(
+        self, tmp_path
+    ):
+        """Codex cycle-2 P2: hardcoded ``conservative`` would let a
+        residue repair drop / add an inline-code span under
+        ``validation="strict"`` — only the strict validator's
+        ``inline_code_count`` check would catch that.  Verify the
+        residue pass uses the processor's actual validation mode.
+        """
+        # A paragraph entry with two inline code spans (one Korean).
+        # The residue repair will collapse the Korean span into prose
+        # text (``Korean fn``), reducing the inline_code count by 1.
+        # Strict validation must reject; conservative would accept.
+        md = "# Heading\n\nUse `var_a` and `한국어` together.\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            system_content = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_content = msg["content"]
+                elif msg["role"] == "user":
+                    user_content = msg["content"]
+            mock_response = MagicMock()
+            if "repairing a translated" in system_content:
+                # Drop the backticks in the response so the inline
+                # span disappears from the final msgstr.  (We strip
+                # the surrounding backticks before returning so the
+                # reassembly produces ``Korean fn`` as plain text.)
+                mock_response.choices[0].message.content = "Korean fn"
+            else:
+                mock_response.choices[0].message.content = (
+                    f"[TRANSLATED] {user_content}"
+                )
+            return mock_response
+
+        with patch("mdpo_llm.processor.litellm") as mock_litellm:
+            mock_litellm.completion.side_effect = _side_effect
+            mock_litellm.get_supported_openai_params.return_value = []
+            processor = MarkdownProcessor(
+                model="test-model",
+                target_lang="en",
+                batch_size=0,
+                validation="strict",
+                residue_pass=True,
+            )
+            processor.process_document(
+                source, tmp_path / "target.md", tmp_path / "messages.po"
+            )
+            po = processor.po_manager.load_or_create_po(tmp_path / "messages.po")
+            para_entry = next(
+                e for e in po if "한국어" in e.msgid
+            )
+            # Strict validator caught the inline-code count mismatch
+            # → residue repair was reverted, original msgstr stays
+            # (still has both backtick spans, including the residue).
+            assert para_entry.msgstr.count("`") == 4
+
+    def test_residue_pass_reverts_repair_that_breaks_fence_count(
+        self, tmp_path
+    ):
+        """A residue repair that strips a fenced delimiter must NOT reach disk.
+
+        Codex cycle-1 P2: ``apply_residue_pass`` only enforces the
+        placeholder-token round-trip on the rewritten span. The
+        surrounding entry's structural invariants (fence count etc.)
+        were validated against the pass-1 ``msgstr`` and aren't
+        re-checked anywhere later in the pipeline — so a malformed
+        residue repair would otherwise reach the rebuilt markdown.
+        ``_run_residue_pass`` runs the conservative validator after
+        each repair and reverts on any failure.
+        """
+        md = "# 한국어 제목\n\n```python\nname = '한국어'\n```\n"
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_content = ""
+            system_content = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_content = msg["content"]
+                elif msg["role"] == "user":
+                    user_content = msg["content"]
+            mock_response = MagicMock()
+            if "repairing a translated" in system_content:
+                # Sabotage the fenced-block repair: drop the closing
+                # fence so the repaired msgstr has fence_count=1
+                # instead of the original 2.  The placeholder-token
+                # round-trip check would accept this (no tokens
+                # involved), so the structural validator is the only
+                # safety net.
+                mock_response.choices[0].message.content = (
+                    "```python\nname = 'name'\n"
+                )
+            else:
+                mock_response.choices[0].message.content = (
+                    f"[TRANSLATED] {user_content}"
+                )
+            return mock_response
+
+        with patch("mdpo_llm.processor.litellm") as mock_litellm:
+            mock_litellm.completion.side_effect = _side_effect
+            mock_litellm.get_supported_openai_params.return_value = []
+            processor = MarkdownProcessor(
+                model="test-model",
+                target_lang="en",
+                batch_size=0,
+                residue_pass=True,
+            )
+            processor.process_document(
+                source, tmp_path / "target.md", tmp_path / "messages.po"
+            )
+            po = processor.po_manager.load_or_create_po(tmp_path / "messages.po")
+            # Find the code-block entry; its msgstr must STILL contain
+            # both fences because the residue repair was reverted.
+            code_entry = next(
+                e for e in po if e.msgid.startswith("```python")
+            )
+            assert code_entry.msgstr.count("```") == 2
+
+    def test_residue_pass_on_invokes_pass(self, tmp_path):
+        source = tmp_path / "source.md"
+        source.write_text(self.KOREAN_RESIDUE_MD, encoding="utf-8")
+        residue_calls = []
+        with patch("mdpo_llm.processor.litellm") as mock_litellm:
+            mock_litellm.completion.side_effect = (
+                self._residue_aware_side_effect(
+                    lambda sysmsg, usr: residue_calls.append((sysmsg, usr))
+                )
+            )
+            mock_litellm.get_supported_openai_params.return_value = []
+            processor = MarkdownProcessor(
+                model="test-model",
+                target_lang="en",
+                batch_size=0,
+                residue_pass=True,
+            )
+            processor.process_document(
+                source, tmp_path / "target.md", tmp_path / "messages.po"
+            )
+        # The Korean inline code span in the paragraph entry triggers
+        # exactly one repair call (heading entry has no code span,
+        # so it isn't a residue-pass target).
+        assert len(residue_calls) == 1
+        # Inline-other prompt was used (not the filename prompt) —
+        # the body has whitespace so the filename heuristic rejects it.
+        sysmsg, _ = residue_calls[0]
+        assert "translate the source-language text" in sysmsg.lower()
+
+
 class TestExtractBlockType:
     def test_standard_msgctxt(self, mock_completion):
         processor = MarkdownProcessor(model="test-model", target_lang="ko")

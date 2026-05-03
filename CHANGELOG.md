@@ -3,6 +3,43 @@
 ## Unreleased
 
 ### Added
+- **Source-language residue post-processing pass for code spans
+  (T-17).** New opt-in `residue_pass=True` constructor kwarg /
+  `--residue-pass on` CLI flag adds a polish stage that runs AFTER
+  T-16 LLM validation and re-translates fenced code blocks / inline
+  code spans whose translated text still contains source-language
+  characters (Korean Hangul, Japanese kana / kanji, Chinese CJK
+  ideographs):
+  - Detection: per-language Unicode-range scan over the translated
+    output's code spans. Source language is detected per entry from
+    the source `msgid` via `mdpo_llm.language.detect_languages`,
+    filtered to the supported set (`ko`, `ja`, `zh`) and excluding
+    the target locale.
+  - Per-residue handling: fenced blocks repair with a "preserve
+    identifiers + comments, translate user-facing strings only"
+    prompt (overriding T-12's MUST-translate-comments rule because
+    pass 1 already processed them); filename-shaped inline spans
+    convert source-language tokens to `UPPER_SNAKE_CASE` ASCII;
+    other inline spans translate naturally.
+  - Composition with T-16: skips entries already marked fuzzy by
+    the retry budget (re-running known-bad output is waste), and
+    skips refine mode entirely (refine is same-language, so
+    "source-language residue" is undefined).
+  - Round-trip safety: the residue pass MUST NOT introduce new
+    `⟦P:N⟧` placeholder tokens or alter existing token counts; a
+    repair that fails the multiset check is rejected and the pass-1
+    output is kept verbatim.
+  - Failure handling: any LLM exception or validator rejection
+    keeps the pass-1 translation and logs a warning. Best-effort
+    polish, not a blocking gate.
+  - Default: `off` pending soak time before promoting to `on`.
+  - New module: `mdpo_llm.residue_pass` with public
+    `detect_residues`, `repair_block`, `apply_residue_pass`,
+    `ResidueSpan`, `RepairResult`, `SOURCE_LANG_PATTERNS`,
+    `SUPPORTED_SOURCE_LANGS`, and three module-level prompt
+    constants (`RESIDUE_FENCED_PROMPT`,
+    `RESIDUE_INLINE_FILENAME_PROMPT`,
+    `RESIDUE_INLINE_OTHER_PROMPT`).
 - **LLM validation + bounded retry loop (T-16).** New opt-in
   `validation="llm"` mode wires a second-pass grader LLM and a
   bounded retry loop into the per-batch translate path:

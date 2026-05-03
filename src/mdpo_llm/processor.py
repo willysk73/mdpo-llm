@@ -38,9 +38,15 @@ from .placeholder import (
     check_round_trip,
     check_structural_position,
 )
+from .language import _resolve_primary, detect_languages
 from .prompts import Prompts
 from .reconstructor import DocumentReconstructor
 from .reference_pool import ReferencePool
+from .residue_pass import (
+    SUPPORTED_SOURCE_LANGS,
+    apply_residue_pass,
+    strip_code_spans as _strip_code_spans,
+)
 from .results import BatchStats, Coverage, DirectoryResult, ProcessResult, Receipt
 from .validator import (
     ValidationIssue,
@@ -245,6 +251,7 @@ class MarkdownProcessor:
         glossary_mode: GlossaryMode = "placeholder",
         mode: Mode = "translate",
         auto_bracket_placeholders: bool = True,
+        residue_pass: bool = False,
         **litellm_kwargs,
     ):
         """
@@ -376,6 +383,18 @@ class MarkdownProcessor:
                 case-insensitive) overrides the kwarg for quick ops toggles
                 without code changes; unrecognised env values fall back to
                 the kwarg so typos don't silently flip behaviour.
+            residue_pass: T-17 source-language residue post-processing
+                pass. When ``True``, runs an opt-in polish stage AFTER
+                T-16 LLM validation (and AFTER structural validation)
+                that re-translates fenced / inline code spans whose
+                translated text still contains source-language
+                characters.  Best-effort: a failed residue repair
+                keeps the pass-1 translation verbatim and logs a
+                warning.  Skipped for ``mode="refine"`` (refine is
+                same-language so "source-language residue" is
+                undefined) and for entries that exhausted T-16's retry
+                budget (already known-bad — re-running is waste).
+                Default: ``False`` pending soak time before promoting.
             **litellm_kwargs: Extra keyword arguments forwarded to
                 ``litellm.completion()``.
         """
@@ -438,6 +457,7 @@ class MarkdownProcessor:
             auto_bracket_placeholders
         )
         self.glossary_mode: GlossaryMode = glossary_mode
+        self.residue_pass: bool = bool(residue_pass)
         if mode not in ("translate", "refine"):
             raise ValueError(
                 f"mode must be 'translate' or 'refine', got {mode!r}"
@@ -2460,6 +2480,17 @@ class MarkdownProcessor:
                     pending=pending,
                     initial_skipped=initial_skipped,
                 )
+
+            # T-17: source-language residue post-processing pass.  Runs
+            # AFTER translation + LLM validation have committed (so we
+            # see fuzzy flags and final msgstr) but BEFORE rebuild +
+            # PO save, so any in-place edits are picked up by both the
+            # rebuilt markdown and the saved PO without a second
+            # save round-trip.  No-op when self.residue_pass is False,
+            # self.mode == 'refine', or translate-mode ``inplace=True``
+            # has rewritten msgid (the residue pass logs a warning and
+            # exits in that case).
+            self._run_residue_pass(po_file, usage, inplace=inplace)
 
             coverage_dict = reconstructor.get_process_coverage(
                 blocks, po_file, parser.context_id
@@ -4825,6 +4856,16 @@ class MarkdownProcessor:
                 reconstructor = DocumentReconstructor(
                     skip_types=self.SKIP_TYPES
                 )
+                # T-17 residue pass: per-lang because each language has
+                # its own target locale and its own source-language
+                # residue characterisation; share the helper with the
+                # single-target path via the ``target_lang_override``
+                # kwarg so the multi-target call doesn't mutate
+                # ``self.target_lang`` (which several other helpers
+                # consult).
+                self._run_residue_pass(
+                    po_file, usage, target_lang_override=lang
+                )
                 coverage_dict = reconstructor.get_process_coverage(
                     blocks, po_file, parser.context_id
                 )
@@ -5873,6 +5914,260 @@ class MarkdownProcessor:
         entry.msgstr = ""
         if stats is not None:
             stats["validation_failed"] = stats.get("validation_failed", 0) + 1
+
+    # ----- residue post-processing pass (T-17) -----
+
+    def _residue_pass_llm_callable(
+        self, target_lang: str, usage: Optional[_UsageAccumulator]
+    ) -> Callable[[str, str], str]:
+        """Build the ``(system, user) -> response`` closure used by
+        :func:`mdpo_llm.residue_pass.apply_residue_pass`.
+
+        Kept as a method (not a free function) so the closure inherits
+        ``self.model`` / ``self._litellm_kwargs`` / token-accounting
+        plumbing without the residue module learning about
+        ``litellm``.  ``usage`` may be ``None`` for callers that don't
+        accumulate (tests, dry-runs); the receipt-billing path threads
+        the same accumulator the rest of the document used so residue
+        repair tokens land on the existing receipt.
+        """
+
+        def _call(system_prompt: str, user_text: str) -> str:
+            messages = [
+                self._system_message(system_prompt),
+                {"role": "user", "content": user_text},
+            ]
+            response = litellm.completion(
+                model=self.model,
+                messages=messages,
+                **self._litellm_kwargs,
+            )
+            if usage is not None:
+                usage.record(response)
+            return response.choices[0].message.content
+
+        return _call
+
+    def _run_residue_pass(
+        self,
+        po_file: polib.POFile,
+        usage: Optional[_UsageAccumulator],
+        *,
+        target_lang_override: Optional[str] = None,
+        inplace: bool = False,
+    ) -> None:
+        """Apply :func:`apply_residue_pass` to every eligible PO entry.
+
+        No-ops unless ``self.residue_pass`` is True and we are NOT in
+        refine mode (refine is same-language, so "source-language
+        residue" is undefined).  Skips fuzzy entries (T-16 already
+        marked them best-effort failures — re-running here would burn
+        tokens on known-bad output) and entries with empty msgstr.
+
+        Source language is inferred per entry from
+        :func:`detect_languages` over ``msgid``: only languages
+        actually present in the source are scanned for in the
+        translated ``msgstr``.  This avoids false positives on
+        documents whose source is, say, English with an intentional
+        Chinese filename token (`` `用户.md` ``) — without the msgid
+        guard the residue pass would blindly scan every supported
+        source range and try to "repair" the legitimate non-source
+        identifier.  ``apply_residue_pass`` further narrows
+        detection with a target-aware Unicode pattern so legitimate
+        target-script characters (e.g. CJK ideographs in a Japanese
+        msgstr) aren't treated as residue.
+
+        Known limitation — translate-mode ``inplace=True`` rewrites
+        ``msgid`` to the translated text BEFORE this pass runs, so
+        the source-language signal is lost and the residue pass
+        effectively no-ops on inplace entries whose msgid equals
+        msgstr.  ``inplace=True`` is deprecated for v0.5; the
+        residue pass is intended to compose with refine-first /
+        non-inplace flows where the original ``msgid`` is preserved.
+
+        Errors from any single entry are caught and logged so one
+        bad block can't abort the whole pass; the surrounding
+        processor's validation already ran, so the entry's pass-1
+        output stays on disk regardless.
+        """
+        if not self.residue_pass:
+            return
+        if self.mode == "refine":
+            return
+        if inplace:
+            # Translate-mode ``inplace=True`` rewrites ``msgid`` to the
+            # translated text BEFORE this pass runs, so the source-
+            # language signal is lost — every entry's msgid would be
+            # detected as the TARGET language and ``src_langs`` would
+            # come up empty, silently skipping every entry.  Surface
+            # this as a single explicit warning instead of a per-entry
+            # no-op so callers running ``--inplace --residue-pass on``
+            # see the incompatibility once and can switch to
+            # ``mode='refine'`` (the v0.5 replacement) or run a
+            # non-inplace translate.
+            logger.warning(
+                "residue pass disabled: --residue-pass is incompatible "
+                "with translate-mode inplace=True (msgid is rewritten "
+                "before the pass runs, so source-language detection "
+                "always returns the target language). Switch to "
+                "mode='refine' or non-inplace translate to enable "
+                "residue post-processing."
+            )
+            return
+        target_primary = _resolve_primary(
+            target_lang_override or self.target_lang
+        )
+        llm_callable = self._residue_pass_llm_callable(
+            target_lang=target_lang_override or self.target_lang,
+            usage=usage,
+        )
+        for entry in po_file:
+            if entry.obsolete or not entry.msgid or not entry.msgstr:
+                continue
+            # Skip only entries that exhausted T-16's LLM-validator
+            # retries (those carry a ``validator: llm:`` tcomment line
+            # AND have a blanked msgstr — already filtered above).
+            # A pre-existing ``fuzzy`` flag from gettext tooling or a
+            # human review is NOT a validation-retry failure and the
+            # residue pass SHOULD still be eligible for those entries.
+            if (
+                "fuzzy" in entry.flags
+                and "validator: llm:" in (entry.tcomment or "")
+            ):
+                continue
+            block_type = self._extract_block_type_from_msgctxt(entry.msgctxt)
+            if block_type in self.SKIP_TYPES:
+                continue
+            # Restrict the source-lang scan to languages the source's
+            # NATURAL TEXT (prose, headings) actually contains.  CJK
+            # tokens that only appear inside the source's code spans
+            # are treated as intentional identifiers rather than
+            # source-language signal — so a non-CJK source document
+            # with an intentional CJK filename (e.g. `` `用户.md` `` in
+            # an English doc) does NOT trigger a residue scan that
+            # would otherwise rewrite the legitimate identifier.
+            # Stripping code spans here, instead of in
+            # ``detect_languages`` itself, keeps language.py's
+            # general-purpose helpers untouched (out of scope) and
+            # confines the residue-pass-specific heuristic to this
+            # call site.
+            msgid_natural = _strip_code_spans(entry.msgid)
+            # Code-only entries (whole msgid is a fenced block or a
+            # single inline code span) leave NO natural text after
+            # stripping — but those are exactly the entries the
+            # residue pass exists for.  Fall back to scanning the
+            # whole msgid so a code-only ``msgid`` like
+            # `` `한국어` `` still surfaces ``ko`` as a candidate.
+            # Mixed entries (prose + a CJK code token) are
+            # intentionally NOT detected here: the downstream pass
+            # cannot distinguish "real residue leak" from an
+            # intentional source-script identifier inside a code
+            # span (`` `用户.md` `` in an English doc) — so the
+            # safer trade-off is to false-negative on mixed
+            # entries (no repair, no harm) rather than
+            # false-positive (rewrite legitimate identifiers).
+            # Glossary placeholder mode and `--placeholder-rules`
+            # remain the deterministic path for documents where
+            # mixed entries DO need explicit handling.
+            detect_target = (
+                msgid_natural if msgid_natural.strip() else entry.msgid
+            )
+            src_langs = {
+                lang
+                for lang in detect_languages(detect_target)
+                if lang in SUPPORTED_SOURCE_LANGS and lang != target_primary
+            }
+            # ``detect_languages`` recognises Japanese only via kana,
+            # so a kanji-only Japanese msgid (e.g. ``名前``) is
+            # classified as ``zh`` (CJK ideographs).  Without this
+            # expansion, T-17's advertised ``ja`` support would be a
+            # no-op on common kanji-only Japanese entries.  When
+            # either CJK-overlapping lang is in scope, scan for
+            # both — the target-aware patterns inside
+            # :func:`apply_residue_pass` filter out same-target false
+            # positives (zh→ja and ja→zh degenerates).  Korean
+            # Hangul is disjoint from CJK ideographs and stays
+            # independent of this expansion.
+            if "zh" in src_langs or "ja" in src_langs:
+                src_langs |= {
+                    lang
+                    for lang in ("ja", "zh")
+                    if lang != target_primary
+                }
+            if not src_langs:
+                continue
+            repaired = entry.msgstr
+            for src_lang in sorted(src_langs):
+                try:
+                    repaired = apply_residue_pass(
+                        repaired,
+                        source_lang=src_lang,
+                        target_lang=target_lang_override or self.target_lang,
+                        llm_callable=llm_callable,
+                    )
+                except Exception:
+                    logger.exception(
+                        "residue pass failed for entry %s (lang=%s); "
+                        "keeping pass-1 output",
+                        entry.msgctxt,
+                        src_lang,
+                    )
+                    repaired = entry.msgstr
+                    break
+            if repaired == entry.msgstr:
+                continue
+            # Structurally re-validate the repair before committing.
+            # ``apply_residue_pass`` only enforces the placeholder-token
+            # round-trip locally on the rewritten span; the surrounding
+            # entry's structural invariants (fence count, heading
+            # level, glossary preservation) were validated against the
+            # pass-1 ``msgstr`` and aren't re-checked anywhere later in
+            # the pipeline — so a rogue residue repair that strips a
+            # closing fence or otherwise alters block structure would
+            # otherwise reach disk.  Re-run the same conservative
+            # validator that pass 1 used; revert on any failure
+            # (best-effort polish, pass-1 output wins).
+            # Use the per-lang glossary when called from
+            # ``process_document_multi`` (which loops over languages
+            # WITHOUT swapping ``self._glossary``) so glossary-preservation
+            # checks the correct locale's mappings.  Single-target
+            # callers thread no override and fall back to the
+            # constructor-time glossary via ``_current_glossary``.
+            check_glossary = (
+                self._resolve_glossary_for_lang(target_lang_override)
+                if target_lang_override is not None
+                else self._current_glossary()
+            )
+            # Match the strictness the main translation path used so
+            # ``validation="strict"`` callers don't silently lose the
+            # ``inline_code_count`` check on residue-repaired entries:
+            # a residue rewrite that adds / drops backticks would
+            # otherwise reach disk under strict mode.  ``"off"`` and
+            # ``"llm"`` callers fall back to ``"conservative"`` — the
+            # same cheap structural pre-gate ``"llm"`` already runs in
+            # ``_apply_validation`` — because the residue pass is
+            # opt-in polish and needs at least one structural safety
+            # net regardless of the surrounding ``validation`` mode.
+            structural_mode = (
+                "strict" if self.validation == "strict" else "conservative"
+            )
+            check = validate_translation(
+                entry.msgid,
+                repaired,
+                target_lang=target_lang_override or self.target_lang,
+                glossary=check_glossary,
+                mode=structural_mode,
+                purpose=self.mode,
+            )
+            if not check.ok:
+                logger.warning(
+                    "residue pass: structural validator rejected "
+                    "repair for entry %s (%s); keeping pass-1 output",
+                    entry.msgctxt,
+                    check.reasons(),
+                )
+                continue
+            entry.msgstr = repaired
 
     # ----- helpers -----
 

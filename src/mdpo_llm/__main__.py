@@ -200,6 +200,20 @@ def _add_translate_flags(
             "MDPO_NO_PROGRESS is set."
         ),
     )
+    parser.add_argument(
+        "--residue-pass",
+        choices=["off", "on"],
+        default="off",
+        help=(
+            "T-17 source-language residue post-processing pass. 'off' "
+            "(default — pending soak time) or 'on' to re-translate fenced / "
+            "inline code spans whose translated text still contains "
+            "source-language characters. Best-effort: a failed residue "
+            "repair keeps the pass-1 output verbatim. Silently ignored by "
+            "the 'refine' / 'refine-dir' subcommands (refine is "
+            "same-language so 'source-language residue' is undefined)."
+        ),
+    )
     _add_placeholder_rules_flag(parser)
 
 
@@ -242,6 +256,7 @@ def _build_processor(
         placeholders=placeholders,
         progress_callback=progress_callback,
         mode=mode,
+        residue_pass=getattr(args, "residue_pass", "off") == "on",
     )
 
 
@@ -1154,6 +1169,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-progress",
         action="store_true",
         help="Disable the progress bar even on a TTY.",
+    )
+    p_multi.add_argument(
+        "--residue-pass",
+        choices=["off", "on"],
+        default="off",
+        help=(
+            "T-17 source-language residue post-processing pass. "
+            "'off' (default) or 'on' — runs per-language after each "
+            "lang's commit. See 'translate --help' for details."
+        ),
     )
     _add_placeholder_rules_flag(p_multi)
     p_multi.add_argument("source", help="Source markdown file.")
