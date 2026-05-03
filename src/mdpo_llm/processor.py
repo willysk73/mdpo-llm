@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -14,7 +15,7 @@ import warnings
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,8 @@ from .placeholder import (
     Placeholder,
     PlaceholderMap,
     PlaceholderRegistry,
+    auto_bracket_predicate_factory,
+    build_auto_bracket_patterns,
     check_round_trip,
     check_structural_position,
 )
@@ -215,6 +218,7 @@ class MarkdownProcessor:
         placeholders: Optional[PlaceholderRegistry] = None,
         glossary_mode: GlossaryMode = "placeholder",
         mode: Mode = "translate",
+        auto_bracket_placeholders: bool = True,
         **litellm_kwargs,
     ):
         """
@@ -302,6 +306,27 @@ class MarkdownProcessor:
                 the raw source text and is asked to preserve / translate
                 each term as instructed.  Ignored when no glossary is
                 configured.
+            auto_bracket_placeholders: Auto-register T-14 bracket placeholder
+                patterns for tokens shaped ``<source-lang-word>`` or
+                ``{source-lang-word}`` whose content contains at least one
+                non-ASCII word character (``\\w`` minus ASCII).  Defaults to
+                ``True`` so source-language identifiers in angle / single-brace
+                constructs (e.g. ``{게임코드}``, ``<전송>``) survive a
+                translate pass verbatim without the caller having to
+                enumerate every token in ``glossary``.  ``{{...}}`` and
+                ``<<...>>`` runtime templates are excluded by the regex, and
+                real HTML opening / closing tags are excluded too so the
+                ``html_attr`` built-in keeps its allowlist-based protection
+                contract.  When a glossary term covers the same span the
+                glossary wins (same priority as elsewhere), so auto-register
+                never overrides an explicit translation / preserve rule.
+                Pass ``False`` to disable — useful when the caller wants
+                strict opt-in placeholder control.  The environment variable
+                ``MDPO_AUTO_BRACKET_PLACEHOLDERS`` (``1`` / ``0`` / ``true`` /
+                ``false`` / ``yes`` / ``no`` / ``on`` / ``off``,
+                case-insensitive) overrides the kwarg for quick ops toggles
+                without code changes; unrecognised env values fall back to
+                the kwarg so typos don't silently flip behaviour.
             **litellm_kwargs: Extra keyword arguments forwarded to
                 ``litellm.completion()``.
         """
@@ -341,6 +366,9 @@ class MarkdownProcessor:
         self.enable_prompt_cache = enable_prompt_cache
         self._progress_callback = progress_callback
         self._placeholders = placeholders
+        self.auto_bracket_placeholders = self._resolve_auto_bracket_setting(
+            auto_bracket_placeholders
+        )
         self.glossary_mode: GlossaryMode = glossary_mode
         if mode not in ("translate", "refine"):
             raise ValueError(
@@ -838,8 +866,16 @@ class MarkdownProcessor:
         Keyed by the frozen ``(term, value)`` items so files with
         identical effective glossaries (the common case when only a
         few subdirectories override) share one compiled registry.
+
+        The key includes the glossary even in instruction mode
+        because T-14 auto-bracket patterns now consult mapped-entry
+        glossary terms to decide whether to defer (cycle-7 fix) — so
+        two per-file instruction glossaries that differ ONLY in
+        their mapping set must NOT share a cached registry, or a
+        mapped term from one file would silently suppress auto-
+        bracketing for another file in the same directory run.
         """
-        if not glossary or self.glossary_mode != "placeholder":
+        if not glossary:
             key: Any = None
         else:
             key = frozenset(glossary.items())
@@ -956,6 +992,7 @@ class MarkdownProcessor:
             placeholders=self._placeholders,
             glossary_mode=self.glossary_mode,
             mode="refine",
+            auto_bracket_placeholders=self.auto_bracket_placeholders,
             **self._litellm_kwargs,
         )
 
@@ -1076,6 +1113,8 @@ class MarkdownProcessor:
         glossary: Optional[Dict[str, Optional[str]]] = None,
         *,
         update_builtin_overrides: bool = True,
+        target_langs_override: Optional[List[str]] = None,
+        auto_bracket_defer_terms: Optional[List[str]] = None,
     ) -> PlaceholderRegistry:
         """Compose the registry the processor actually uses on every call.
 
@@ -1177,7 +1216,92 @@ class MarkdownProcessor:
                 if pattern is None:
                     continue
                 registry.register(f"glossary:{term}", pattern)
+        # T-14 auto source-language bracket placeholders.  Registered AFTER
+        # glossary so the factory's predicate sees the final glossary term
+        # set — which lets auto-bracket defer to any glossary term that
+        # would match the inner span (glossary wins by contract, see
+        # :func:`mdpo_llm.placeholder.auto_bracket_predicate_factory`).
+        # Registration order is also the tie-break on equal-span overlaps;
+        # a user-supplied pattern still wins on exact ties because user
+        # patterns are registered first (step 1 above).
+        #
+        # Term-selection rules for the predicate (per glossary mode):
+        #
+        # * Placeholder mode: every glossary term gets a ``glossary:*``
+        #   pattern registered above, so auto-bracket must defer to
+        #   every one of them (otherwise the outer bracket span wins
+        #   the overlap resolver and the inner glossary match is
+        #   dropped — the caller's explicit preserve / translate rule
+        #   for the term would never apply).
+        # * Instruction mode: glossary is a prompt hint with no opaque-
+        #   token preservation.  Only MAPPED-to-a-different-string
+        #   entries (e.g. ``"게임코드" → "GameCode"``) need deference
+        #   so the LLM sees the raw source term and applies the
+        #   mapping; null-entries and identity mappings want the
+        #   same verbatim preservation auto-bracket already provides,
+        #   so they're left alone — otherwise bracketed identifiers
+        #   under instruction-mode glossary would reach the model
+        #   entirely unguarded (no glossary pattern tokenizes them
+        #   there).  Empty after filter means "no deference needed".
+        if self.auto_bracket_placeholders:
+            glossary_terms: Optional[List[str]] = None
+            if auto_bracket_defer_terms is not None:
+                # Explicit override — used by
+                # :meth:`process_document_multi` to collect mapped
+                # terms across ALL requested locales so the shared
+                # predicate defers for any lang's explicit mapping,
+                # not just the constructor-locale's (cycle-10 P1).
+                glossary_terms = auto_bracket_defer_terms or None
+            elif effective_glossary:
+                if self.glossary_mode == "placeholder":
+                    glossary_terms = list(effective_glossary.keys())
+                else:
+                    mapped = [
+                        term
+                        for term, value in effective_glossary.items()
+                        if value is not None and value != term
+                    ]
+                    glossary_terms = mapped or None
+            predicate = auto_bracket_predicate_factory(glossary_terms)
+            # Build target-script-gated patterns per processor
+            # instance so ``target_lang="ko"`` only tokenizes non-
+            # Korean content in brackets (``{id_게임}`` matches,
+            # ``{전송}`` does not — the refine pass / ko→ja
+            # translate pass still gets to polish / translate
+            # target-script labels).  ``target_langs_override`` is
+            # used by multi-target runs to union script ranges
+            # across every requested locale so a single source
+            # encoding is safe to fan out to every target.
+            target_arg: Union[str, List[str], None] = (
+                target_langs_override
+                if target_langs_override
+                else self.target_lang
+            )
+            for name, pattern in build_auto_bracket_patterns(target_arg):
+                registry.register(name, pattern, predicate=predicate)
         return registry
+
+    @staticmethod
+    def _resolve_auto_bracket_setting(kwarg_value: bool) -> bool:
+        """Resolve the final ``auto_bracket_placeholders`` setting.
+
+        Reads ``MDPO_AUTO_BRACKET_PLACEHOLDERS`` from the environment: a
+        recognised truthy / falsy value (``1`` / ``0`` / ``true`` /
+        ``false`` / ``yes`` / ``no`` / ``on`` / ``off``, case-insensitive)
+        wins over the constructor kwarg so operators can flip the toggle
+        without redeploying.  Unrecognised values fall through to the
+        kwarg — a typo in the env var should not silently disable
+        behaviour the caller explicitly requested.
+        """
+        raw = os.environ.get("MDPO_AUTO_BRACKET_PLACEHOLDERS")
+        if raw is None:
+            return kwarg_value
+        normalised = raw.strip().lower()
+        if normalised in ("0", "false", "no", "off"):
+            return False
+        if normalised in ("1", "true", "yes", "on"):
+            return True
+        return kwarg_value
 
     @staticmethod
     def _compile_glossary_pattern(term: str) -> Optional["re.Pattern[str]"]:
@@ -3682,6 +3806,49 @@ class MarkdownProcessor:
         usage = getattr(self._tls, "usage", None) or _UsageAccumulator()
         start = time.monotonic()
 
+        # Install a multi-target-aware placeholder registry so the
+        # shared source-side encoding that fans out to every lang
+        # only tokenizes bracket content that is non-target-script
+        # for EVERY requested locale (cycle-9 P1 regression guard).
+        # Without this, patterns frozen to ``self.target_lang`` at
+        # construction time would misclassify cross-lang spans —
+        # e.g. ``{전송}`` tokenized under a processor constructed
+        # with ``target_lang="en"`` even when the multi call also
+        # targets ``ko`` and the Korean pass should polish the span.
+        #
+        # Glossary-defer terms for the shared predicate are also
+        # unioned across every lang's resolved glossary (cycle-10
+        # P1).  Multi-target disallows ``glossary_mode="placeholder"``
+        # (see the raise above), so only mapped-to-a-different-string
+        # entries need deference — null-entries and identity
+        # mappings preserve verbatim either way and stay in the
+        # auto-bracket protection path.
+        raw_chain: Dict[str, Any] = {}
+        if self._glossary_file:
+            raw_chain.update(self._glossary_file)
+        if self._glossary_inline:
+            raw_chain.update(self._glossary_inline)
+        multi_defer_terms: List[str] = []
+        seen_terms: set = set()
+        for lang in langs:
+            resolved = self._resolve_raw_for_lang(raw_chain, lang)
+            for term, value in resolved.items():
+                if (
+                    value is not None
+                    and value != term
+                    and term not in seen_terms
+                ):
+                    seen_terms.add(term)
+                    multi_defer_terms.append(term)
+        previous_registry = getattr(self._tls, "per_file_registry", _TLS_UNSET)
+        self._tls.per_file_registry = self._build_effective_registry(
+            self._placeholders,
+            glossary=None,
+            update_builtin_overrides=False,
+            target_langs_override=list(langs),
+            auto_bracket_defer_terms=multi_defer_terms,
+        )
+
         po_managers: Dict[str, POManager] = {
             lang: POManager(skip_types=self.SKIP_TYPES) for lang in langs
         }
@@ -3931,6 +4098,17 @@ class MarkdownProcessor:
                 self._emit_progress(
                     kind="document_end", path=source_path_str
                 )
+            # Restore whatever TLS registry was installed before the
+            # multi-target override — clearing the attribute when
+            # there was none so subsequent calls on the same thread
+            # fall back to ``self._effective_registry`` cleanly.
+            if previous_registry is _TLS_UNSET:
+                try:
+                    del self._tls.per_file_registry
+                except AttributeError:
+                    pass
+            else:
+                self._tls.per_file_registry = previous_registry
 
     def _translate_group_multi(
         self,
@@ -4122,7 +4300,49 @@ class MarkdownProcessor:
         ignored under :meth:`process_document_multi`).  Returns ``None``
         on call failure so the caller can count the entry as failed
         rather than aborting the whole group.
+
+        Temporarily swaps the TLS placeholder registry to one built
+        for this specific ``target_lang`` so the encoding step uses
+        per-lang script gating instead of the multi-target UNION
+        registry installed by :meth:`process_document_multi`.
+        Without this swap, a Korean fallback on an English-first
+        ``[en, ko]`` run would encode ``{\uc804\uc1a1}`` with the
+        shared union pattern (Hangul excluded) and still tokenize it
+        — so Korean output would freeze placeholders that a single
+        ``target_lang="ko"`` call would correctly leave translatable.
+        Restored in a ``finally`` so an exception in the call path
+        doesn't leak the single-lang registry into sibling langs.
         """
+        # Resolve the glossary for THIS specific fallback lang so
+        # locale-specific mappings (``{"게임코드": {"en": None,
+        # "ja": "GameCode"}}``) feed the predicate with the correct
+        # per-target mapping set.  Falling back on
+        # ``self._current_glossary()`` would always use the
+        # processor's constructor locale, so a Japanese fallback on
+        # an English-constructor run would miss the ja-only
+        # ``"GameCode"`` mapping and auto-bracket the raw term away
+        # from the translate prompt (cycle-19 P1 regression guard).
+        lang_glossary: Optional[Dict[str, Optional[str]]] = None
+        raw_chain: Dict[str, Any] = {}
+        if self._glossary_file:
+            raw_chain.update(self._glossary_file)
+        if self._glossary_inline:
+            raw_chain.update(self._glossary_inline)
+        if raw_chain:
+            resolved = self._resolve_raw_for_lang(raw_chain, target_lang)
+            lang_glossary = {
+                term: value
+                for term, value in resolved.items()
+                if value != "__remove__"
+            } or None
+        lang_registry = self._build_effective_registry(
+            self._placeholders,
+            glossary=lang_glossary,
+            update_builtin_overrides=False,
+            target_langs_override=[target_lang],
+        )
+        previous_registry = getattr(self._tls, "per_file_registry", _TLS_UNSET)
+        self._tls.per_file_registry = lang_registry
         try:
             encoded_source, mapping = self._encode_source(source_text)
             if self.mode == "refine":
@@ -4168,6 +4388,14 @@ class MarkdownProcessor:
                 exc,
             )
             return None
+        finally:
+            if previous_registry is _TLS_UNSET:
+                try:
+                    del self._tls.per_file_registry
+                except AttributeError:
+                    pass
+            else:
+                self._tls.per_file_registry = previous_registry
 
     def _commit_multi_entry(
         self,

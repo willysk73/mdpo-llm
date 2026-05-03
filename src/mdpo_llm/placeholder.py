@@ -18,7 +18,16 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Pattern as RePattern, Tuple, Union
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Pattern as RePattern,
+    Tuple,
+    Union,
+)
 
 # Marker used for pre-existing token-literals found in the source text.
 # They're recorded as identity entries in the mapping so the round-trip
@@ -341,6 +350,548 @@ BUILTIN_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]", Optional[Callable[[str, in
     ("anchor", ANCHOR_PATTERN, _anchor_predicate),
     ("html_attr", HTML_ATTR_PATTERN, _is_inside_html_tag),
 )
+
+
+# T-14 auto source-language bracket placeholders.  Detect single-angle
+# ``<source-lang-word>`` and single-brace ``{source-lang-word}`` spans
+# whose content holds at least one NON-ASCII word character — typically
+# CJK / Hangul / Kana / Cyrillic identifiers that the LLM would otherwise
+# rewrite when asked to "translate" a path parameter or UI token.
+#
+# Not added to :data:`BUILTIN_PATTERNS` because T-6 built-ins are
+# no-opt-out by contract, while T-14 ships with a constructor kwarg
+# (``MarkdownProcessor(auto_bracket_placeholders=...)``) and a
+# ``MDPO_AUTO_BRACKET_PLACEHOLDERS`` env-var override.  The registry
+# caller (the processor) registers them explicitly after the glossary
+# patterns using :func:`auto_bracket_predicate_factory` to compose the
+# active glossary terms into the match-time predicate so glossary
+# substitutions still win for any span they cover.
+#
+# Detection rule — the bracket content must hold at least one word
+# character OUTSIDE the TARGET LANGUAGE'S primary script.  Python's
+# ``re`` doesn't support character-class subtraction, so we spell it
+# as ``[^\W<target-script-range>]``: NOT (non-word) AND NOT
+# (target-script-range) = word-char AND not-in-target-script.
+#
+# Target-script gating matters because the brief says "auto-
+# registration only fires for NON-target-script content": a Korean
+# refine pass (``target_lang="ko"``) that hard-coded "non-ASCII" as
+# the detection rule would still tokenize every ``{전송}`` / ``<다음>``
+# span and never let the refiner polish them, and a Korean → Japanese
+# translate pass would freeze both source-script and target-script
+# brackets indiscriminately.  The default for unknown language codes
+# is Latin/ASCII, which matches the repo's typical English-target
+# workflow.
+#
+# The surrounding content class is intentionally NARROW — identifier
+# shapes only (``\w``, ``-``, ``_``, ``.``).  Using the permissive
+# ``[^<>]*`` / ``[^{}]*`` that the brief's shape sketches would
+# match arbitrary prose / JSON whose brace run happens to hold a
+# non-ASCII word char, so e.g. ``{"이름":"값"}`` and
+# ``{ 상태: 한글 }`` would get frozen into opaque tokens and never
+# reach the model — a regression that silently suppresses
+# translation of perfectly translatable content.  Keeping the class
+# tight aligns with the brief's "source-lang-word" singular wording
+# and the ``{page_id}``-style URL-path-parameter example.
+#
+# Whitespace is deliberately EXCLUDED from the class too — a
+# multi-word bracketed UI label like ``{상태 변경}`` or
+# ``<следующий шаг>`` is ordinary translatable prose wrapped in
+# brackets, not a source-language identifier, and since the feature
+# is on by default any whitespace leniency silently suppresses those
+# strings from reaching the model.  Callers who really do need to
+# pin a multi-word bracketed label can register a project-specific
+# user pattern via ``placeholders=PlaceholderRegistry(...)`` which
+# takes priority over auto-register on exact-span ties.
+#
+# The surrounding lookbehind / lookahead excludes double-delimiter
+# runtime templates (``{{var}}`` Mustache / Jinja, ``<<x>>``) so the
+# inner single-brace / single-angle does NOT get tokenized away from
+# under the template engine.
+#
+# HTML tag exclusion is NOT done at the regex level — an earlier
+# ``(?![A-Za-z/!?])`` lookahead after ``<`` incorrectly rejected
+# mixed-script identifiers that start with ASCII letters
+# (``<id_게임코드>``, ``<userПример>``) that are legitimate source
+# tokens.  Instead the narrow content class itself filters most
+# HTML tag shapes (attribute values, slash, equals, quotes, spaces
+# all fall outside ``[\w.\-]``) and the match-time predicate
+# :func:`_inside_html_open_tag` rejects any auto-bracket span that
+# falls INSIDE a tag body matched by :data:`HTML_TAG_OPEN_RE` —
+# which covers quoted / unquoted / JSX-style attribute values in
+# one check without false-positives on mixed-script IDs.
+# Combining mark ranges for scripts the detection table claims to
+# support (Latin, Cyrillic, Arabic, Hebrew, Greek, Thai, Devanagari,
+# CJK, Tibetan, plus the adjacent Indic / Southeast-Asian blocks
+# bundled together for completeness).  Python's ``\w`` excludes
+# ``Mn`` / ``Mc`` / ``Me`` marks, so identifiers like ``{\u0915\u093f\u0924\u093e\u092c}``
+# (Hindi ``किताब``) or ``{\u0633\u064e\u0644\u064e\u0627\u0645}``
+# (Arabic ``سَلَام``) would never match the content class without
+# these explicit ranges — and would silently fail the auto-bracket
+# preservation contract for whole scripts the feature advertises.
+_AUTO_BRACKET_MARK_RANGES = (
+    r"\u0300-\u036F"  # Combining Diacritical Marks
+    r"\u0483-\u0489"  # Cyrillic combining
+    r"\u0591-\u05C7"  # Hebrew points
+    r"\u0610-\u061A"  # Arabic extension
+    r"\u064B-\u065F"  # Arabic harakat
+    r"\u0670"  # Arabic superscript alef
+    r"\u06D6-\u06ED"  # Arabic Quranic annotations
+    r"\u0711"  # Syriac
+    r"\u0730-\u074A"  # Syriac
+    r"\u07A6-\u07B0"  # Thaana
+    r"\u0816-\u0819\u081B-\u0823\u0825-\u0827\u0829-\u082D"  # Samaritan
+    r"\u0859-\u085B"  # Mandaic
+    r"\u08D3-\u0903"  # Arabic extended / Devanagari prefix
+    r"\u093A-\u094F"  # Devanagari
+    r"\u0951-\u0957"  # Devanagari
+    r"\u0962-\u0963"  # Devanagari vowel extension
+    r"\u0981-\u0983\u09BC\u09BE-\u09C4\u09C7-\u09C8\u09CB-\u09CD\u09D7\u09E2-\u09E3"  # Bengali
+    r"\u0A01-\u0A03\u0A3C\u0A3E-\u0A42\u0A47-\u0A48\u0A4B-\u0A4D\u0A51"  # Gurmukhi
+    r"\u0A81-\u0A83\u0ABC\u0ABE-\u0AC5\u0AC7-\u0AC9\u0ACB-\u0ACD\u0AE2-\u0AE3"  # Gujarati
+    r"\u0B01-\u0B03\u0B3C\u0B3E-\u0B44\u0B47-\u0B48\u0B4B-\u0B4D\u0B56-\u0B57\u0B62-\u0B63"  # Oriya
+    r"\u0B82\u0BBE-\u0BC2\u0BC6-\u0BC8\u0BCA-\u0BCD\u0BD7"  # Tamil
+    r"\u0C00-\u0C04\u0C3E-\u0C44\u0C46-\u0C48\u0C4A-\u0C4D\u0C55-\u0C56\u0C62-\u0C63"  # Telugu
+    r"\u0C81-\u0C83\u0CBC\u0CBE-\u0CC4\u0CC6-\u0CC8\u0CCA-\u0CCD\u0CD5-\u0CD6\u0CE2-\u0CE3"  # Kannada
+    r"\u0D00-\u0D03\u0D3B-\u0D3C\u0D3E-\u0D44\u0D46-\u0D48\u0D4A-\u0D4D\u0D57\u0D62-\u0D63"  # Malayalam
+    r"\u0D82-\u0D83\u0DCA\u0DCF-\u0DD4\u0DD6\u0DD8-\u0DDF\u0DF2-\u0DF3"  # Sinhala
+    r"\u0E31\u0E34-\u0E3A\u0E47-\u0E4E"  # Thai
+    r"\u0EB1\u0EB4-\u0EBC\u0EC8-\u0ECD"  # Lao
+    r"\u0F18-\u0F19\u0F35\u0F37\u0F39\u0F3E-\u0F3F\u0F71-\u0F84\u0F86-\u0F87\u0F8D-\u0F97\u0F99-\u0FBC\u0FC6"  # Tibetan
+)
+_AUTO_BRACKET_CONTENT_CHARS = r"[\w.\-" + _AUTO_BRACKET_MARK_RANGES + r"]"
+
+# BCP 47 primary-language (the substring before ``-`` / ``_``) →
+# Unicode character-range string for that language's primary
+# script.  Unlisted codes fall through to Latin/ASCII, which matches
+# the codebase's typical English-target workflow and keeps the
+# detection semantics equivalent to the earlier hard-coded
+# "non-ASCII word char" rule for those callers.
+# Latin covers Basic Latin + Latin-1 Supplement + Extended-A / B +
+# Extended Additional so accented chars from Western-European
+# languages (French ``é``, German ``Ü``, Spanish ``ñ``, Portuguese
+# ``ã``, Polish ``ł``, Vietnamese tone marks, …) are classified as
+# target-script for Latin-script locales.  A pure ASCII range would
+# only cover English — any ``{étape}`` / ``<Überblick>`` in a
+# ``fr`` / ``de`` document would otherwise auto-tokenize and never
+# reach the translate / refine prompt.
+_SCRIPT_RANGE_LATIN = (
+    r"\u0000-\u007F"  # Basic Latin
+    r"\u0080-\u00FF"  # Latin-1 Supplement
+    r"\u0100-\u017F"  # Latin Extended-A
+    r"\u0180-\u024F"  # Latin Extended-B
+    r"\u1E00-\u1EFF"  # Latin Extended Additional
+)
+# Hangul-only, for Korean targets.  Hanja (shared with Chinese /
+# Japanese via CJK Unified Ideographs) is NOT included — it is
+# rarely used in modern Korean writing, and an ``{漢字}`` / ``{漢字ID}``
+# token in a Korean-target document is almost certainly a Chinese /
+# Japanese source identifier the caller wants preserved.
+_SCRIPT_RANGE_HANGUL = (
+    r"\u1100-\u11FF"  # Hangul Jamo
+    r"\u3130-\u318F"  # Hangul Compatibility Jamo
+    r"\uA960-\uA97F"  # Hangul Jamo Extended-A
+    r"\uAC00-\uD7A3"  # Hangul Syllables
+    r"\uD7B0-\uD7FF"  # Hangul Jamo Extended-B
+)
+# Japanese covers Hiragana + Katakana + Kanji (which shares the CJK
+# Unified block with Chinese); ``{漢字}`` under a Japanese target is
+# treated as target-script because Japanese writing routinely uses
+# those same codepoints.
+_SCRIPT_RANGE_JAPANESE = (
+    r"\u3040-\u309F"  # Hiragana
+    r"\u30A0-\u30FF"  # Katakana
+    r"\u31F0-\u31FF"  # Katakana Phonetic Extensions
+    r"\u3400-\u4DBF"  # CJK Unified Ideographs Extension A
+    r"\u4E00-\u9FFF"  # CJK Unified Ideographs (shared Kanji)
+)
+# Chinese variants use Hanzi (CJK Unified) only; Hiragana /
+# Katakana / Hangul content in brackets is non-target-script and
+# should be preserved as a Japanese / Korean source identifier.
+_SCRIPT_RANGE_CHINESE = (
+    r"\u3400-\u4DBF"  # CJK Unified Ideographs Extension A
+    r"\u4E00-\u9FFF"  # CJK Unified Ideographs (Hanzi)
+)
+_SCRIPT_RANGE_CYRILLIC = r"\u0400-\u052F"
+_SCRIPT_RANGE_ARABIC = r"\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF"
+_SCRIPT_RANGE_HEBREW = r"\u0590-\u05FF\uFB1D-\uFB4F"
+_SCRIPT_RANGE_GREEK = r"\u0370-\u03FF"
+_SCRIPT_RANGE_THAI = r"\u0E00-\u0E7F"
+_SCRIPT_RANGE_DEVANAGARI = r"\u0900-\u097F"
+_SCRIPT_RANGE_TIBETAN = r"\u0F00-\u0FFF"
+
+_LANG_TO_SCRIPT_RANGE: Dict[str, str] = {}
+_LANG_TO_SCRIPT_RANGE["ko"] = _SCRIPT_RANGE_HANGUL
+_LANG_TO_SCRIPT_RANGE["ja"] = _SCRIPT_RANGE_JAPANESE
+for _code in ("zh", "yue", "wuu", "nan", "hak"):
+    _LANG_TO_SCRIPT_RANGE[_code] = _SCRIPT_RANGE_CHINESE
+for _code in ("ru", "uk", "be", "bg", "sr", "mk", "ky", "tg", "kk", "mn"):
+    _LANG_TO_SCRIPT_RANGE[_code] = _SCRIPT_RANGE_CYRILLIC
+for _code in ("ar", "fa", "ur", "ps", "sd", "ug"):
+    _LANG_TO_SCRIPT_RANGE[_code] = _SCRIPT_RANGE_ARABIC
+for _code in ("he", "yi", "lad"):
+    _LANG_TO_SCRIPT_RANGE[_code] = _SCRIPT_RANGE_HEBREW
+for _code in ("el",):
+    _LANG_TO_SCRIPT_RANGE[_code] = _SCRIPT_RANGE_GREEK
+for _code in ("th",):
+    _LANG_TO_SCRIPT_RANGE[_code] = _SCRIPT_RANGE_THAI
+for _code in ("hi", "mr", "ne", "sa"):
+    _LANG_TO_SCRIPT_RANGE[_code] = _SCRIPT_RANGE_DEVANAGARI
+for _code in ("bo", "dz"):
+    _LANG_TO_SCRIPT_RANGE[_code] = _SCRIPT_RANGE_TIBETAN
+
+
+# BCP 47 script subtag (ISO 15924 four-letter code) -> script range.
+# Takes precedence over the primary-language default so locales like
+# ``sr-Latn`` (Latin-script Serbian) or ``zh-Hans`` (Simplified
+# Chinese) pick the correct script instead of the language's default.
+# ``Jpan`` / ``Kore`` / ``Hant`` / ``Hans`` are the superset aliases
+# (Japanese writing, Korean writing, Traditional / Simplified
+# Chinese) that BCP 47 uses; they map to the same ranges as
+# ``ja`` / ``ko`` / ``zh`` respectively.
+_SCRIPT_SUBTAG_TO_RANGE: Dict[str, str] = {
+    "latn": _SCRIPT_RANGE_LATIN,
+    "cyrl": _SCRIPT_RANGE_CYRILLIC,
+    "hans": _SCRIPT_RANGE_CHINESE,
+    "hant": _SCRIPT_RANGE_CHINESE,
+    "hani": _SCRIPT_RANGE_CHINESE,
+    "jpan": _SCRIPT_RANGE_JAPANESE,
+    "hira": _SCRIPT_RANGE_JAPANESE,
+    "kana": _SCRIPT_RANGE_JAPANESE,
+    "hang": _SCRIPT_RANGE_HANGUL,
+    "kore": _SCRIPT_RANGE_HANGUL,
+    "arab": _SCRIPT_RANGE_ARABIC,
+    "hebr": _SCRIPT_RANGE_HEBREW,
+    "grek": _SCRIPT_RANGE_GREEK,
+    "thai": _SCRIPT_RANGE_THAI,
+    "deva": _SCRIPT_RANGE_DEVANAGARI,
+    "tibt": _SCRIPT_RANGE_TIBETAN,
+}
+
+
+def _target_script_range(target_lang: Optional[str]) -> str:
+    """Resolve a BCP 47 ``target_lang`` to its primary-script range.
+
+    Returns the character-range string suitable for embedding inside
+    a ``[^\\W...]`` regex class.  Falls back to the Latin range for
+    ``None``, empty, or unrecognised codes so the default matches
+    the common English-target workflow.
+
+    A BCP 47 script subtag (ISO 15924 four-letter code, e.g.
+    ``Latn``, ``Cyrl``, ``Hans``) takes precedence over the
+    primary-language default — ``sr-Latn`` resolves to Latin even
+    though ``sr`` alone defaults to Cyrillic, and ``zh-Hant`` /
+    ``zh-Hans`` both land on Chinese because Chinese subtags are
+    the same script for this purpose.  Region subtags (``en-US``,
+    ``fr-CA``) don't carry script semantics and are ignored.
+    """
+    if not target_lang:
+        return _SCRIPT_RANGE_LATIN
+    normalised = target_lang.strip().lower().replace("_", "-")
+    if not normalised:
+        return _SCRIPT_RANGE_LATIN
+    parts = normalised.split("-")
+    base = parts[0]
+    # Walk subtags for a 4-letter script code; the BCP 47 grammar
+    # permits script after language and before region, but accept
+    # any 4-letter subtag position so tools that emit a non-canonical
+    # order still work.
+    for sub in parts[1:]:
+        if len(sub) == 4 and sub.isalpha():
+            override = _SCRIPT_SUBTAG_TO_RANGE.get(sub)
+            if override is not None:
+                return override
+    return _LANG_TO_SCRIPT_RANGE.get(base, _SCRIPT_RANGE_LATIN)
+
+
+def build_auto_bracket_patterns(
+    target_lang: Union[str, Iterable[str], None] = None,
+) -> Tuple[Tuple[str, "re.Pattern[str]"], ...]:
+    """Build T-14 auto-bracket patterns gated on ``target_lang``.
+
+    ``target_lang`` may be a single BCP 47 string, an iterable of
+    strings (multi-target runs), or ``None``.  The content "core"
+    class matches word characters OUTSIDE the union of every
+    target's primary-script range — so a single source encoding is
+    safe to fan out to every language in the iterable:
+    ``target_langs=["en", "ko"]`` keeps bare-Latin (``{game_id}``)
+    AND bare-Hangul (``{전송}``) out of the auto-bracket stream, while
+    cross-script content like ``{こんにちは}`` still tokenizes for
+    both passes.  Single-string / ``None`` inputs retain the previous
+    behaviour (one script range, unknown code → Latin).  Returns a
+    tuple of ``(name, compiled_pattern)`` pairs in the same shape as
+    the module-level :data:`AUTO_BRACKET_PATTERNS` Latin-target
+    default.
+    """
+    if target_lang is None or isinstance(target_lang, str):
+        script_range = _target_script_range(target_lang)
+    else:
+        seen = []
+        for lang in target_lang:
+            rng = _target_script_range(lang)
+            if rng not in seen:
+                seen.append(rng)
+        if not seen:
+            script_range = _SCRIPT_RANGE_LATIN
+        else:
+            script_range = "".join(seen)
+    non_target_word = r"[^\W" + script_range + r"]"
+    angle = re.compile(
+        r"(?<!<)<"
+        + _AUTO_BRACKET_CONTENT_CHARS
+        + r"*"
+        + non_target_word
+        + r"+"
+        + _AUTO_BRACKET_CONTENT_CHARS
+        + r"*>(?!>)"
+    )
+    brace = re.compile(
+        r"(?<!\{)\{"
+        + _AUTO_BRACKET_CONTENT_CHARS
+        + r"*"
+        + non_target_word
+        + r"+"
+        + _AUTO_BRACKET_CONTENT_CHARS
+        + r"*\}(?!\})"
+    )
+    return (
+        ("auto_bracket_angle", angle),
+        ("auto_bracket_brace", brace),
+    )
+
+
+AUTO_BRACKET_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    build_auto_bracket_patterns(None)
+)
+AUTO_BRACKET_ANGLE_PATTERN = AUTO_BRACKET_PATTERNS[0][1]
+AUTO_BRACKET_BRACE_PATTERN = AUTO_BRACKET_PATTERNS[1][1]
+
+
+# Void HTML elements — they never have a closing tag, so the
+# paired-closer heuristic below would incorrectly treat them as
+# unpaired "placeholders" and auto-bracket them even in real
+# markup.
+_VOID_HTML_TAG_NAMES = frozenset(
+    {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+)
+# HTML element names that an opener like ``<name>`` should ALWAYS be
+# treated as a real tag rather than a source-language placeholder.
+# Markdown batching often splits ``<a> ... </a>`` across blocks, so a
+# closer-search-in-same-text heuristic would tokenize an unpaired
+# opener and corrupt cross-block markup on non-Latin runs.  Earlier
+# revisions excluded ``title`` / ``label`` / ``button`` / ``form`` /
+# ``code`` etc. on the rationale that authors might use those names
+# as URL-path-parameter placeholders (``/docs/<title>``); review
+# feedback at cycle 21 flagged that this freezes real HTML in
+# cross-batch scenarios on ``ko`` / ``ja`` / ``ru`` / etc. runs.
+# The trade-off is now resolved in favour of HTML safety: ASCII
+# tag-name-shape spans match this set unconditionally.  Source-
+# language placeholders ``<\uac8c\uc784\ucf54\ub4dc>``,
+# ``<\u30d4\u30c3\u30c1>``, ``<\u3010\u9001\u4fe1\u3011>`` are
+# unaffected — those don't match ``_TAG_NAME_EXTRACT_RE``'s
+# ASCII-letter shape.  Authors who genuinely want a literal ASCII
+# bracket placeholder (rare) should pin it via the glossary, which
+# wins over auto-register.
+_STRUCTURAL_HTML_TAG_NAMES = frozenset(
+    {
+        # Container / sectioning
+        "div", "span", "p", "h1", "h2", "h3", "h4", "h5", "h6",
+        "ul", "ol", "li", "dl", "dt", "dd",
+        "table", "tr", "td", "th", "thead", "tbody", "tfoot",
+        "caption", "colgroup",
+        "html", "body", "head", "script", "style", "iframe",
+        "article", "section", "header", "footer", "main", "nav",
+        "aside", "figure", "figcaption",
+        "blockquote", "pre",
+        # Inline phrasing
+        "strong", "em", "b", "i", "u", "s", "small", "sub", "sup",
+        "ins", "del", "mark", "cite", "q", "bdi", "bdo", "ruby",
+        "rb", "rp", "rt", "rtc",
+        "a", "abbr", "address", "code", "dfn", "kbd", "samp", "var",
+        # Forms / interactive
+        "button", "datalist", "details", "dialog", "fieldset", "form",
+        "label", "legend", "meter", "optgroup", "option", "output",
+        "progress", "select", "summary", "template", "textarea",
+        # Media / embedded
+        "audio", "canvas", "map", "object", "picture", "video",
+        # Document metadata that can appear inline in HTML-in-Markdown
+        "noscript", "time", "title",
+    }
+)
+_TAG_NAME_EXTRACT_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]*")
+
+
+def _inside_html_open_tag(text: str, start: int, end: int) -> bool:
+    """True when ``[start, end)`` belongs to an HTML opening tag.
+
+    Covers two distinct shapes in one check:
+
+    * STRICTLY INSIDE a tag body (``title="<\uc804\uc1a1>"``,
+      ``aria-label={\uac8c\uc784\ucf54\ub4dc}``) — the outer tag is
+      handled by ``html_attr`` (allowlisted attrs) or left
+      translatable (user-facing attrs), so auto-bracket wedging
+      itself inside would regress the existing contract.
+    * SAME-SPAN as a tag that IS itself a real HTML / JSX tag
+      (``<div>``, ``<MyComponent>``, ``<my-component>``) — for
+      non-Latin-script targets (``ko``, ``ja``, ``ru``, ...) Latin
+      content counts as non-target-script and would otherwise match
+      the bare-tag span and freeze real HTML out of the translate /
+      refine prompt.  A "real tag" here is ASCII tag-name-shape
+      (``[A-Za-z][A-Za-z0-9\-]*`` fullmatch on the inner content,
+      trimmed of a self-closing ``/`` and trailing whitespace).
+      Mixed-script identifiers like ``<id_\uac8c\uc784\ucf54\ub4dc>``
+      and digit-or-non-alpha-prefixed spans like ``<1\ub2e8\uacc4>``
+      are NOT real HTML tags — their inner content fails the
+      ASCII tag-name fullmatch — and stay protected.
+
+    :data:`HTML_TAG_OPEN_RE` only matches tags that start with an
+    ASCII letter (``<[A-Za-z]…>``), so the iteration never yields a
+    span for CJK / Cyrillic / digit-prefixed bracket content, and
+    the "real tag name" fullmatch on the inner text gates the same-
+    span branch so mixed-script IDs keep matching.
+    """
+    for tag_m in HTML_TAG_OPEN_RE.finditer(text):
+        if tag_m.start() < start and end <= tag_m.end():
+            return True
+        if tag_m.start() == start and tag_m.end() == end:
+            inner = text[start + 1 : end - 1].rstrip("/").rstrip()
+            # Reject only when the entire inner is a valid ASCII
+            # tag-name shape.  Mixed-script inners (``<Submit\uac8c\uc784>``,
+            # ``<id_\uac8c\uc784\ucf54\ub4dc>``) fail the fullmatch
+            # and stay protected — those are placeholders, not
+            # HTML/JSX tag names.
+            if not _TAG_NAME_EXTRACT_RE.fullmatch(inner):
+                continue
+            # Void HTML elements (``<br>``, ``<img>``, ``<hr>``, ...)
+            # reject unconditionally — they have no closer, so the
+            # paired-closer heuristic below would otherwise treat
+            # them as unpaired placeholders and mistakenly tokenize
+            # real markup.  Structural container elements
+            # (``<div>``, ``<span>``, ``<ul>``, ``<section>``, ...)
+            # also reject unconditionally because batched Markdown
+            # often separates the opener and closer across blocks;
+            # the paired-closer check below would miss them and
+            # freeze the real markup.
+            inner_lower = inner.lower()
+            if (
+                inner_lower in _VOID_HTML_TAG_NAMES
+                or inner_lower in _STRUCTURAL_HTML_TAG_NAMES
+            ):
+                return True
+            # Every other ASCII-named span is ambiguous — could be
+            # a real HTML / JSX tag pair OR a source-language
+            # placeholder that happens to share a tag name
+            # (``/docs/<title>``, ``<label>`` in prose,
+            # ``<MyComponent>`` placeholder text, ...).  Reject only
+            # when a matching ``</Name>`` closer appears AFTER this
+            # opener in the same text — that is the distinguishing
+            # signal of a real tag pair.  Scoping the search to
+            # positions after ``end`` avoids misclassifying a prose
+            # ``<Submit>`` whose document happens to mention
+            # ``</Submit>`` in an earlier unrelated block.
+            # HTML tag names are case-insensitive, so pair
+            # ``<DIV>…</div>`` / ``<Foo>…</foo>`` correctly against
+            # their lowercase / mixed-case closers.  JSX is case-
+            # sensitive but also pairs (``<Foo>`` only pairs with
+            # ``</Foo>``), and re.IGNORECASE preserves those pairs
+            # too — the false-positive for a placeholder ``<Submit>``
+            # whose document happens to contain a literal
+            # ``</submit>`` elsewhere is vanishingly rare compared
+            # to the common HTML case-folding shape.
+            closer_re = re.compile(
+                r"</\s*" + re.escape(inner) + r"\s*>",
+                re.IGNORECASE,
+            )
+            if closer_re.search(text, end):
+                return True
+    return False
+
+
+def auto_bracket_predicate_factory(
+    glossary_terms: Optional[List[str]] = None,
+) -> Callable[[str, int, int], bool]:
+    """Build the match-time predicate for T-14 auto-bracket patterns.
+
+    Composes three guards:
+
+    * Reject matches that sit inside Markdown backtick code (inline
+      or fenced) — same guard :data:`BUILTIN_PATTERNS` applies so
+      documentation that illustrates bracket syntax literally (``Use
+      `{한글}` here``) doesn't freeze the example.
+    * Reject matches whose span sits anywhere inside an HTML opening
+      tag — preserves the ``html_attr`` contract that translatable
+      attributes (``title``, ``alt``, ``aria-label``, ``placeholder``,
+      ``label``) keep flowing through the translate prompt, and
+      covers both quoted (``title="<\uc804\uc1a1> \ubc84\ud2bc"``)
+      and unquoted / JSX-style (``aria-label={\uac8c\uc784\ucf54\ub4dc}``)
+      attribute value shapes in one check.  Source-language bracket
+      tokens like ``<\uc804\uc1a1>`` that sit OUTSIDE any HTML tag
+      (plain prose, between sibling tags) still match because
+      :data:`HTML_TAG_OPEN_RE` only matches tags starting with an
+      ASCII letter.
+    * Reject matches whose span covers a glossary term — the
+      caller-supplied glossary wins (mapped to its target-language
+      form via decode, or preserved verbatim for null-entries), so
+      the auto-pattern only fires when no glossary entry claims the
+      span.  Terms that :meth:`MarkdownProcessor._compile_glossary_pattern`
+      would itself reject (non-word-boundary terms such as ``.NET``)
+      are excluded from the combined regex so they don't spuriously
+      block auto-registration.
+
+    ``glossary_terms=None`` or an empty list skips the glossary guard
+    entirely — the returned predicate is then a pure inline-code +
+    html-tag-body check, cheap enough to keep registered
+    unconditionally.
+    """
+    glossary_re: Optional["re.Pattern[str]"] = None
+    literal_defer_terms: List[str] = []
+    if glossary_terms:
+        safe_terms: List[str] = []
+        for t in glossary_terms:
+            if not t:
+                continue
+            if (t[0].isalnum() or t[0] == "_") and (
+                t[-1].isalnum() or t[-1] == "_"
+            ):
+                safe_terms.append(t)
+            else:
+                # Terms like ``.NET`` / ``C++`` whose first / last
+                # character isn't a word char fail ``\b`` anchors,
+                # so ``_compile_glossary_pattern`` skips them and
+                # the regex path misses them.  Keep them in a
+                # literal-substring defer list so an explicit
+                # mapping still blocks auto-bracket and the LLM
+                # sees the raw term ready to apply the instruction-
+                # mode mapping (cycle-20 P2 regression guard).
+                literal_defer_terms.append(t)
+        if safe_terms:
+            # Longest-first keeps the alternation stable for overlapping
+            # prefixes ("pull request" before "pull"); ``re`` alternation
+            # is leftmost-first within a group so this matters for
+            # ``.search`` against partial overlaps inside a bracket.
+            safe_terms.sort(key=len, reverse=True)
+            glossary_re = re.compile(
+                r"\b(?:" + "|".join(re.escape(t) for t in safe_terms) + r")\b"
+            )
+
+    def predicate(text: str, start: int, end: int) -> bool:
+        if _is_in_inline_code(text, start):
+            return False
+        if _inside_html_open_tag(text, start, end):
+            return False
+        if glossary_re is not None and glossary_re.search(text, start, end):
+            return False
+        if literal_defer_terms:
+            span_text = text[start:end]
+            for term in literal_defer_terms:
+                if term in span_text:
+                    return False
+        return True
+
+    return predicate
 
 
 def format_token(index: int) -> str:

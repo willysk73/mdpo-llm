@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### Added
+- **Auto source-language bracket placeholders.** Tokens shaped
+  `<source-lang-word>` or `{source-lang-word}` whose content holds
+  at least one non-ASCII word character (`\w` minus `[\u0000-\u007F]`)
+  are auto-registered on the per-file placeholder registry before
+  every LLM call, so identifiers like `{게임코드}`, `<전송>`,
+  `/users/{한글id}` survive a translate pass verbatim without the
+  caller enumerating each one in `glossary`. The regex is
+  conservative: `{{…}}` Mustache / Jinja templates, real HTML
+  opening / closing tags (`<a href="/…">`, `</…>`), HTML comments
+  (`<!-- … -->`), and XML processing instructions (`<?xml ?>`) are
+  excluded by lookbehind / lookahead + a leading-char guard so the
+  `html_attr` built-in retains its allowlist-based protection
+  contract and translatable attributes like `title` / `alt` still
+  reach the translate prompt. Inline-code examples are skipped by
+  the same guard the T-6 built-ins use. Caller-supplied glossary
+  entries that cover the inner span win — auto-register defers so
+  the glossary pattern tokenizes its specific term. On by default;
+  opt out per instance via the new `auto_bracket_placeholders=False`
+  constructor kwarg on `MarkdownProcessor` / `MdpoLLM`, or globally
+  via the `MDPO_AUTO_BRACKET_PLACEHOLDERS` env var (`1` / `0` /
+  `true` / `false` / `yes` / `no` / `on` / `off`, case-insensitive —
+  unrecognised values fall through to the kwarg). Exposes two new
+  module-level regexes on `mdpo_llm.placeholder`
+  (`AUTO_BRACKET_ANGLE_PATTERN`, `AUTO_BRACKET_BRACE_PATTERN`), the
+  grouped `AUTO_BRACKET_PATTERNS` tuple, and the
+  `auto_bracket_predicate_factory(glossary_terms=None)` helper so
+  downstream callers can rebuild the same registration surface
+  against a custom registry (see also
+  `build_auto_bracket_patterns(target_lang=...)` for the
+  target-script-gated variant). Propagated through to the refine-
+  mode sibling processor built by `refine_first=True` so both
+  passes agree on which spans survive verbatim. Gating is keyed on
+  the BCP 47 primary-language prefix of `target_lang`:
+  `ko`/`ja`/`zh` → CJK, `ru`/`uk`/`bg` → Cyrillic, `ar`/`fa` →
+  Arabic, `he`/`yi` → Hebrew, `el` → Greek, `th` → Thai, `hi`/`mr`
+  → Devanagari; unlisted codes (including `en`/`fr`/`de`/empty)
+  fall back to Latin/ASCII. Bracket spans whose content is entirely
+  target-script (`{전송}` under `ko`, `{game_id}` under `en`) stay
+  for the model; mixed-script identifiers (`{id_게임코드}` under
+  `ko`) still match because the Latin prefix is non-target-script.
+
 ### Changed
 - **Refine mode: glossary null-entries and identity mappings are kept
   instead of being dropped wholesale.** v0.4.x refine-mode init in
