@@ -22,6 +22,14 @@ mdpo-llm splits your Markdown into blocks, tracks each one in a PO file, and sen
   no fallback model. Configure via `--max-retries` /
   `--fallback-model` (or the matching constructor kwargs).
   Structural `conservative` checks still run as a cheap pre-gate.
+- **Free-text domain context injection** (T-18). `--context PATH`
+  reads a UTF-8 text file and injects it into every translation /
+  validation system prompt under a stable `**ADDITIONAL CONTEXT...**`
+  header. Per-directory `context.md` files cascade parent → child
+  before the override is appended, so document-level briefing
+  (audience, tone, conventions, proper nouns) flows alongside the
+  glossary's term-level substitutions. Empty / missing files at any
+  level are silently skipped. See *Domain context* below.
 
 ## What's new in v0.3
 
@@ -319,6 +327,59 @@ can be debugged without rerunning.
 Directory-level caching resolves each ancestor's `glossary.json`
 exactly once — sibling files in the same subtree reuse the cached
 merged chain.
+
+## Domain context (`--context`)
+
+Glossary handles term-level substitutions; **`--context`** handles
+the document-level brief — audience, tone, conventions, proper-noun
+guidance — that does not fit cleanly as term pairs. The flag accepts a
+path to a UTF-8 text file (any format; treated as opaque text) whose
+contents are appended verbatim to the system prompt under a stable
+header:
+
+```text
+**ADDITIONAL CONTEXT (use for proper nouns, terminology, tone, audience):**
+{file content verbatim}
+```
+
+```bash
+python -m mdpo_llm translate-dir docs/ out/ \
+  --model gpt-4o --target ko \
+  --context briefs/game-security.md
+```
+
+**Cascade rules** (mirrors the glossary cascade in shape, but
+concatenates instead of overriding):
+
+- Per-directory `context.md` files in the source tree are walked
+  parent → child and **concatenated** (child *appends* to parent — a
+  child writer typically wants to extend the parent's framing, not
+  replace it).
+- A `context.md` in the current working directory (when not already
+  in the tree walk) is appended after the tree cascade.
+- `--context PATH` is appended **last** as the topmost / closest
+  layer.
+- Empty / missing files at any level are silently skipped — most
+  directories will not have a `context.md`, and warning on absence
+  would be noise.
+- `context.md` files are **excluded from the source glob** in
+  `translate-dir` / `refine-dir` whenever the glob *also* matches
+  non-context files — the cascade configuration is treated as
+  configuration, not as translatable content. A glob that targets
+  only `context.md` (for example `**/context.md`) is respected
+  verbatim so deliberate callers can still translate them as
+  documents.
+
+Both `translate` / `translate-dir` and `refine` / `refine-dir`
+honour `--context`; the same brief flows into the LLM-validator
+prompt under `validation=llm` so the validator grades against the
+same domain framing the translator saw.
+
+> **Token-cost note.** The resolved context is appended to every
+> system prompt of every batch. A large file (KB+) inflates token
+> usage proportionally on every API call — keep the brief tight, or
+> rely on prompt caching (`--prompt-cache`) so the stable prefix is
+> reused across batches.
 
 ## Auto source-language bracket placeholders
 

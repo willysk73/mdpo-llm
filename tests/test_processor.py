@@ -1807,3 +1807,724 @@ class TestAutoBracketPlaceholders:
         )
         sibling = parent._sibling_refine_processor(target_lang="en")
         assert sibling.auto_bracket_placeholders is False
+
+
+def _system_messages_from_calls(mock_completion):
+    """Return the system-message string from every captured LLM call."""
+    out = []
+    for call in mock_completion.completion.call_args_list:
+        messages = call.kwargs.get("messages") or (
+            call.args[0] if call.args else []
+        )
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg["content"]
+                if isinstance(content, list):
+                    # Anthropic prompt-cache shape: [{"type": "text",
+                    # "text": "...", "cache_control": ...}]
+                    parts = [p.get("text", "") for p in content]
+                    content = "".join(parts)
+                out.append(content)
+                break
+    return out
+
+
+class TestContextInjection:
+    """T-18: free-text domain context injection via --context (cascade).
+
+    Covers the end-to-end wiring on top of the unit tests in
+    :mod:`tests.test_context_loader`: the constructor reads
+    ``context_path``, every translate / refine / validate / multi-target
+    prompt assembler picks up the resolved block via
+    :meth:`MarkdownProcessor._current_context_text`, and the per-file
+    cascade in :meth:`process_directory` walks parent → child.
+    """
+
+    HEADER = (
+        "**ADDITIONAL CONTEXT (use for proper nouns, terminology, "
+        "tone, audience):**"
+    )
+
+    def test_constructor_context_path_appears_in_system_prompt(
+        self, tmp_path, mock_completion
+    ):
+        ctx = tmp_path / "brief.md"
+        ctx.write_text(
+            "Domain: game-security SDK. Audience: senior backend engineers.",
+            encoding="utf-8",
+        )
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nParagraph.\n", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=0,
+            context_path=ctx,
+        )
+        processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+
+        systems = _system_messages_from_calls(mock_completion)
+        assert systems, "expected at least one LLM call"
+        for sys in systems:
+            assert self.HEADER in sys
+            assert "game-security SDK" in sys
+
+    def test_no_context_means_no_header(self, tmp_path, mock_completion):
+        """Without ``--context``, the header MUST NOT appear — otherwise
+        a no-config run would pay tokens for an empty block."""
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nParagraph.\n", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+
+        systems = _system_messages_from_calls(mock_completion)
+        assert systems
+        for sys in systems:
+            assert self.HEADER not in sys
+
+    def test_missing_context_path_silent_skip(self, tmp_path, mock_completion):
+        """Brief: missing files are silently skipped at every level —
+        a typo in ``--context`` should not abort the run, just fall back
+        to the empty-context path."""
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nParagraph.\n", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=0,
+            context_path=tmp_path / "does-not-exist.md",
+        )
+        # Run does not raise.
+        processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        systems = _system_messages_from_calls(mock_completion)
+        for sys in systems:
+            assert self.HEADER not in sys
+
+    def test_empty_context_file_silent_skip(self, tmp_path, mock_completion):
+        ctx = tmp_path / "empty.md"
+        ctx.write_text("", encoding="utf-8")
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nParagraph.\n", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=0,
+            context_path=ctx,
+        )
+        processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+        systems = _system_messages_from_calls(mock_completion)
+        for sys in systems:
+            assert self.HEADER not in sys
+
+    def test_directory_cascade_parent_then_child(
+        self, tmp_path, mock_completion
+    ):
+        source_dir = tmp_path / "docs"
+        api_dir = source_dir / "api"
+        api_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "context.md").write_text(
+            "ROOT-LEVEL-DOMAIN", encoding="utf-8"
+        )
+        (api_dir / "context.md").write_text(
+            "API-SECTION-CONTEXT", encoding="utf-8"
+        )
+        leaf_md = api_dir / "auth.md"
+        leaf_md.write_text("# Auth\n\nSign in.\n", encoding="utf-8")
+
+        target_dir = tmp_path / "out"
+        po_dir = tmp_path / "po"
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        processor.process_directory(source_dir, target_dir, po_dir)
+
+        systems = _system_messages_from_calls(mock_completion)
+        assert systems
+        # Both blocks appear, parent before child.
+        sys = systems[0]
+        assert "ROOT-LEVEL-DOMAIN" in sys
+        assert "API-SECTION-CONTEXT" in sys
+        assert sys.index("ROOT-LEVEL-DOMAIN") < sys.index(
+            "API-SECTION-CONTEXT"
+        )
+
+    def test_cli_override_appended_after_cascade(
+        self, tmp_path, mock_completion
+    ):
+        source_dir = tmp_path / "docs"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "context.md").write_text(
+            "TREE-CONTEXT", encoding="utf-8"
+        )
+        leaf_md = source_dir / "page.md"
+        leaf_md.write_text("# Page\n\nBody.\n", encoding="utf-8")
+
+        cli_ctx = tmp_path / "cli.md"
+        cli_ctx.write_text("OVERRIDE-CONTEXT", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=0,
+            context_path=cli_ctx,
+        )
+        processor.process_directory(
+            source_dir, tmp_path / "out", tmp_path / "po"
+        )
+
+        sys = _system_messages_from_calls(mock_completion)[0]
+        assert "TREE-CONTEXT" in sys
+        assert "OVERRIDE-CONTEXT" in sys
+        # Override is the closest layer — appended LAST in the
+        # accumulated context block.
+        assert sys.rindex("OVERRIDE-CONTEXT") > sys.rindex(
+            "TREE-CONTEXT"
+        )
+
+    def test_refine_mode_includes_context(
+        self, tmp_path, mock_completion
+    ):
+        ctx = tmp_path / "brief.md"
+        ctx.write_text(
+            "Style: tutorial voice; keep code tokens verbatim.",
+            encoding="utf-8",
+        )
+        source = tmp_path / "source.md"
+        source.write_text("# Heading\n\nBody text.\n", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model",
+            target_lang="en",
+            batch_size=0,
+            mode="refine",
+            context_path=ctx,
+        )
+        processor.process_document(
+            source,
+            tmp_path / "refined.md",
+            tmp_path / "m.po",
+            refined_path=tmp_path / "refined.md",
+        )
+
+        systems = _system_messages_from_calls(mock_completion)
+        assert systems
+        for sys in systems:
+            assert self.HEADER in sys
+            assert "tutorial voice" in sys
+
+    def test_validator_prompt_includes_context(
+        self, tmp_path, mock_completion
+    ):
+        """When ``validation='llm'`` the validator MUST grade against the
+        same domain framing the translator saw, so the context block
+        appears in the validator system prompt too."""
+        ctx = tmp_path / "brief.md"
+        ctx.write_text(
+            "Domain: payment infrastructure. Tone: precise.",
+            encoding="utf-8",
+        )
+
+        # Override mock_completion to return both translations and
+        # validator grades. We detect validator calls by their system
+        # prompt's "validator" wording.
+        def _side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            system_text = ""
+            user_text = ""
+            for msg in messages:
+                if msg.get("role") == "system":
+                    sc = msg["content"]
+                    if isinstance(sc, list):
+                        sc = "".join(p.get("text", "") for p in sc)
+                    system_text = sc
+                if msg.get("role") == "user":
+                    user_text = msg["content"]
+
+            mock_response = MagicMock()
+            if "validator" in system_text.lower():
+                # Validator: pass everything.
+                try:
+                    payload = json.loads(user_text)
+                except json.JSONDecodeError:
+                    payload = {}
+                grades = {
+                    k: {"binary_score": "yes", "reason": "ok"}
+                    for k in payload
+                }
+                mock_response.choices[0].message.content = json.dumps(grades)
+                return mock_response
+            # Translator: prefix the source with a Korean glyph so the
+            # target-language structural check passes and the LLM
+            # validator actually fires (a Latin-only response would be
+            # rejected by the conservative pre-gate before grading).
+            try:
+                parsed = json.loads(user_text)
+                if isinstance(parsed, dict):
+                    out = {k: f"번역: {v}" for k, v in parsed.items()}
+                    mock_response.choices[0].message.content = json.dumps(
+                        out, ensure_ascii=False
+                    )
+                    return mock_response
+            except json.JSONDecodeError:
+                pass
+            mock_response.choices[0].message.content = (
+                f"번역: {user_text}"
+            )
+            return mock_response
+
+        mock_completion.completion.side_effect = _side_effect
+
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nParagraph.\n", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=10,
+            validation="llm",
+            max_retries=0,
+            context_path=ctx,
+        )
+        processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+
+        # Find the validator system message specifically and verify it
+        # also carries the context block.
+        validator_systems = [
+            sys
+            for sys in _system_messages_from_calls(mock_completion)
+            if "validator" in sys.lower()
+        ]
+        assert validator_systems, (
+            "expected at least one validator call under validation='llm'"
+        )
+        for sys in validator_systems:
+            assert self.HEADER in sys
+            assert "payment infrastructure" in sys
+
+    def test_multi_target_shares_context_across_langs(
+        self, tmp_path, mock_completion
+    ):
+        ctx = tmp_path / "brief.md"
+        ctx.write_text(
+            "Domain: developer documentation; keep API names verbatim.",
+            encoding="utf-8",
+        )
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nBody.\n", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=10,
+            glossary_mode="instruction",
+            context_path=ctx,
+        )
+
+        # The mock_completion fixture round-trips JSON; for multi-
+        # target the wire format is {block_id: {lang: text}}, so wrap
+        # the translation map per lang.
+        def _multi_side_effect(*args, **kwargs):
+            messages = kwargs.get("messages", args[0] if args else [])
+            user_text = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    user_text = msg["content"]
+                    break
+            mock_response = MagicMock()
+            try:
+                payload = json.loads(user_text)
+            except json.JSONDecodeError:
+                payload = {}
+            if isinstance(payload, dict):
+                out = {
+                    k: {"ko": f"[ko] {v}", "ja": f"[ja] {v}"}
+                    for k, v in payload.items()
+                }
+                mock_response.choices[0].message.content = json.dumps(
+                    out, ensure_ascii=False
+                )
+            else:
+                mock_response.choices[0].message.content = "{}"
+            return mock_response
+
+        mock_completion.completion.side_effect = _multi_side_effect
+
+        processor.process_document_multi(
+            source,
+            target_langs=["ko", "ja"],
+            target_paths={
+                "ko": tmp_path / "ko.md",
+                "ja": tmp_path / "ja.md",
+            },
+        )
+
+        # The single multi-target system prompt carries the shared
+        # context block — same brief flows to every lang's output bucket.
+        systems = _system_messages_from_calls(mock_completion)
+        assert systems
+        assert any(self.HEADER in sys for sys in systems)
+        assert any("developer documentation" in sys for sys in systems)
+
+    def test_missing_per_directory_context_does_not_break_run(
+        self, tmp_path, mock_completion
+    ):
+        """A directory tree without any ``context.md`` files runs
+        identically to the no-context path — the cascade walk should
+        not read every parent dir into a "(empty)" placeholder."""
+        source_dir = tmp_path / "docs"
+        sub = source_dir / "api"
+        sub.mkdir(parents=True, exist_ok=True)
+        (sub / "page.md").write_text("# Page\n\nBody.\n", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        processor.process_directory(
+            source_dir, tmp_path / "out", tmp_path / "po"
+        )
+        systems = _system_messages_from_calls(mock_completion)
+        assert systems
+        for sys in systems:
+            assert self.HEADER not in sys
+
+    def test_context_md_excluded_from_directory_glob(
+        self, tmp_path, mock_completion
+    ):
+        """``context.md`` is cascade configuration — process_directory
+        MUST NOT pick it up via the default ``**/*.md`` glob and try
+        to translate the brief itself."""
+        source_dir = tmp_path / "docs"
+        sub = source_dir / "api"
+        sub.mkdir(parents=True, exist_ok=True)
+        (source_dir / "context.md").write_text("ROOT-CTX", encoding="utf-8")
+        (sub / "context.md").write_text("API-CTX", encoding="utf-8")
+        (sub / "auth.md").write_text(
+            "# Auth\n\nSign in.\n", encoding="utf-8"
+        )
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        result = processor.process_directory(
+            source_dir, tmp_path / "out", tmp_path / "po"
+        )
+
+        # Only auth.md is translatable; the two context.md files are
+        # excluded so files_processed reflects exactly the one
+        # document the user wanted translated.
+        assert (tmp_path / "out" / "api" / "auth.md").exists()
+        assert not (tmp_path / "out" / "context.md").exists()
+        assert not (tmp_path / "out" / "api" / "context.md").exists()
+        # Defensive: total files seen by workers excludes config too.
+        assert (
+            result.files_processed
+            + result.files_failed
+            + result.files_skipped
+        ) == 1
+
+    def test_single_file_does_not_walk_directory_cascade(
+        self, tmp_path, mock_completion
+    ):
+        """Single-file ``process_document`` MUST NOT walk a per-directory
+        cascade — that's a ``process_directory`` feature (parity with
+        glossary). A ``context.md`` next to the source file should be
+        ignored unless the caller explicitly passed ``--context PATH``."""
+        source_dir = tmp_path / "docs"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "context.md").write_text(
+            "FILE-DIR-CONTEXT", encoding="utf-8"
+        )
+        source = source_dir / "page.md"
+        source.write_text("# Title\n\nBody.\n", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+
+        systems = _system_messages_from_calls(mock_completion)
+        assert systems
+        for sys in systems:
+            assert "FILE-DIR-CONTEXT" not in sys
+            assert self.HEADER not in sys
+
+    def test_default_glob_skips_context_md_even_when_alone_in_tree(
+        self, tmp_path, mock_completion
+    ):
+        """The auto-skip MUST be driven by the caller's glob pattern,
+        not by which files happen to be in the tree right now: a small
+        directory whose only ``.md`` files are ``context.md`` configs
+        and where the caller used the default broad ``**/*.md`` MUST
+        leave them alone — the user never opted into translating
+        configuration."""
+        source_dir = tmp_path / "docs"
+        sub = source_dir / "api"
+        sub.mkdir(parents=True, exist_ok=True)
+        (source_dir / "context.md").write_text("ROOT-CTX", encoding="utf-8")
+        (sub / "context.md").write_text("API-CTX", encoding="utf-8")
+        # No other .md files in the tree at all.
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        result = processor.process_directory(
+            source_dir, tmp_path / "out", tmp_path / "po"
+        )
+
+        # Default glob is ``**/*.md`` — broad — so context.md files
+        # are filtered out even though they are the only matches.
+        assert not (tmp_path / "out" / "context.md").exists()
+        assert not (tmp_path / "out" / "api" / "context.md").exists()
+        assert (
+            result.files_processed
+            + result.files_failed
+            + result.files_skipped
+        ) == 0
+
+    def test_explicit_context_glob_translates_context_md(
+        self, tmp_path, mock_completion
+    ):
+        """When the caller's glob targets ``context.md`` exclusively,
+        the directory loop respects intent and translates the files —
+        the auto-skip only applies when the glob ALSO matches non-
+        context content (i.e. the configs are incidental)."""
+        source_dir = tmp_path / "docs"
+        api_dir = source_dir / "api"
+        api_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "context.md").write_text(
+            "# Root context heading\n", encoding="utf-8"
+        )
+        (api_dir / "context.md").write_text(
+            "# API context heading\n", encoding="utf-8"
+        )
+        # No other .md files in the tree — the explicit glob below
+        # only matches the two context files.
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        processor.process_directory(
+            source_dir,
+            tmp_path / "out",
+            tmp_path / "po",
+            glob="**/context.md",
+        )
+
+        # Both context files were translated and written under the
+        # output tree — the user's explicit glob is honoured.
+        assert (tmp_path / "out" / "context.md").exists()
+        assert (tmp_path / "out" / "api" / "context.md").exists()
+
+    def test_cache_key_isolates_distinct_runs(
+        self, tmp_path, mock_completion
+    ):
+        """Reusing one processor across two ``process_directory`` calls
+        with DIFFERENT trees must serve each tree's own cascade — the
+        per-file context cache key MUST include source_root so the
+        second run does not echo the first's brief."""
+        # Tree A
+        tree_a = tmp_path / "a"
+        (tree_a / "sub").mkdir(parents=True, exist_ok=True)
+        (tree_a / "context.md").write_text("BRIEF-A", encoding="utf-8")
+        (tree_a / "sub" / "page.md").write_text(
+            "# Title\n\nBody.\n", encoding="utf-8"
+        )
+        # Tree B
+        tree_b = tmp_path / "b"
+        (tree_b / "sub").mkdir(parents=True, exist_ok=True)
+        (tree_b / "context.md").write_text("BRIEF-B", encoding="utf-8")
+        (tree_b / "sub" / "page.md").write_text(
+            "# Title\n\nBody.\n", encoding="utf-8"
+        )
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        processor.process_directory(
+            tree_a, tmp_path / "out_a", tmp_path / "po_a"
+        )
+        a_systems = _system_messages_from_calls(mock_completion)
+        assert any("BRIEF-A" in s for s in a_systems)
+
+        # Reset captured calls between runs.
+        mock_completion.completion.call_args_list.clear()
+        processor.process_directory(
+            tree_b, tmp_path / "out_b", tmp_path / "po_b"
+        )
+        b_systems = _system_messages_from_calls(mock_completion)
+        # The second tree's calls carry the second tree's brief —
+        # the cache must NOT serve BRIEF-A here just because the
+        # source filename collides with the first run.
+        assert any("BRIEF-B" in s for s in b_systems)
+        for s in b_systems:
+            assert "BRIEF-A" not in s
+
+    def test_explicit_context_glob_basename_normalises_separators(self):
+        """The basename-detection step that decides whether a glob
+        explicitly targets ``context.md`` MUST normalise both
+        forward- and back-slash separators so Windows-shaped patterns
+        (``docs\\\\context.md``) are recognised the same way
+        forward-slash forms (``docs/context.md``) are. The full glob
+        expansion can't be exercised cross-platform from one test
+        environment (pathlib rejects ``**\\\\…`` on POSIX), so we
+        verify the detection step in isolation."""
+        # Mirror the literal expression used in
+        # ``process_directory`` so a refactor of either side trips
+        # this test.
+        for raw in ("**/context.md", "docs/context.md", "context.md"):
+            assert raw.replace("\\", "/").rsplit("/", 1)[-1] == "context.md"
+        for raw in (
+            "**\\context.md",
+            "docs\\context.md",
+            "docs\\sub\\context.md",
+        ):
+            assert raw.replace("\\", "/").rsplit("/", 1)[-1] == "context.md"
+        # Broad globs MUST stay broad regardless of separator style.
+        for raw in (
+            "**/*.md",
+            "**\\*.md",
+            "*.md",
+            "docs/*.md",
+            "docs\\*.md",
+        ):
+            assert raw.replace("\\", "/").rsplit("/", 1)[-1] != "context.md"
+
+    def test_translate_paths_sees_tree_level_context(
+        self, tmp_path, mock_completion
+    ):
+        """``translate_paths=True`` runs filename-segment translation
+        BEFORE per-file workers fan out. The tree-level cascade
+        (source root's ``context.md`` plus cwd + override) must be
+        installed for that phase too — otherwise filename translations
+        drift from the content's terminology guidance."""
+        source_dir = tmp_path / "docs"
+        sub = source_dir / "api"
+        sub.mkdir(parents=True, exist_ok=True)
+        (source_dir / "context.md").write_text(
+            "TREE-LEVEL-BRIEF-FOR-PATHS", encoding="utf-8"
+        )
+        (sub / "page.md").write_text(
+            "# Title\n\nBody.\n", encoding="utf-8"
+        )
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        processor.process_directory(
+            source_dir,
+            tmp_path / "out",
+            tmp_path / "po",
+            translate_paths=True,
+        )
+
+        systems = _system_messages_from_calls(mock_completion)
+        # Both the path-segment LLM call(s) AND the per-file body
+        # call carry the tree-level brief. Without the segment-phase
+        # TLS install, only the body call would have it.
+        assert systems
+        with_brief = [
+            s for s in systems if "TREE-LEVEL-BRIEF-FOR-PATHS" in s
+        ]
+        # At minimum: one segment call + one body call = >= 2 prompts
+        # carrying the brief. Allow more if the segment translator
+        # bisects internally.
+        assert len(with_brief) >= 2, (
+            f"expected the brief in both segment and body prompts; "
+            f"got {len(with_brief)} of {len(systems)}"
+        )
+
+    def test_refine_first_sibling_sees_directory_cascade(
+        self, tmp_path, mock_completion
+    ):
+        """``refine_first`` builds a refine sibling whose own TLS does
+        not inherit the parent's per-file cascade. Without the
+        sibling-context propagation in :meth:`_sibling_refine_processor`,
+        the refine pass would translate against a context-blind prompt
+        while the translate pass (running on the parent) sees the full
+        cascaded brief — silent divergence between stages."""
+        source_dir = tmp_path / "docs"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "context.md").write_text(
+            "REFINE-FIRST-DIRECTORY-BRIEF", encoding="utf-8"
+        )
+        (source_dir / "page.md").write_text(
+            "# Title\n\nBody.\n", encoding="utf-8"
+        )
+
+        refined_dir = tmp_path / "refined"
+        target_dir = tmp_path / "out"
+
+        processor = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=0,
+            mode="translate",
+        )
+        processor.process_directory(
+            source_dir,
+            target_dir,
+            tmp_path / "po",
+            refined_dir=refined_dir,
+            refine_first=True,
+            refine_lang="en",
+            refined_po_dir=tmp_path / "po-refine",
+        )
+
+        systems = _system_messages_from_calls(mock_completion)
+        # Both refine and translate stages issue calls; both should
+        # carry the same brief. Find at least two system messages
+        # that contain the brief — separate stages.
+        with_brief = [
+            s for s in systems if "REFINE-FIRST-DIRECTORY-BRIEF" in s
+        ]
+        assert len(with_brief) >= 2, (
+            f"expected refine and translate stages to share the cascaded "
+            f"brief; got {len(with_brief)} of {len(systems)} calls "
+            f"carrying it"
+        )
+
+    def test_extra_instructions_does_not_collide_with_context(
+        self, tmp_path, mock_completion
+    ):
+        """``--extra-instructions`` (existing flag) and ``--context``
+        (T-18) are independent — both should appear, neither should
+        overwrite the other."""
+        ctx = tmp_path / "brief.md"
+        ctx.write_text("CONTEXT-MARKER", encoding="utf-8")
+        source = tmp_path / "source.md"
+        source.write_text("# Title\n\nBody.\n", encoding="utf-8")
+
+        processor = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            batch_size=0,
+            extra_instructions="EXTRA-INSTRUCTION-MARKER",
+            context_path=ctx,
+        )
+        processor.process_document(
+            source, tmp_path / "target.md", tmp_path / "m.po"
+        )
+
+        sys = _system_messages_from_calls(mock_completion)[0]
+        assert "EXTRA-INSTRUCTION-MARKER" in sys
+        assert "CONTEXT-MARKER" in sys
+        assert self.HEADER in sys

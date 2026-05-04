@@ -170,6 +170,23 @@ def _add_translate_flags(
         help="Additional prompt instructions (tone, domain, audience).",
     )
     parser.add_argument(
+        "--context",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Optional path to a UTF-8 text file (T-18). Its contents "
+            "are injected verbatim into the translation and "
+            "validation system prompts under the **ADDITIONAL "
+            "CONTEXT** header. Per-directory `context.md` files in "
+            "the source tree (parent → child) are concatenated first; "
+            "this `--context PATH` is appended LAST as the closest "
+            "layer. Empty / missing files are silently skipped. "
+            "Token-cost note: large context files inflate every API "
+            "call's prompt — keep the brief tight."
+        ),
+    )
+    parser.add_argument(
         "--prompt-cache",
         action="store_true",
         help="Mark the stable system prefix as cacheable.",
@@ -257,6 +274,7 @@ def _build_processor(
         progress_callback=progress_callback,
         mode=mode,
         residue_pass=getattr(args, "residue_pass", "off") == "on",
+        context_path=getattr(args, "context", None),
     )
 
 
@@ -1152,6 +1170,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Additional prompt instructions (tone, domain, audience).",
+    )
+    p_multi.add_argument(
+        "--context",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Optional path to a UTF-8 text file (T-18). Same as the "
+            "`translate` flag — see `translate --help`. The block is "
+            "injected once into the multi-target system prompt and "
+            "shared across every target language; per-language tone "
+            "notes belong inside the file."
+        ),
     )
     p_multi.add_argument(
         "--prompt-cache",

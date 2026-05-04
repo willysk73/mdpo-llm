@@ -23,6 +23,7 @@ import litellm
 import polib
 
 from .batch import BatchTranslator, MultiTargetBatchTranslator
+from .context_loader import inject_context, resolve_context_chain
 from .llm_validator import BinaryGrade, LLMValidator
 from .manager import POManager
 from .parser import BlockParser, slugify_path_segment
@@ -252,6 +253,7 @@ class MarkdownProcessor:
         mode: Mode = "translate",
         auto_bracket_placeholders: bool = True,
         residue_pass: bool = False,
+        context_path: Path | str | None = None,
         **litellm_kwargs,
     ):
         """
@@ -395,6 +397,26 @@ class MarkdownProcessor:
                 undefined) and for entries that exhausted T-16's retry
                 budget (already known-bad — re-running is waste).
                 Default: ``False`` pending soak time before promoting.
+            context_path: Optional path to a UTF-8 text file whose
+                contents are appended verbatim to the system prompt
+                under the ``ADDITIONAL CONTEXT`` header (T-18). The
+                file is treated as opaque text — no Markdown / YAML
+                parsing — so authors can use any format they prefer.
+                When ``MarkdownProcessor`` is invoked through
+                :meth:`process_directory` (or any caller that supplies
+                a source root), per-directory ``context.md`` files are
+                discovered and concatenated parent → child first; this
+                ``context_path`` is then appended LAST as the
+                topmost / closest layer. Empty / missing files at any
+                level are silently skipped. Applies in both
+                ``translate`` and ``refine`` modes (tone consistency
+                benefits from the same brief). The same context is
+                injected into the LLM-validation prompt
+                (``validation="llm"``) so the validator grades against
+                the same domain framing the translator saw.
+                Token-cost note: the resolved context is appended to
+                every system prompt of every batch — a large file
+                inflates token usage proportionally.
             **litellm_kwargs: Extra keyword arguments forwarded to
                 ``litellm.completion()``.
         """
@@ -513,6 +535,30 @@ class MarkdownProcessor:
         ] = {}
         self._glossary_registry_cache: Dict[
             Any, PlaceholderRegistry
+        ] = {}
+        # T-18: constructor-time ``--context PATH`` text. Read once
+        # here so a per-call cascade resolution does not re-read the
+        # override file for every source document. ``None`` /
+        # missing / empty / undecodable paths all collapse to ``""``
+        # via :func:`context_loader.read_context_file`, which the
+        # rest of the code treats as "no override" — keeps the
+        # default path identical to runs that never passed the flag.
+        self._context_override_text: str = ""
+        self._context_path: Optional[Path] = None
+        if context_path:
+            from .context_loader import read_context_file as _read_ctx
+            self._context_path = Path(context_path)
+            self._context_override_text = _read_ctx(self._context_path)
+        # Per-file context cache. Keyed by the
+        # ``(source_path, source_root, cwd)`` tuple because the
+        # resolved cascade text depends on all three; using just the
+        # source path would let a processor reused across runs
+        # silently serve the wrong tree's cascade. Cleared at the
+        # top of every ``process_directory`` to scope caching to a
+        # single invocation — same lifetime as the glossary cascade
+        # caches above.
+        self._context_for_file_cache: Dict[
+            Tuple[Path, Optional[Path], Optional[Path]], str
         ] = {}
 
     # ----- progress hook -----
@@ -946,6 +992,82 @@ class MarkdownProcessor:
         resolved = self._resolve_raw_for_lang(merged, self.target_lang)
         return (resolved or None), chain_paths
 
+    # ----- per-file context cascade (T-18) -----
+
+    def _resolve_context_for_file(
+        self,
+        source_path: Path,
+        source_root: Optional[Path],
+    ) -> str:
+        """Return the resolved context block for ``source_path`` (cached).
+
+        Cache is keyed by the resolved source path PLUS the resolved
+        ``source_root`` and ``cwd``, because the computed text depends
+        on all three: a processor reused across :meth:`process_directory`
+        runs with different source roots would otherwise serve the
+        cascade for the *first* root on the second run, and a single-
+        file caller that changed working directory between calls would
+        see the cwd layer of an earlier run. The constructor-level
+        override text does not change within an instance lifetime so
+        it does not need to enter the key. Cleared at the top of
+        :meth:`process_directory` to additionally guard against
+        ``context.md`` edits between runs (the per-file value path
+        does not key on file content / mtime).
+        """
+        try:
+            cwd: Optional[Path] = Path.cwd()
+        except (OSError, FileNotFoundError):
+            # ``Path.cwd()`` raises when the working directory was
+            # removed under us (rare, but happens in test fixtures
+            # that ``tmp_path``-walk and tear down). Skipping the
+            # cwd layer is preferable to crashing every translation.
+            cwd = None
+        try:
+            resolved_source = Path(source_path).resolve(strict=False)
+        except OSError:
+            resolved_source = Path(source_path).absolute()
+        resolved_root: Optional[Path] = None
+        if source_root is not None:
+            try:
+                resolved_root = Path(source_root).resolve(strict=False)
+            except OSError:
+                resolved_root = Path(source_root).absolute()
+        resolved_cwd: Optional[Path] = None
+        if cwd is not None:
+            try:
+                resolved_cwd = cwd.resolve(strict=False)
+            except OSError:
+                resolved_cwd = cwd.absolute()
+        cache_key = (resolved_source, resolved_root, resolved_cwd)
+        cached = self._context_for_file_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        text = resolve_context_chain(
+            Path(source_path),
+            Path(source_root) if source_root is not None else None,
+            cwd,
+            self._context_override_text or None,
+        )
+        self._context_for_file_cache[cache_key] = text
+        return text
+
+    def _current_context_text(self) -> str:
+        """Return the active context block for the current call.
+
+        Reads ``self._tls.per_file_context_text`` first (installed by
+        :meth:`process_document` / :meth:`process_directory` workers
+        per source file), falling back to the constructor-level
+        override when the slot is unset (e.g. a unit test that drives
+        the prompt builders directly without going through a public
+        entry point). Returns ``""`` for "no context" so callers can
+        ``if text:``-gate the injection without a separate ``None``
+        branch.
+        """
+        tls_val = getattr(self._tls, "per_file_context_text", _TLS_UNSET)
+        if tls_val is not _TLS_UNSET:
+            return tls_val or ""
+        return self._context_override_text or ""
+
     def _registry_for_glossary(
         self, glossary: Optional[Dict[str, Optional[str]]]
     ) -> PlaceholderRegistry:
@@ -1064,7 +1186,7 @@ class MarkdownProcessor:
             }
             collapsed = self._resolve_raw_for_lang(raw, target_lang)
             sibling_glossary = self._filter_refine_glossary(collapsed)
-        return MarkdownProcessor(
+        sibling = MarkdownProcessor(
             model=self.model,
             target_lang=target_lang,
             max_reference_pairs=self.max_reference_pairs,
@@ -1083,8 +1205,32 @@ class MarkdownProcessor:
             glossary_mode=self.glossary_mode,
             mode="refine",
             auto_bracket_placeholders=self.auto_bracket_placeholders,
+            context_path=self._context_path,
             **self._litellm_kwargs,
         )
+        # T-18: copy the parent's currently-resolved context onto
+        # the sibling so the refine pass sees the SAME domain
+        # framing as the translate pass — otherwise terminology /
+        # tone guidance silently diverges between the two stages
+        # for refine_first runs. Two scenarios collapse here:
+        #
+        # - ``process_directory(..., refine_first=True)``:
+        #   ``_process_one`` has already installed the per-file
+        #   cascaded text on the parent's TLS by the time we get
+        #   here, so ``_current_context_text()`` returns the merged
+        #   tree-walk + cwd + override. Each ``MarkdownProcessor``
+        #   instance has its own TLS, so the sibling cannot read
+        #   the parent's slot directly — we copy the resolved text
+        #   into the sibling's constructor-level override field
+        #   instead.
+        # - Single-file ``process_document(refine_first=True)``:
+        #   the parent's TLS is installed AFTER the sibling is
+        #   built, so this read falls back to the parent's own
+        #   ``_context_override_text`` — the same value the sibling
+        #   already received via ``context_path``. Overwriting with
+        #   the equivalent string is harmless.
+        sibling._context_override_text = self._current_context_text() or ""
+        return sibling
 
     # ----- per-entry messaging -----
 
@@ -1120,6 +1266,13 @@ class MarkdownProcessor:
         )
         if glossary_block:
             system_content += "\n\n" + glossary_block
+
+        # T-18: append the resolved domain-context block last so the
+        # LLM sees it as the freshest instruction before the user
+        # message starts.
+        system_content = inject_context(
+            system_content, self._current_context_text()
+        )
 
         messages: List[Dict[str, Any]] = [self._system_message(system_content)]
 
@@ -1636,6 +1789,13 @@ class MarkdownProcessor:
             if rendered_any:
                 system_content += "\n\n" + "\n".join(reason_lines)
 
+        # T-18: domain-context block appended after every other rule
+        # section so it stays freshest in the model's working memory
+        # when batch JSON output begins.
+        system_content = inject_context(
+            system_content, self._current_context_text()
+        )
+
         user_payload = json.dumps(items, ensure_ascii=False)
         return [
             self._system_message(system_content),
@@ -1733,6 +1893,14 @@ class MarkdownProcessor:
                 lang=target_lang
             )
         system_content = Prompts.VALIDATE_SYSTEM + "\n\n" + criteria
+        # T-18: the validator's job is to grade against source intent
+        # and tone — exactly what domain context informs. Inject the
+        # same block here so the validator judges with the same
+        # framing the translator saw, instead of measuring a context-
+        # aware translation against a context-blind grader.
+        system_content = inject_context(
+            system_content, self._current_context_text()
+        )
         # No prompt cache here: the criteria block is short, callers
         # only invoke the validator under ``--validation=llm`` (an
         # opt-in path), and provider-side caching is already amortising
@@ -2425,6 +2593,30 @@ class MarkdownProcessor:
         usage = getattr(self._tls, "usage", None) or _UsageAccumulator()
         start = time.monotonic()
 
+        # T-18: install the per-file context block on TLS so every
+        # downstream prompt builder (single-target, batched, validator,
+        # multi-target fallback) reads it via
+        # :meth:`_current_context_text`. Skip when the slot is already
+        # installed (``process_directory``'s ``_process_one``
+        # pre-installs the per-file cascaded value before calling us).
+        # In single-file mode we deliberately do NOT walk a cascade —
+        # this mirrors :meth:`process_document`'s glossary contract,
+        # where per-directory ``glossary.json`` files only resolve
+        # under ``process_directory``. Walking only the file's own
+        # directory here would surface the leaf level inconsistently
+        # while missing every parent ``context.md``, which is worse
+        # than a documented "no cascade in single-file mode" rule.
+        # Users who want the cascade should run via
+        # :meth:`process_directory` (or ``translate-dir``); the
+        # constructor-level ``--context`` override still applies in
+        # single-file mode.
+        context_installed_here = False
+        if not hasattr(self._tls, "per_file_context_text"):
+            self._tls.per_file_context_text = (
+                self._context_override_text or ""
+            )
+            context_installed_here = True
+
         po_file = None
         po_saved = False
         source_path_str = str(source_path)
@@ -2629,6 +2821,16 @@ class MarkdownProcessor:
             # into the next call on this thread.
             if getattr(self._tls, "refine_first_carryover", None):
                 self._tls.refine_first_carryover = None
+            # T-18: only clear the per-file context slot when this call
+            # planted it. process_directory's ``_process_one`` installs
+            # the slot itself (so workers concurrently translating
+            # different files keep their own cascade) and also owns the
+            # cleanup; clearing it here would race with sibling workers
+            # on the same thread pool that share this processor instance.
+            if context_installed_here and hasattr(
+                self._tls, "per_file_context_text"
+            ):
+                delattr(self._tls, "per_file_context_text")
 
     def _translate_path_segments(
         self,
@@ -3047,7 +3249,39 @@ class MarkdownProcessor:
                     "as already processed and skip translation."
                 )
 
-        matched_files = sorted(source_dir.glob(glob))
+        # T-18: ``context.md`` files are cascade configuration when
+        # they are picked up incidentally by a broad glob — the
+        # default ``**/*.md`` would otherwise translate the domain
+        # brief itself, wasting tokens and leaving a translated
+        # copy in the output tree the user never asked for.
+        #
+        # The decision is based on the caller's *glob pattern*, not
+        # on which files happen to be in the tree right now:
+        # filtering on the matched set would let a small directory
+        # that currently contains only ``context.md`` files start
+        # translating them under the default ``**/*.md`` even though
+        # the caller never opted in. We treat the glob as explicit
+        # when its trailing basename is the literal string
+        # ``context.md`` (``**/context.md``, ``docs/context.md``,
+        # ``context.md``, …); any pattern with wildcards in the
+        # basename is broad and the configuration files are filtered
+        # out.
+        from .context_loader import CONTEXT_FILENAME as _CONTEXT_FN
+        # Normalise Windows-style separators so callers passing
+        # ``docs\context.md`` or ``**\context.md`` are recognised as
+        # explicit targets too — ``Path.glob`` accepts both, but
+        # ``str.rsplit("/")`` would otherwise leave the basename
+        # equal to the full pattern on Windows-shaped inputs and
+        # the documented escape hatch would silently filter them.
+        glob_basename = glob.replace("\\", "/").rsplit("/", 1)[-1]
+        explicit_context_glob = glob_basename == _CONTEXT_FN
+        all_matches = sorted(source_dir.glob(glob))
+        if explicit_context_glob:
+            matched_files = list(all_matches)
+        else:
+            matched_files = [
+                sf for sf in all_matches if sf.name != _CONTEXT_FN
+            ]
         start = time.monotonic()
 
         # Directory where path-translation catalog files (_paths.po,
@@ -3176,13 +3410,60 @@ class MarkdownProcessor:
                             "explicit --po-dir that does not contain a "
                             "source document mapped to '_paths.po'."
                         )
-                path_map_relative = self._translate_path_segments(
-                    source_dir=source_dir,
-                    matched_files=matched_files,
-                    paths_po_path=paths_po_path,
-                    usage=path_usage,
-                    previous_map=previous_map,
-                )
+                # T-18: install the tree-level context (source-root's
+                # own ``context.md`` cascade resolved AS IF a file
+                # lived directly inside source_dir, plus the cwd
+                # layer and the constructor override) on TLS for the
+                # path-segment translation pass. Path segments span
+                # the whole tree, so per-file cascades do not apply
+                # — but the brief still informs how segment names
+                # should read (audience, formality, terminology).
+                # Without this the segment prompts would carry only
+                # the constructor override while the document body
+                # prompts saw the full cascaded brief, drifting
+                # filenames out of sync with the content.
+                #
+                # We pass a synthetic file path INSIDE ``source_dir``
+                # rather than ``source_dir`` itself —
+                # :func:`resolve_context_chain` always treats its
+                # first argument as a file and starts walking from
+                # ``Path(source_path).parent``, so passing
+                # ``source_dir`` directly would shift the walk one
+                # level above and miss ``source_dir/context.md``
+                # entirely.
+                #
+                # Clear the per-file context cache BEFORE the
+                # tree-level resolve so a processor reused across
+                # multiple ``process_directory(translate_paths=True)``
+                # runs picks up edits to ``context.md`` between runs.
+                # The post-path glossary clears at the bottom of
+                # this method are too late: the path-segment
+                # translation's _paths.po and localized filenames
+                # would otherwise be generated with stale context
+                # while the document-body prompts use the freshly-
+                # cleared context, leaving filenames and content
+                # out of sync.
+                self._context_for_file_cache.clear()
+                path_segment_ctx_installed = False
+                if not hasattr(self._tls, "per_file_context_text"):
+                    tree_context_text = self._resolve_context_for_file(
+                        source_dir / "__tree_root__", source_dir
+                    )
+                    self._tls.per_file_context_text = tree_context_text
+                    path_segment_ctx_installed = True
+                try:
+                    path_map_relative = self._translate_path_segments(
+                        source_dir=source_dir,
+                        matched_files=matched_files,
+                        paths_po_path=paths_po_path,
+                        usage=path_usage,
+                        previous_map=previous_map,
+                    )
+                finally:
+                    if path_segment_ctx_installed and hasattr(
+                        self._tls, "per_file_context_text"
+                    ):
+                        delattr(self._tls, "per_file_context_text")
 
         results: List[Any] = []
         files_processed = 0
@@ -3216,6 +3497,19 @@ class MarkdownProcessor:
         self._glossary_json_cache.clear()
         self._glossary_dir_chain_cache.clear()
         self._glossary_registry_cache.clear()
+        # T-18: clear the per-file context cache for every directory
+        # run (not just translate_paths runs) so a processor reused
+        # across multiple ``process_directory()`` calls picks up
+        # edits to ``context.md`` between runs.  The cache keys on
+        # ``(source_path, source_root, cwd)`` plus the constructor
+        # override text, so without this clear an edited
+        # ``context.md`` would keep injecting the stale brief into
+        # translation and validation prompts until a new processor
+        # is constructed.  An earlier clear runs inside the
+        # translate_paths branch so the path-segment translation
+        # also sees fresh context; that earlier clear is redundant
+        # with this one for translate_paths runs but harmless.
+        self._context_for_file_cache.clear()
 
         # T-11: pre-compute the per-file glossary cascade ON THE MAIN
         # THREAD so workers only read from the caches.  T-13: the
@@ -3237,6 +3531,14 @@ class MarkdownProcessor:
         per_file_glossary: Dict[Path, Optional[Dict[str, Optional[str]]]] = {}
         per_file_registry: Dict[Path, Optional[PlaceholderRegistry]] = {}
         per_file_raw_chain: Dict[Path, Dict[str, Any]] = {}
+        # T-18: pre-resolve per-file domain context on the main
+        # thread (same lifecycle as the glossary cascade above) so
+        # workers only read from the cache. Constructor-level
+        # ``--context`` text is folded in by
+        # :meth:`_resolve_context_for_file`; per-directory
+        # ``context.md`` files merge parent → child first; the
+        # override is appended last.
+        per_file_context: Dict[Path, str] = {}
         for sf in matched_files:
             if refine_first:
                 # Compute raw + resolved from the same cascade walk so
@@ -3276,6 +3578,13 @@ class MarkdownProcessor:
                 effective = self._filter_refine_glossary(effective)
             per_file_glossary[sf] = effective
             per_file_registry[sf] = self._registry_for_glossary(effective)
+            # T-18: resolve once per file on the main thread so
+            # workers do not contend on ``context.md`` reads. Result
+            # is the merged tree-walk + cwd + constructor-override
+            # text; ``""`` when no context resolves.
+            per_file_context[sf] = self._resolve_context_for_file(
+                sf, source_dir
+            )
             if logger.isEnabledFor(logging.INFO):
                 try:
                     rel = sf.relative_to(source_dir)
@@ -3386,6 +3695,18 @@ class MarkdownProcessor:
             if refine_first and source_file in per_file_raw_chain:
                 self._tls.refine_sibling_raw = per_file_raw_chain[source_file]
                 refine_sibling_raw_installed = True
+            # T-18: install the per-file context block so
+            # ``process_document`` skips its own re-resolution and
+            # every prompt builder reads the cascade we computed on
+            # the main thread. ``""`` is a valid value (cascade
+            # resolved to empty) and MUST install the slot — leaving
+            # it absent would let ``process_document`` fall through
+            # to its own resolution and re-walk the cascade per
+            # worker, defeating the pre-compute optimisation.
+            context_installed = False
+            if source_file in per_file_context:
+                self._tls.per_file_context_text = per_file_context[source_file]
+                context_installed = True
             self._emit_progress(kind="file_start", path=str(source_file))
             try:
                 # Only forward refine-specific kwargs when a refine pathway
@@ -3422,6 +3743,10 @@ class MarkdownProcessor:
                     self._tls, "refine_sibling_raw"
                 ):
                     delattr(self._tls, "refine_sibling_raw")
+                if context_installed and hasattr(
+                    self._tls, "per_file_context_text"
+                ):
+                    delattr(self._tls, "per_file_context_text")
 
         try:
             with concurrent.futures.ThreadPoolExecutor(
@@ -4720,6 +5045,24 @@ class MarkdownProcessor:
         source_path_str = str(source_path)
         document_started = False
 
+        # T-18: install the per-file context block on TLS so every
+        # prompt builder this multi-target call routes through (the
+        # batched multi-target builder, the per-lang single-target
+        # fallback, the validator) reads it via
+        # :meth:`_current_context_text`. Single-file caller, so —
+        # same as :meth:`process_document` outside a directory run —
+        # we do NOT walk a per-directory cascade here; only the
+        # constructor-level ``--context`` text applies. See
+        # :meth:`process_document` for the rationale (glossary
+        # parity: per-directory cascades are a ``process_directory``
+        # feature; single-file callers get the constructor override).
+        context_installed_here_multi = False
+        if not hasattr(self._tls, "per_file_context_text"):
+            self._tls.per_file_context_text = (
+                self._context_override_text or ""
+            )
+            context_installed_here_multi = True
+
         try:
             source_text = Path(source_path).read_text(encoding="utf-8")
             source_lines = source_text.splitlines(keepends=True)
@@ -4982,6 +5325,15 @@ class MarkdownProcessor:
                     pass
             else:
                 self._tls.per_file_registry = previous_registry
+            # T-18: clear the per-file context slot only when this
+            # call planted it. Leaving it installed when an outer
+            # caller (a future directory-style multi-target driver)
+            # owns the slot would clobber its lifecycle the same way
+            # process_document carefully avoids.
+            if context_installed_here_multi and hasattr(
+                self._tls, "per_file_context_text"
+            ):
+                delattr(self._tls, "per_file_context_text")
 
     def _translate_group_multi(
         self,
@@ -5405,6 +5757,12 @@ class MarkdownProcessor:
             )
             if glossary_block:
                 system_content += "\n\n" + glossary_block
+            # T-18: same context block flows into the per-lang
+            # single-target fallback so a multi-target run that
+            # bisects into per-lang calls still sees the brief.
+            system_content = inject_context(
+                system_content, self._current_context_text()
+            )
             messages: List[Dict[str, Any]] = [
                 self._system_message(system_content)
             ]
@@ -5561,6 +5919,14 @@ class MarkdownProcessor:
             for src, tgt in refs:
                 ref_lines.append(f"- SRC: {src}\n  TGT: {tgt}")
             system_content += "\n\n" + "\n".join(ref_lines)
+
+        # T-18: same context applied across all target languages —
+        # the brief frames the SOURCE document, not per-language
+        # style, so the same block sits at the end for every lang's
+        # output bucket the model produces.
+        system_content = inject_context(
+            system_content, self._current_context_text()
+        )
 
         user_payload = json.dumps(items, ensure_ascii=False)
         return [

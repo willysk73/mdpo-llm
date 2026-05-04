@@ -3,6 +3,45 @@
 ## Unreleased
 
 ### Added
+- **Free-text domain context injection via `--context` (T-18).**
+  Glossary handles term-level substitutions; this flag handles the
+  document-level brief that does not fit cleanly as term pairs —
+  audience, tone, conventions, proper nouns. New constructor kwarg
+  `context_path: Path | str | None = None` and matching CLI flag
+  `--context PATH` (registered on `translate`, `translate-dir`,
+  `refine`, `refine-dir`, `translate-multi`).
+  - Source-side discovery: per-directory `context.md` files in the
+    source tree cascade parent → child and **concatenate** (the
+    child appends to the parent rather than overriding it — domain
+    framing is additive by nature). The current working directory's
+    `context.md` is appended after the tree cascade when not already
+    present in the walk; the constructor-level `context_path` is
+    appended last as the topmost / closest layer.
+  - Empty / missing files at any level are silently skipped (most
+    directories will not have a `context.md`, and warning on
+    absence would be noise). Soft cap at 64 KB per source: longer
+    files pass through verbatim with a single informational warning
+    so operators see the bill scales per API call.
+  - Injection: the merged text is appended to every translation,
+    refine, multi-target, validator, and per-lang fallback system
+    prompt under the stable header `**ADDITIONAL CONTEXT (use for
+    proper nouns, terminology, tone, audience):**`. Validator prompt
+    too, so under `validation=llm` the grader judges against the
+    same brief the translator saw.
+  - Mode coverage: applies in `translate` and `refine` modes (tone
+    consistency benefits from the same brief). Multi-target uses
+    one shared block across every output language — per-language
+    tone notes belong inside the file.
+  - New module: `mdpo_llm.context_loader` with public
+    `resolve_context_chain`, `inject_context`, `read_context_file`,
+    and three constants (`ADDITIONAL_CONTEXT_HEADER`,
+    `CONTEXT_FILENAME`, `MAX_CONTEXT_BYTES`).
+  - Side effect: `process_directory` excludes `context.md` from the
+    source glob when the glob *also* matches non-context files —
+    the cascade configuration is not accidentally translated as a
+    document. A glob that targets `context.md` exclusively (e.g.
+    `**/context.md`) is respected verbatim so deliberate callers
+    still translate them.
 - **Source-language residue post-processing pass for code spans
   (T-17).** New opt-in `residue_pass=True` constructor kwarg /
   `--residue-pass on` CLI flag adds a polish stage that runs AFTER
