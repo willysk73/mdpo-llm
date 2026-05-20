@@ -1013,6 +1013,83 @@ Exit-code contract:
   exists but is not a directory; `--po-dir` (when supplied) is not a
   directory.
 
+## Whole-tree validation report (`mdpo-llm validate-dir`)
+
+Aggregate every per-file signal — fuzzy counts, structural / LLM
+validator findings stored in PO `tcomment` lines, optional T-19 lint
+hits, and mirror-layout cross-reference issues — into a single
+report so reviewers do not have to grep per-file PO trees by hand.
+
+```bash
+mdpo-llm validate-dir docs_ko/ --source docs/
+mdpo-llm validate-dir docs_ko/ --source docs/ \
+    --target ko --include-llm-validator --include-lint
+```
+
+What it reports:
+
+1. **Per-file summary** — for each target Markdown: the relative
+   path, the per-document PO path (when present), whether the
+   corresponding source file still exists, the fuzzy-entry count,
+   and the structural validator finding count. With
+   `--include-llm-validator`, the T-16 LLM grader's
+   `validator: llm: <reason>` lines are surfaced verbatim (otherwise
+   counted-but-hidden). With `--include-lint`, T-19 residue and
+   dangling-reference findings are folded onto the same per-file row
+   via :func:`mdpo_llm.cli_lint.lint_directory` — the lint
+   semantics stay consistent with the standalone `mdpo-llm lint` verb
+   rather than re-implementing the scan here.
+2. **Cross-reference issues** — `source-without-target` (source on
+   disk has no translation yet) and `target-without-source` (target
+   is an orphan, its source has been deleted). Mirror layout only:
+   the comparison is by relative path against the source / target
+   roots. This overlaps with `mdpo-llm cleanup` deliberately —
+   `validate-dir` only flags, `cleanup` acts.
+3. **Aggregate counters** — `files_scanned`, `po_files_scanned`,
+   `total_fuzzy`, `total_structural_findings`,
+   `total_llm_validator_findings`, `total_residue`,
+   `total_dangling`, `total_cross_reference_issues`.
+
+Flags:
+
+- `--source DIR` (required) — the source tree the translation ran
+  against. Used for the cross-reference section and (when
+  `--include-lint` is set) as the lint scanner's `--source-root` so
+  attachments present in source still resolve.
+- `--po-dir DIR` (optional) — override when the translate-dir run
+  used `--po-dir` to route PO files outside the target tree.
+  Defaults to `TARGET_DIR`.
+- `--target LANG` — BCP 47 locale of the translated tree. Required
+  only with `--include-lint`; ignored otherwise.
+- `--include-llm-validator` — materialise `validator: llm: <reason>`
+  tcomment lines on the per-file summary. Structural validator
+  findings are always counted; the LLM lines stay opt-in because
+  they can be dense on large trees that ran with `validation=llm`.
+- `--include-lint` — fold T-19 lint findings (residue + dangling)
+  onto the matching per-file row. Requires `--target`.
+- `--json` — emit a machine-readable schema instead of the human
+  report: `{target_dir, source_dir, llm_validator_ran, lint_ran,
+  files: [...], cross_reference: [...], aggregate: {...}}`.
+- `--exit-non-zero-on-findings` — exit 1 when any finding is
+  reported, for CI gating. The scanner itself succeeds either way;
+  this flag is a configurable failure signal.
+
+The verb is read-only by design: no PO writes, no LLM calls, no
+filesystem mutation. Corrupt or unparseable PO files are reported as
+zero-count rather than aborting the walk — a single broken PO must
+not blind the reviewer to the rest of the tree.
+
+Exit-code contract:
+
+- `0` — scan completed successfully (regardless of findings, unless
+  `--exit-non-zero-on-findings` is set).
+- `1` — findings reported AND `--exit-non-zero-on-findings` was
+  passed.
+- `2` — usage error: `--source` missing or not a directory;
+  `target_dir` exists but is not a directory; `--po-dir` (when
+  supplied) is not a directory; `--include-lint` without
+  `--target`.
+
 ## Working with PO Files
 
 PO files (GNU gettext) track the state of each content block:

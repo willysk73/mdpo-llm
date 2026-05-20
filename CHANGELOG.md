@@ -3,6 +3,61 @@
 ## Unreleased
 
 ### Added
+- **Whole-tree validation report: `mdpo-llm validate-dir` (T-21).**
+  New CLI verb that walks an already-translated tree and aggregates
+  every per-file signal into a single report so reviewers do not
+  have to grep per-file PO trees by hand. Borrowed from
+  's `cli_validate_dir.py`; reuses T-19's
+  `cli_lint.lint_directory` as a library helper for the residue /
+  dangling scan rather than re-implementing it.
+  - **Per-file summary** — relative target path, per-document PO
+    path, fuzzy count, structural validator finding count (parsed
+    from `validator: <check>: <detail>` tcomment lines that
+    `processor.py` already stamps onto flagged entries),
+    `source_present` mirror-layout flag.
+  - **`validator: llm: <reason>` tcomment lines** are opt-in via
+    `--include-llm-validator` (kept off by default to keep large
+    `validation=llm` trees readable). The LLM prefix is parsed first
+    because it is a strict subprefix of the structural one;
+    the parser guarantees no double-counting.
+  - **T-19 lint folding** — `--include-lint` runs the residue /
+    dangling-reference scan over the target tree (with `--source`
+    doubling as `--source-root`) and attaches findings to the
+    matching per-file row. Requires `--target` for the residue
+    script-family scoring. Additive — the scanner is the same
+    `cli_lint.lint_directory` the `mdpo-llm lint` verb already uses,
+    so semantics stay consistent across verbs.
+  - **Cross-reference section** — `source-without-target` and
+    `target-without-source` mismatches surfaced as
+    `CrossReferenceIssue` rows. Mirror layout only (target relative
+    path == source relative path). Overlaps with T-20 cleanup
+    deliberately: `validate-dir` only flags, `cleanup` acts.
+  - **Aggregate counters** — `files_scanned`, `po_files_scanned`,
+    `total_fuzzy`, `total_structural_findings`,
+    `total_llm_validator_findings`, `total_residue`,
+    `total_dangling`, `total_cross_reference_issues`.
+  - CLI: `mdpo-llm validate-dir <target_dir> --source <source_dir>
+    [--po-dir <po_dir>] [--target <lang>] [--include-llm-validator]
+    [--include-lint] [--json] [--exit-non-zero-on-findings]`.
+    `--json` emits the full report as JSON for CI; the default is a
+    human-readable summary modeled on `mdpo-llm lint`'s output.
+    Exit codes: `0` on success (regardless of findings unless the
+    opt-in flag is set), `1` when findings exist AND
+    `--exit-non-zero-on-findings` is passed, `2` on usage error
+    (missing / non-directory `--source` or `target_dir`,
+    `--include-lint` without `--target`). Corrupt PO files are
+    surfaced as zero-count rather than aborting the walk — a single
+    broken PO must not blind the reviewer to the rest of the tree.
+  - New module: `mdpo_llm.cli_validate_dir` with public
+    `validate_directory`, `ValidateDirReport`, `FileSummary`,
+    `CrossReferenceIssue`, `StructuralValidatorFinding`,
+    `LLMValidatorFinding`, `format_human_report`,
+    `add_validate_dir_subparser`, `cmd_validate_dir`, `main`, and
+    `TARGET_EXTENSIONS`.
+  - Read-only — no behavioural change to `translate`, `translate-dir`,
+    `refine`, `refine-dir`, `translate-multi`, `estimate`, `report`,
+    `lint`, or `cleanup`. No LLM calls, no PO writes, no filesystem
+    mutation.
 - **Orphan cleanup verb: `mdpo-llm cleanup` (T-20).** New CLI verb
   that removes translated outputs whose source has been deleted
   since the last `translate-dir` run, exposed as a standalone verb

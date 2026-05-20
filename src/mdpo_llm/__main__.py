@@ -7,6 +7,7 @@ Usage:
     python -m mdpo_llm refine-dir SOURCE_DIR REFINED_DIR [options]
     python -m mdpo_llm estimate SOURCE [options]
     python -m mdpo_llm report SOURCE PO [options]
+    python -m mdpo_llm validate-dir TARGET_DIR --source SOURCE_DIR [options]
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from typing import Any, Callable, Dict, Optional
 from . import __version__
 from .cleanup_ops import add_cleanup_subparser
 from .cli_lint import add_lint_subparser
+from .cli_validate_dir import add_validate_dir_subparser
 from .placeholder import PlaceholderRegistry, load_placeholder_rules
 from .processor import MarkdownProcessor, ProgressEvent
 
@@ -1231,6 +1233,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_lint_subparser(sub)
     add_cleanup_subparser(sub)
+    add_validate_dir_subparser(sub)
 
     return parser
 
