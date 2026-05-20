@@ -3,6 +3,44 @@
 ## Unreleased
 
 ### Added
+- **Read-only lint scanner: `mdpo-llm lint` (T-19).** New CLI verb
+  that walks a directory of translated markdown files and reports
+  two classes of issue without issuing any LLM call or touching a
+  PO file:
+  - **Source-language residue** — lines whose detected script set
+    contains any non-target subtag from the supported residue set
+    (`ko`, `ja`, `zh`, reused from `residue_pass.SOURCE_LANG_PATTERNS`
+    so the lint stays consistent with the T-17 post-pass).
+    Examples: Hangul under `--target en`, CJK ideographs in a
+    Korean→English run. Latin-script leakage into a non-Latin
+    target is intentionally NOT flagged — the language module's
+    coarse `en` pattern (`[A-Za-z]`) would otherwise produce
+    universal false positives under any Latin-script target
+    (`fr`, `de`, `es`, …).
+  - **Dangling doc references** — backticked or angle-bracketed
+    filenames whose basename is not present in either the scanned
+    tree or the optional `--source-root`. Tracked extensions:
+    `.pdf .png .jpg .jpeg .gif .svg .md .csv .json .xlsx .docx`
+    (generalised from 's PDF-only scan). Matching is
+    case-insensitive and basename-only; URLs (anything containing
+    `://`) are skipped because their existence cannot be checked
+    on disk. The known-filename set is built straight from the
+    filesystem so `filename_map.json` is not reintroduced as a
+    parallel data structure — `_paths.po` (T-10) / `path_map.json`
+    remain the source of truth for filename mapping.
+  - CLI: `mdpo-llm lint <directory> --target <lang> [--source-root
+    <dir>] [--json] [--exit-non-zero-on-findings]`. Default output
+    is a human-readable report; `--json` emits a stable schema for
+    CI consumers (`{files_scanned, residue: [...], dangling: [...]}`).
+    Exit-code contract: `0` on success regardless of findings,
+    `1` when findings exist AND `--exit-non-zero-on-findings` is
+    set, `2` on usage error (missing / non-directory argument).
+  - New module: `mdpo_llm.cli_lint` with public `lint_directory`,
+    `lint_file`, `format_human_report`, `add_lint_subparser`,
+    `cmd_lint`, `main`, `LintReport`, `ResidueFinding`,
+    `DanglingFinding`, and `LINT_EXTENSIONS`.
+  - Pure observability — no pipeline interaction, no downstream
+    risk to existing translate / refine flows.
 - **Free-text domain context injection via `--context` (T-18).**
   Glossary handles term-level substitutions; this flag handles the
   document-level brief that does not fit cleanly as term pairs —

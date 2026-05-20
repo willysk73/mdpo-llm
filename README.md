@@ -879,6 +879,65 @@ from mdpo_llm import Prompts
 print(Prompts.TRANSLATE_INSTRUCTION)
 ```
 
+## Read-only lint (`mdpo-llm lint`)
+
+Walk a directory of already-translated markdown files and flag two
+classes of issue — without ever issuing an LLM call or touching a PO
+file.
+
+```bash
+mdpo-llm lint docs_ko/ --target ko --source-root docs/
+```
+
+What it checks:
+
+1. **Source-language residue** — lines whose detected script set
+   contains any non-target subtag from the supported residue set
+   (`ko`, `ja`, `zh` — the same set the residue post-pass treats as
+   source languages). Hangul under `--target en` and CJK ideographs
+   in a Korean→English run both surface here. Latin-script leakage
+   into a non-Latin target (e.g. a stray English clause in a Korean
+   tree) is intentionally NOT flagged because the language module's
+   coarse `en` pattern would otherwise produce universal false
+   positives under any Latin-script target (`fr`, `de`, `es`, …);
+   that disambiguation belongs to the structural validator, not the
+   read-only lint. CJK-overlap is target-aware: under `--target ja`
+   the `zh` pattern is suppressed (kanji is normal Japanese), but a
+   kana-bearing line under `--target zh` still surfaces as residue.
+2. **Dangling doc references** — backticked or angle-bracketed
+   filenames whose basename is not present in either the scanned tree
+   or the optional `--source-root`. Tracked extensions: `.pdf .png
+   .jpg .jpeg .gif .svg .md .csv .json .xlsx .docx`. URLs (anything
+   containing `://`) are skipped because their existence cannot be
+   checked on disk. Matching is case-insensitive and basename-only —
+   `` `docs/old/logo.svg` `` is considered resolved when any
+   `logo.svg` exists somewhere in the target or source tree.
+
+Default output is a human-readable report. Add `--json` for a
+machine-readable schema suitable for CI:
+
+```json
+{
+  "files_scanned": 42,
+  "residue": [
+    {"file": "guide.md", "line": 17, "text": "…", "languages": ["ko"]}
+  ],
+  "dangling": [
+    {"file": "guide.md", "line": 4, "reference": "missing.pdf"}
+  ]
+}
+```
+
+Exit-code contract:
+
+- `0` — scan completed successfully (regardless of findings).
+- `1` — findings reported AND `--exit-non-zero-on-findings` was passed.
+- `2` — usage error (missing directory, non-directory argument).
+
+The scanner is read-only by design: zero LLM calls, no PO writes, no
+mutation of the scanned tree. Intended use is post-translation
+follow-up review and a configurable CI gate.
+
 ## Working with PO Files
 
 PO files (GNU gettext) track the state of each content block:
