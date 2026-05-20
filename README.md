@@ -1166,6 +1166,123 @@ decision-aligned; the difference is purely the LLM wire (mdpo-llm
 routes through `litellm`,  calls the OpenAI SDK
 directly). Real LLM calls in tests are mocked end-to-end.
 
+## Auto-glossary candidate extraction (`mdpo-llm suggest-glossary`)
+
+Building a fresh `glossary.json` for a large source tree is tedious:
+you have to skim every file, spot every brand / product / acronym, and
+type the translations by hand. `mdpo-llm suggest-glossary` automates
+the candidate-discovery half of that workflow. It walks a source
+directory of markdown files, finds high-frequency proper-noun-like
+tokens (`WCS`, `GitHub`, `OAuth`, …) and short phrases (`WCS
+dashboard`, `API gateway`), clusters near-duplicate variants via
+`difflib.SequenceMatcher`, translates each cluster's canonical form
+into the requested target locales in a single bulk LLM call, and emits
+a draft `glossary.suggested.json` you review and promote into the real
+`glossary.json` by hand.
+
+```bash
+mdpo-llm suggest-glossary docs/ \
+    --target ko,ja,zh-CN \
+    --model gpt-4o \
+    --min-occurrences 3 --min-files 2
+```
+
+The default output is `<source_dir>/glossary.suggested.json`. The verb
+**hard-refuses** to write to a file whose basename is exactly
+`glossary.json` — promotion is a manual review step by design, so an
+authored `glossary.json` (which the per-directory glossary cascade
+loads automatically during `translate-dir`) is never silently
+overwritten by a fresh suggestion pass.
+
+Flags:
+
+- `source_dir` (positional) — directory of markdown files scanned
+  recursively. Extensions: `.md`, `.markdown`. Non-markdown files are
+  ignored; undecodable UTF-8 files are skipped silently rather than
+  aborting the walk.
+- `--target LANGS` (required) — comma- or space-separated list of
+  target locales (e.g. `ko,ja,zh-CN`). Each cluster's canonical is
+  translated into every requested locale in one bulk LLM call.
+- `--model NAME` (required) — LiteLLM model string for the bulk
+  translation (e.g. `gpt-4o`, `openrouter/openai/gpt-4o`,
+  `anthropic/claude-sonnet-4-5-20250929`).
+- `--source-lang LANG` (default `en`) — BCP 47 locale of the source
+  corpus, used to label the prompt rendered for the LLM.
+- `--min-occurrences N` (default `3`) — minimum total occurrences
+  across the corpus for a token / phrase to be eligible.
+- `--min-files K` (default `2`) — minimum number of distinct source
+  files a token / phrase must appear in.
+- `--similarity-threshold FLOAT` (default `0.85`) — `SequenceMatcher`
+  ratio at or above which two candidates merge into the same cluster.
+  The whole-word containment rule (`"WCS"` is contained in `"WCS
+  API"`) fires independently of this threshold.
+- `--output PATH` — explicit output path. Default:
+  `<source_dir>/glossary.suggested.json`. Any value whose basename is
+  exactly `glossary.json` is rejected as a usage error.
+
+Token extraction skips markdown surfaces that would otherwise leak
+identifiers into the candidate pool: fenced and indented code blocks,
+inline code, URLs and autolinks, raw HTML, image / link bracket
+bodies, and pure numeric / version runs (`1.2.3`, `1,000`, `v3`).
+Proper-noun shapes accepted are `ALL_CAPS` acronyms (`WCS`, `API`),
+`CamelCase` (`GitHub`, `MacBook`), and `TitleCase` (`Markdown`,
+`Anthropic`). Common English stopwords (`The`, `When`, `This`, …) are
+rejected even when their casing matches.
+
+Phrases of 2 to 3 words are extracted starting at any proper-noun
+position; following words may be proper-noun-shaped or lowercase
+common-noun continuations (length ≥ 3, not a stopword). The brief's
+`"WCS"` / `"WCS API"` / `"WCS dashboard"` example then collapses into
+a single cluster anchored on the most-frequent variant.
+
+Output schema is the same per-locale dict shape `glossary_path=`
+already consumes, so promotion is literally `mv
+glossary.suggested.json glossary.json` after the review pass:
+
+```json
+{
+  "WCS": {
+    "ko": "WCS",
+    "ja": "WCS",
+    "zh-CN": "WCS"
+  },
+  "GitHub": {
+    "ko": "깃허브",
+    "ja": "ギットハブ",
+    "zh-CN": "GitHub"
+  }
+}
+```
+
+Locales the LLM did not return are emitted as empty strings so the
+reviewer sees a stable per-row shape and can fill them in manually.
+
+Exit-code contract:
+
+- `0` — successful run, including the degenerate "zero candidates"
+  case (the output file is still written, just empty).
+- `2` — usage error: missing / non-directory source path, empty
+  `--target`, threshold out of range, or `--output` basename equals
+  `glossary.json`.
+
+Library callers can drive the same pipeline programmatically; the
+bulk-translator function is injectable, so tests pass deterministic
+stubs without monkey-patching `litellm`:
+
+```python
+from mdpo_llm.glossary_suggest import suggest_glossary
+
+def my_translator(sources, target_langs):
+    # return [{"source": s, "translations": {l: ... for l in target_langs}}, ...]
+    ...
+
+suggestions = suggest_glossary(
+    source_dir,
+    target_langs=["ko", "ja"],
+    translator=my_translator,
+)
+```
+
 ## Working with PO Files
 
 PO files (GNU gettext) track the state of each content block:

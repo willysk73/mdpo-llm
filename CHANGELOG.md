@@ -3,6 +3,72 @@
 ## Unreleased
 
 ### Added
+- **Auto-glossary candidate extraction: `mdpo-llm suggest-glossary`
+  (T-23).** New CLI verb that walks a source markdown tree, surfaces
+  high-frequency proper-noun-like tokens and short phrases, clusters
+  near-duplicate variants, translates each cluster's canonical via a
+  bulk LLM call, and emits a draft `glossary.suggested.json` the
+  operator reviews and promotes into a real `glossary.json` by hand.
+  Borrowed from 's `glossary/` package
+  (`similarity.py`, `translator.py`, `operations.py`, `models.py`
+  — ~600 lines combined); the extraction / clustering algorithm is
+  adapted to mdpo-llm's source-corpus model and the LLM wire routes
+  through `litellm` so the project's model-string contract
+  (OpenRouter, Anthropic, Bedrock, …) keeps working.
+  - **Token extraction**: walks `*.md` / `*.markdown` files, strips
+    fenced + indented code, inline code, URLs / autolinks, raw HTML,
+    image / link bracket bodies, and numeric / version runs before
+    tokenizing. Accepted shapes: `ALL_CAPS` acronyms (`WCS`, `API`),
+    `CamelCase` (`GitHub`), `TitleCase` (`Markdown`). Common English
+    stopwords (`The`, `When`, …) are rejected even when their casing
+    matches.
+  - **Phrase extraction**: 2- to 3-word runs starting at a
+    proper-noun-shaped token; following words may be proper-noun-
+    shaped OR lowercase common-noun continuations (length ≥ 3, not a
+    stopword). The brief's `"WCS"` / `"WCS API"` / `"WCS dashboard"`
+    example then materialises as three candidates that the clusterer
+    collapses into one.
+  - **Clustering**: `difflib.SequenceMatcher` ratio at or above
+    `--similarity-threshold` (default `0.85`) OR whole-word
+    containment (so `"WCS"` and `"WCS API"` merge regardless of the
+    threshold). Canonical pick: most-frequent variant, ties broken by
+    longer string then lexicographic order so output is deterministic.
+  - **Bulk translation**: a single LLM call per run with all
+    canonicals; the system prompt is borrowed verbatim from
+    's `translator._build_bulk_system_prompt`
+    (parameterised by source / target locales). Locales the LLM did
+    not return for a given entry render as empty strings so the
+    reviewer sees a stable per-row shape and can fill them in.
+  - **Authored-glossary protection**: the default output filename is
+    `glossary.suggested.json` (not `glossary.json`), and the verb
+    HARD-REFUSES to write to a path whose basename is exactly
+    `glossary.json`. Promotion is a manual review step by design —
+    the per-directory glossary cascade in `translate-dir` is never
+    silently overwritten by a fresh suggestion pass.
+  - **CLI**: `mdpo-llm suggest-glossary <source_dir> --target LANGS
+    --model NAME [--source-lang LANG] [--min-occurrences N]
+    [--min-files K] [--similarity-threshold FLOAT] [--output PATH]`.
+    Exit codes: `0` on success (including zero-candidate runs — the
+    output file is still written, just empty); `2` on usage error
+    (missing / non-directory source, empty `--target`, threshold out
+    of range, `--output` basename equals `glossary.json`).
+  - **Output schema**: per-canonical per-locale dict, matching the
+    `glossary_path=` schema the per-directory cascade already
+    consumes. Promotion is literally `mv glossary.suggested.json
+    glossary.json` after the operator's content review.
+  - New module: `mdpo_llm.glossary_suggest` with public
+    `suggest_glossary`, `collect_candidates`, `filter_by_thresholds`,
+    `cluster_candidates`, `extract_tokens`, `write_suggested_glossary`,
+    `litellm_bulk_translator`, `add_suggest_glossary_subparser`,
+    `cmd_suggest_glossary`, `main`, `TokenCandidate`,
+    `GlossaryCluster`, `GlossarySuggestion`, `BulkTranslator`,
+    `MARKDOWN_EXTENSIONS`, `DEFAULT_MIN_OCCURRENCES`,
+    `DEFAULT_MIN_FILES`, `DEFAULT_SIMILARITY_THRESHOLD`,
+    `SUGGESTED_GLOSSARY_FILENAME`, and `AUTHORED_GLOSSARY_FILENAME`.
+  - Independent of T-19 / T-20 / T-21 / T-22 — the verb adds no
+    cross-module coupling. The bulk-translator callable is
+    injectable, so tests pass deterministic stubs end-to-end and no
+    real LLM calls reach the wire. Targets v0.6.0.
 - **Vision-LLM image residue check: `mdpo-llm check-image` (T-22).**
   New CLI verb that walks a single image or a directory of images and
   asks a vision-capable LLM whether each image still contains visible
