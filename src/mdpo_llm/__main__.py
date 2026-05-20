@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from . import __version__
+from .cleanup_ops import add_cleanup_subparser
 from .cli_lint import add_lint_subparser
 from .placeholder import PlaceholderRegistry, load_placeholder_rules
 from .processor import MarkdownProcessor, ProgressEvent
@@ -1229,6 +1230,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep.set_defaults(func=cmd_report)
 
     add_lint_subparser(sub)
+    add_cleanup_subparser(sub)
 
     return parser
 

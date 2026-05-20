@@ -938,6 +938,81 @@ The scanner is read-only by design: zero LLM calls, no PO writes, no
 mutation of the scanned tree. Intended use is post-translation
 follow-up review and a configurable CI gate.
 
+## Orphan cleanup (`mdpo-llm cleanup`)
+
+Source documents come and go — `cleanup` removes the translated
+artefacts whose source has disappeared since the last `translate-dir`
+run. It is the standalone equivalent of the in-flight stale-output
+pass that `translate-dir --translate-paths` already performs, exposed
+as a verb so it can run without a fresh translation.
+
+```bash
+mdpo-llm cleanup docs_ko/ --source docs/ --dry-run
+mdpo-llm cleanup docs_ko/ --source docs/
+```
+
+What it removes:
+
+1. **Orphaned target file** — source gone, translated target still on
+   disk. Removes the target Markdown, its sibling per-document PO
+   file (unless `--keep-po`), and the matching `_paths.po` segment
+   row when no surviving source still uses that segment.
+2. **Stale `path_map.json` entries** — `{src_rel: tgt_rel}` rows
+   whose source no longer exists are dropped from the published map
+   so downstream link rewriters / sitemap jobs see a truthful view.
+3. **Unused `_paths.po` segment rows** — segments not referenced by
+   any surviving source are pruned. Segments shared across multiple
+   sources are preserved as long as at least one source keeps using
+   them.
+
+Flags:
+
+- `--source DIR` (required) — the source tree the translation ran
+  against. Required because "every source missing" is otherwise
+  indistinguishable from "wrong directory entirely", and we refuse
+  to wipe the target on that ambiguity.
+- `--po-dir DIR` (optional) — override when the translate-dir run
+  used `--po-dir` to route PO files outside the target tree. Both
+  per-document POs and `_paths.po` are read / rewritten under this
+  path. Defaults to `TARGET_DIR`.
+- `--dry-run` — print what would be removed without acting. The
+  header differs from a real run (`=== DRY RUN ===` vs `=== CLEANUP ===`)
+  but the per-section body lists match the classification a real run
+  would emit, so a preview / diff workflow stays predictable.
+- `--keep-po` — remove the orphan target Markdown but preserve the
+  sibling PO. A subsequent `translate-dir` run can then re-emit the
+  target from the cached translation if the source comes back.
+- `--json` — emit a machine-readable summary:
+  `{dry_run, removed_targets, removed_pos, removed_path_map_entries,
+  removed_paths_po_entries, failures}`.
+
+What it deliberately does **not** do:
+
+- Move or modify the surviving target files. Targets may have been
+  hand-edited; the cleanup never overwrites or relocates them.
+  A renamed source surfaces as orphan-plus-new-translation — the
+  operator re-runs `translate-dir` to mint the new target and (if
+  desired) deletes the old one with a second `cleanup` pass.
+- Touch files whose extension is not `.md`. Operator-deposited PDFs,
+  screenshots, JSON data, etc. are out of scope and untouched.
+- Issue any LLM call.
+
+Exit-code contract:
+
+- `0` — cleanup completed successfully (including zero-removal runs).
+  A missing `target_dir` is treated as a clean no-op so CI pipelines
+  that always invoke `cleanup` after `translate-dir` don't choke on
+  the first run.
+- `1` — one or more apply steps failed (permission denied, locked
+  file on Windows, read-only mount, …). The classification still
+  applied to the parts it could; re-running the verb mops up the
+  rest. The failures are surfaced in the report (and in the JSON
+  schema's `failures` field) so CI can decide whether to retry or
+  escalate.
+- `2` — usage error: `--source` missing or not a directory; `target_dir`
+  exists but is not a directory; `--po-dir` (when supplied) is not a
+  directory.
+
 ## Working with PO Files
 
 PO files (GNU gettext) track the state of each content block:

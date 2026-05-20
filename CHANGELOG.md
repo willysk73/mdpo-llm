@@ -3,6 +3,48 @@
 ## Unreleased
 
 ### Added
+- **Orphan cleanup verb: `mdpo-llm cleanup` (T-20).** New CLI verb
+  that removes translated outputs whose source has been deleted
+  since the last `translate-dir` run, exposed as a standalone verb
+  so the existing in-flight stale-output pass inside
+  `process_directory --translate-paths` can also run without a fresh
+  translation. Three deletion modes:
+  - **Orphaned target file** — source gone, target on disk. Removes
+    the target Markdown, its sibling per-document PO (unless
+    `--keep-po`), and the matching `_paths.po` segment row when no
+    surviving source still uses that segment.
+  - **Stale `path_map.json` entries** — `{src_rel: tgt_rel}` rows
+    whose source no longer exists are dropped from the published
+    map. 's `filename_map.json` is deliberately NOT
+    reintroduced; `_paths.po` (T-10) + `path_map.json` remain the
+    sole filename-mapping source of truth.
+  - **Unused `_paths.po` segments** — segments not referenced by any
+    surviving source are pruned. Shared segments are preserved as
+    long as at least one source still uses them.
+  - CLI: `mdpo-llm cleanup <target_dir> --source <source_dir>
+    [--po-dir <po_dir>] [--dry-run] [--keep-po] [--json]`.
+    `--dry-run` body lists match the classification a real run would
+    emit (only the header differs: `DRY RUN` vs `CLEANUP`); `--json`
+    emits `{dry_run, removed_targets, removed_pos,
+    removed_path_map_entries, removed_paths_po_entries, failures}`
+    for CI. Exit codes: `0` on success (including zero-removal runs
+    and a missing target tree, which is treated as an idempotent
+    no-op); `1` when one or more apply steps failed (the report
+    lists the paths so a re-run can mop them up); `2` on usage error
+    (`--source` missing or non-directory, `target_dir` exists but
+    is a file, `--po-dir` is not a directory).
+  - Target files outside `.md` are deliberately untouched (operator
+    PDFs / screenshots / JSON are out of scope). The cleanup never
+    moves or rewrites surviving targets — a renamed source surfaces
+    as orphan + new translation pending; the operator re-runs
+    `translate-dir` and a second `cleanup` to converge.
+  - New module: `mdpo_llm.cleanup_ops` with public
+    `cleanup_target_tree`, `CleanupResult`, `format_human_report`,
+    `add_cleanup_subparser`, `cmd_cleanup`, `main`, and
+    `TARGET_EXTENSIONS`.
+  - Additive: no behavioural change to `translate`, `translate-dir`,
+    `refine`, `refine-dir`, `translate-multi`, `estimate`, `report`,
+    or `lint`.
 - **Read-only lint scanner: `mdpo-llm lint` (T-19).** New CLI verb
   that walks a directory of translated markdown files and reports
   two classes of issue without issuing any LLM call or touching a
