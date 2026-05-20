@@ -3,6 +3,57 @@
 ## Unreleased
 
 ### Added
+- **Vision-LLM image residue check: `mdpo-llm check-image` (T-22).**
+  New CLI verb that walks a single image or a directory of images and
+  asks a vision-capable LLM whether each image still contains visible
+  text in `--target`. For the residue workflow `--target` is the
+  SOURCE language of the translation and a record with
+  `contains_target_lang=true` is the finding — a screenshot whose UI
+  text was localized in code but whose image asset still ships the
+  source-locale rendering. Example: after an `en → ko` translation,
+  run `check-image docs_ko/screenshots/ --target en` to surface
+  images still carrying English UI text. This class of residue is
+  invisible to the text-only validators (`mdpo-llm lint`, the T-16
+  LLM grader, the T-17 residue post-pass) by construction. Borrowed
+  from 's `cli_check_image.py`; the strict OCR system
+  prompt is reused verbatim so the two implementations stay
+  decision-aligned. The wire is routed through `litellm` instead of a
+  direct OpenAI client so every other `mdpo-llm` verb's model-string
+  contract (OpenRouter, Anthropic, Bedrock, …) keeps working without
+  a separate API client.
+  - **Default vision model**: `openrouter/openai/gpt-4o`,
+    configurable via `--vision-model`. Validated through
+    `litellm.supports_vision(model=…)` before any API call so a
+    non-vision model surfaces as a usage error rather than burning
+    tokens on a model that cannot read images. An older `litellm` or
+    an unrecognised model string is treated as non-vision (degrades
+    safely rather than leaking the exception).
+  - **Supported extensions**: `.gif .jpeg .jpg .png .webp` — matches
+    the set  accepts on its `--input` flag minus exotic
+    formats (TIFF, BMP, HEIC) that the vision providers consistently
+    reject anyway. A single-file argument with any other extension
+    surfaces as a usage error before any LLM call.
+  - **Output schema**: a JSON array of `{path,
+    contains_target_lang, reason}` records to stdout, sorted by path
+    for byte-stable output across runs and platforms.
+    `contains_target_lang=true` flags an image that still carries
+    visible text in `--target`. CI consumers can depend on the schema
+    — the dict keys are exactly the three above.
+  - **CLI**: `mdpo-llm check-image <image_or_dir> --target <lang>
+    [--vision-model NAME] [--exit-non-zero-on-findings]`. Exit codes:
+    `0` on a successful scan (regardless of findings unless the
+    opt-in flag is set), `1` when findings exist AND
+    `--exit-non-zero-on-findings` is passed, `2` on usage error
+    (missing path, unsupported single-file extension, non-vision
+    model).
+  - New module: `mdpo_llm.cli_check_image` with public
+    `check_image`, `check_images`, `add_check_image_subparser`,
+    `cmd_check_image`, `main`, `ImageCheckRecord`,
+    `IMAGE_EXTENSIONS`, `SYSTEM_PROMPT`, and `DEFAULT_VISION_MODEL`.
+  - Independent of T-19 / T-20 / T-21 — the verb shares only the
+    `__main__.py` subparser-registration surface and adds no
+    cross-module coupling. Tests mock the vision LLM end-to-end; no
+    real API calls.
 - **Whole-tree validation report: `mdpo-llm validate-dir` (T-21).**
   New CLI verb that walks an already-translated tree and aggregates
   every per-file signal into a single report so reviewers do not

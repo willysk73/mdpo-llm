@@ -1090,6 +1090,82 @@ Exit-code contract:
   supplied) is not a directory; `--include-lint` without
   `--target`.
 
+## Vision-LLM image residue check (`mdpo-llm check-image`)
+
+`mdpo-llm lint`, the T-16 LLM grader, and the T-17 residue post-pass
+cover *text* residue but cannot see inside image assets. The
+`check-image` verb closes that gap: it walks a single image or a
+directory of images and asks a vision-capable LLM whether each
+image still contains visible text in `--target`. For the residue
+workflow you pass the **source language of the translation** as
+`--target` and treat `contains_target_lang=true` records as findings
+— screenshots whose UI text was localized in code but whose image
+asset still ships the source-locale rendering.
+
+```bash
+# English → Korean translation: scan the translated tree's
+# screenshots for leftover English text (the source-language residue).
+mdpo-llm check-image docs_ko/screenshots/ --target en
+
+mdpo-llm check-image docs_ko/screenshots/login.png --target en \
+    --vision-model openrouter/anthropic/claude-3.5-sonnet
+```
+
+Flags:
+
+- `image_path` (positional) — a single image file or a directory of
+  images (scanned recursively). Supported extensions: `.gif .jpeg
+  .jpg .png .webp`. A single-file argument with any other extension
+  fails as a usage error before any LLM call.
+- `--target LANG` (required) — BCP 47 locale of the language the
+  vision LLM should look for in each image. For the residue workflow
+  this is the SOURCE language of the translation (e.g. `en` when
+  scanning an English→Korean translated tree's screenshots);
+  `contains_target_lang=true` records then carry un-localised
+  source-language text and are the findings the verb is meant to
+  surface.
+- `--vision-model NAME` (default `openrouter/openai/gpt-4o`) —
+  vision-capable LiteLLM model string. Validated via
+  `litellm.supports_vision` before any API call; a non-vision model
+  surfaces as a usage error rather than burning tokens.
+- `--exit-non-zero-on-findings` — exit 1 when any image is flagged
+  (`contains_target_lang=true`). Default: always exit 0 unless a
+  usage error occurs.
+
+Output is a JSON array on stdout — one record per image:
+
+```json
+[
+  {
+    "path": "docs_ko/screenshots/login.png",
+    "contains_target_lang": true,
+    "reason": "English banner text 'Login' visible at the top — not localised."
+  },
+  {
+    "path": "docs_ko/screenshots/dashboard.png",
+    "contains_target_lang": false,
+    "reason": "No source-language text detected; UI fully re-rendered in Korean."
+  }
+]
+```
+
+Records are sorted by path so the output is byte-stable across runs.
+
+Exit-code contract:
+
+- `0` — scan completed (regardless of findings unless
+  `--exit-non-zero-on-findings` is set).
+- `1` — at least one image flagged AND `--exit-non-zero-on-findings`
+  was passed.
+- `2` — usage error: missing path, unsupported single-file
+  extension, or non-vision `--vision-model`.
+
+The strict OCR system prompt is shared with 's
+`cli_check_image.py` so the two implementations stay
+decision-aligned; the difference is purely the LLM wire (mdpo-llm
+routes through `litellm`,  calls the OpenAI SDK
+directly). Real LLM calls in tests are mocked end-to-end.
+
 ## Working with PO Files
 
 PO files (GNU gettext) track the state of each content block:
