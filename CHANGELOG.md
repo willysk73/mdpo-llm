@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-05-23
 
 ### Added
 - **Auto-glossary candidate extraction: `mdpo-llm suggest-glossary`
