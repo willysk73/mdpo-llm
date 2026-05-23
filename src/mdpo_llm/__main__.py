@@ -203,7 +203,7 @@ def _add_translate_flags(
         "--inplace",
         action="store_true",
         help=(
-            "[DEPRECATED — removed in v0.5] After translating, copy msgstr "
+            "[DEPRECATED — removed in v0.6] After translating, copy msgstr "
             "back to msgid. Use the `refine` subcommand (or `translate "
             "--refine-first`) instead to polish the source while keeping "
             "the original msgid intact."

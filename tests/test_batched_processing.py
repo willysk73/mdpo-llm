@@ -1769,7 +1769,7 @@ class TestRefineMode:
 
 class TestInplaceDeprecation:
     """T-7 deprecation contract: ``inplace=True`` emits DeprecationWarning
-    pointing at refine mode; scheduled for removal in v0.5."""
+    pointing at refine mode; scheduled for removal in v0.6."""
 
     def test_inplace_true_emits_deprecation_warning(self, tmp_path, mock_completion):
         md = "# Title\n\nBody.\n"
@@ -1792,7 +1792,7 @@ class TestInplaceDeprecation:
         # Message points the user at the replacement path.
         joined = "\n".join(messages)
         assert "refine" in joined.lower()
-        assert "v0.5" in joined
+        assert "v0.6" in joined
 
     def test_inplace_false_no_warning(self, tmp_path, mock_completion):
         md = "# Title\n\nBody.\n"

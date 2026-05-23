@@ -69,7 +69,7 @@ _TLS_UNSET = object()
 
 
 _INPLACE_DEPRECATION_MESSAGE = (
-    "`inplace=True` is deprecated and will be removed in v0.5. "
+    "`inplace=True` is deprecated and will be removed in v0.6. "
     "Use `mode='refine'` with a separate `refined_path` to produce a "
     "polished version of the source while keeping the original `msgid` "
     "intact. See README 'Refine mode' for migration details."
