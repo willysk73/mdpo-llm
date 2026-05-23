@@ -36,14 +36,12 @@ Three deletion modes:
    happens implicitly as part of mode 1 for every orphaned source that
    had an entry, plus a defensive sweep for entries whose target was
    never on disk.
-3. **(Limitation) Renamed source detection.** 's
-   ``cleanup_ops`` does not detect renames either: it can only
-   distinguish "input present" from "input absent". mdpo-llm's
-   ``_paths.po`` records segment translations, not file-level rename
-   pairs, so a rename surfaces here as "old source absent, new source
-   present" — i.e. an orphan plus a new translation pending. The
-   operator must re-run ``translate-dir`` to mint the new target;
-   moving target files automatically would clobber hand-edits.
+3. **(Limitation) Renamed source detection.** ``_paths.po`` records
+   segment translations, not file-level rename pairs, so a rename
+   surfaces here as "old source absent, new source present" — i.e. an
+   orphan plus a new translation pending. The operator must re-run
+   ``translate-dir`` to mint the new target; moving target files
+   automatically would clobber hand-edits.
 
 The target markdown file itself is never moved or modified — only
 removed when the source has truly disappeared.
@@ -66,10 +64,10 @@ logger = logging.getLogger(__name__)
 
 
 # Extensions of files we consider "translated markdown artefacts" when
-# walking the target tree. Limited to ``.md`` for now; 
-# also covered ``.pdf`` but mdpo-llm's pipeline only writes Markdown,
-# and treating an arbitrary user-deposited PDF as an orphan would risk
-# deleting hand-managed attachments.
+# walking the target tree. Limited to ``.md`` for now; mdpo-llm's
+# pipeline only writes Markdown, and treating an arbitrary
+# user-deposited PDF as an orphan would risk deleting hand-managed
+# attachments.
 TARGET_EXTENSIONS: frozenset[str] = frozenset({".md"})
 
 

@@ -133,12 +133,11 @@ _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _FILENAME_RE = re.compile(r"^[^\s]+\.[A-Za-z0-9]{1,8}$")
 
 
-# Module-level prompt templates.  Lifted from
-# ``/processors/llm_refiner.py``
-# with the comment-preservation rule made explicit because the T-12
-# pass-1 prompt asks the LLM to translate comments — at residue-pass time
-# the comments have already been processed and re-translating them risks
-# round-trip drift, so they MUST be preserved verbatim.
+# Module-level prompt templates.  The comment-preservation rule is
+# explicit because the pass-1 translate prompt asks the LLM to translate
+# comments — at residue-pass time the comments have already been
+# processed and re-translating them risks round-trip drift, so they MUST
+# be preserved verbatim.
 RESIDUE_FENCED_PROMPT = """\
 You are repairing a translated fenced code block. The block still contains
 source-language characters that the previous translation pass missed.

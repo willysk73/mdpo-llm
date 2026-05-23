@@ -96,9 +96,7 @@ class TestSingleImage:
         assert mock_litellm.completion.call_count == 1
         kwargs = mock_litellm.completion.call_args.kwargs
         assert kwargs["model"] == "vmodel"
-        # The system prompt must be the strict OCR prompt verbatim so
-        # the two implementations (mdpo-llm + ) stay
-        # decision-aligned across forks.
+        # The system prompt must be the strict OCR prompt verbatim.
         assert kwargs["messages"][0]["role"] == "system"
         assert kwargs["messages"][0]["content"] == SYSTEM_PROMPT
         user_content = kwargs["messages"][1]["content"]

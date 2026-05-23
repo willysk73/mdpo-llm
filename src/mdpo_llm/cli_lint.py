@@ -14,9 +14,8 @@ without ever issuing an LLM call or touching a PO file:
 
 2. **Dangling doc references** — backticked or angle-bracketed
    filenames whose basename is not present in either the scanned
-   target tree or, optionally, the ``--source-root`` tree.
-    only covered PDF refs; this scanner generalises to
-   the common artefact extensions (`pdf png jpg jpeg gif svg md csv
+   target tree or, optionally, the ``--source-root`` tree. Covers the
+   common artefact extensions (`pdf png jpg jpeg gif svg md csv
    json xlsx docx`). URLs (anything containing ``://``) are skipped
    because their existence cannot be checked on disk.
 
@@ -24,11 +23,9 @@ The scanner is pure observability: no LLM calls, no PO writes, no
 mutation of the scanned tree. It is meant to surface follow-up work
 for human reviewers and as a CI gate via ``--exit-non-zero-on-findings``.
 
-The  reference implementation drove its
-known-filename set from ``filename_map.json``; per BOARD direction
-mdpo-llm replaces that artefact with ``_paths.po`` / ``path_map.json``,
-so this scanner derives the known set straight from the filesystem
-instead of reintroducing a parallel mapping file.
+The known-filename set is derived straight from the filesystem
+(``_paths.po`` / ``path_map.json``) rather than from a parallel
+mapping file.
 """
 
 from __future__ import annotations
@@ -86,9 +83,8 @@ _TARGET_SUPPRESSED_RESIDUE: dict[str, frozenset[str]] = {
 
 
 # Doc artefact extensions tracked for dangling-reference detection
-# (lowercased, no leading dot). Generalised from 's
-# PDF-only scan to cover the common documentation attachments
-# mdpo-llm operators ship alongside markdown trees.
+# (lowercased, no leading dot). Covers the common documentation
+# attachments mdpo-llm operators ship alongside markdown trees.
 LINT_EXTENSIONS: Tuple[str, ...] = (
     "pdf",
     "png",
@@ -127,9 +123,7 @@ _REF_ANGLE_RE = re.compile(
 )
 
 # Truncation width applied to the human-readable preview of a
-# residue-bearing line. Matches the  reference so
-# tooling parsing the human report sees the same cap regardless of
-# which implementation produced it.
+# residue-bearing line.
 _LINE_PREVIEW_CHARS = 80
 
 

@@ -8,10 +8,8 @@ clusters near-duplicate variants (``"WCS"`` / ``"WCS API"`` /
 call, and emits a draft ``glossary.suggested.json`` the operator can
 review and promote into a real ``glossary.json``.
 
-Borrowed from 's ``glossary/`` package (``similarity.py``,
-``translator.py``, ``operations.py``, ``models.py`` — ~600 lines
-combined). The extraction / clustering algorithm is adapted to
-mdpo-llm's source-corpus model:
+The extraction / clustering algorithm is built around mdpo-llm's
+source-corpus model:
 
   1. Walk the source tree for ``*.md`` files; for each file, strip the
      markdown surfaces (fenced + indented code, inline code, URLs,
@@ -103,7 +101,6 @@ MARKDOWN_EXTENSIONS: Tuple[str, ...] = (".md", ".markdown")
 
 
 # Default similarity threshold for SequenceMatcher-based clustering.
-# Calibrated against 's reference implementation:
 # 0.85 collapses common variant pairs (``"WCS"`` / ``"WCS API"``) via
 # the whole-word substring rule but does not over-merge unrelated
 # proper nouns that happen to share a few letters
@@ -122,10 +119,8 @@ DEFAULT_MIN_FILES = 2
 
 
 # Cap on phrase length (number of whitespace-separated tokens) for
-# multi-word candidates. 's reference clustered up to
-# 3-word phrases ("WCS API gateway"); higher arities mostly surfaced
-# fragments of full sentences with low cluster value, so the cap is
-# kept at 3.
+# multi-word candidates. Capped at 3: higher arities mostly surface
+# fragments of full sentences with low cluster value.
 _MAX_PHRASE_TOKENS = 3
 
 
@@ -948,13 +943,11 @@ BulkTranslator = Callable[
 ]
 
 
-# System prompt for the bulk-translation call. Borrowed verbatim from
-# 's ``translator._build_bulk_system_prompt`` (with
-# the source-language label dropped in favour of a placeholder so it
-# can be rendered for any source language). The strict JSON-only
-# instruction matters because the structured-output path is the
-# fallback rather than the default — older LiteLLM installs and a
-# handful of providers ignore ``response_format``, and the verb
+# System prompt for the bulk-translation call. The source-language
+# label is a placeholder so it can be rendered for any source language.
+# The strict JSON-only instruction matters because the structured-output
+# path is the fallback rather than the default — older LiteLLM installs
+# and a handful of providers ignore ``response_format``, and the verb
 # needs to keep working there.
 _BULK_SYSTEM_PROMPT_TEMPLATE = (
     "You are a translation AI specialized in translating {source} text "
@@ -990,11 +983,10 @@ def _bulk_user_prompt(
 ) -> str:
     """Render the bulk-translation user prompt.
 
-    The numbered ``[N]`` prefix mirrors the  reference;
-    LLMs return the same numbering verbatim in their JSON, which the
-    parser uses as a robustness signal (a missing index implies the
-    LLM dropped an entry and the caller emits an empty-translation
-    placeholder for that source).
+    The numbered ``[N]`` prefix is preserved in LLM responses verbatim,
+    which the parser uses as a robustness signal (a missing index
+    implies the LLM dropped an entry and the caller emits an
+    empty-translation placeholder for that source).
     """
     lines: List[str] = [
         f"Translate the following {source_lang} source terms into "

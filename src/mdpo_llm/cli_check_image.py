@@ -21,17 +21,12 @@ CLI shape:
 
 Output: a JSON array of ``{path, contains_target_lang, reason}`` records
 to stdout, sorted by path for byte-stable output. ``contains_target_lang``
-names the language passed via ``--target`` and is named for symmetry
-with the  reference implementation; in the residue
-workflow ``true`` means "residue detected". ``--exit-non-zero-on-
-findings`` flips the exit code to ``1`` when any image is flagged so
-the verb can gate CI without callers needing to parse the JSON
-themselves.
+names the language passed via ``--target``; in the residue workflow
+``true`` means "residue detected". ``--exit-non-zero-on-findings`` flips
+the exit code to ``1`` when any image is flagged so the verb can gate
+CI without callers needing to parse the JSON themselves.
 
-The strict OCR system prompt is borrowed verbatim from 's
-``cli_check_image.py`` so the two implementations stay decision-aligned;
-the difference is purely the LLM wire —  calls the OpenAI
-SDK directly, mdpo-llm routes through ``litellm`` so every other
+mdpo-llm routes the vision call through ``litellm`` so every other
 ``mdpo-llm`` verb's model-string contract (OpenRouter, Anthropic,
 Bedrock, etc.) keeps working without a separate API client.
 
@@ -56,11 +51,10 @@ from typing import List, Optional, Sequence, Tuple
 import litellm
 
 
-# Lower-cased image extensions the directory walk recognises. Matches
-# the set 's ``cli_check_image`` accepts on its
-# ``--input`` flag, minus exotic formats (TIFF, BMP, HEIC) that the
-# vision providers consistently reject anyway. Sorted alphabetically so
-# the ``--help`` blurb prints in a stable order across Python versions.
+# Lower-cased image extensions the directory walk recognises. Excludes
+# exotic formats (TIFF, BMP, HEIC) that the vision providers consistently
+# reject anyway. Sorted alphabetically so the ``--help`` blurb prints in
+# a stable order across Python versions.
 IMAGE_EXTENSIONS: Tuple[str, ...] = (
     ".gif",
     ".jpeg",
@@ -77,10 +71,8 @@ IMAGE_EXTENSIONS: Tuple[str, ...] = (
 DEFAULT_VISION_MODEL = "openrouter/openai/gpt-4o"
 
 
-# Strict OCR system prompt copied from . JSON-quoted
-# rather than the  reference's single-quoted form so the
-# wire payload is parseable JSON if the model echoes it back; the
-# semantics are identical.
+# Strict OCR system prompt. JSON-quoted so the wire payload is parseable
+# JSON if the model echoes it back.
 SYSTEM_PROMPT = (
     "You are a strict OCR assistant. Look at the provided image and "
     "decide ONLY whether it contains any text in the requested target "

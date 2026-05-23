@@ -42,10 +42,9 @@
   - **No new CLI flag.** Markers are inert in documents that don't
     contain them, so existing pipelines see zero behavioural change
     until an author opts in by adding markers to a source file.
-  - Inspired by ``'s
-    code-fence-based syntax (`` ```no_translate ``), but deliberately
-    diverged: code fences render as monospace, which would corrupt
-    the prose styling the feature exists to preserve.
+  - Uses HTML comments rather than a code-fence-based syntax
+    (`` ```no_translate ``): code fences render as monospace, which
+    would corrupt the prose styling the feature exists to preserve.
 
 ## 0.5.0 — 2026-05-23
 
@@ -56,12 +55,10 @@
   near-duplicate variants, translates each cluster's canonical via a
   bulk LLM call, and emits a draft `glossary.suggested.json` the
   operator reviews and promotes into a real `glossary.json` by hand.
-  Borrowed from 's `glossary/` package
-  (`similarity.py`, `translator.py`, `operations.py`, `models.py`
-  — ~600 lines combined); the extraction / clustering algorithm is
-  adapted to mdpo-llm's source-corpus model and the LLM wire routes
-  through `litellm` so the project's model-string contract
-  (OpenRouter, Anthropic, Bedrock, …) keeps working.
+  The extraction / clustering algorithm targets mdpo-llm's
+  source-corpus model and the LLM wire routes through `litellm` so
+  the project's model-string contract (OpenRouter, Anthropic,
+  Bedrock, …) keeps working.
   - **Token extraction**: walks `*.md` / `*.markdown` files, strips
     fenced + indented code, inline code, URLs / autolinks, raw HTML,
     image / link bracket bodies, and numeric / version runs before
@@ -81,11 +78,9 @@
     threshold). Canonical pick: most-frequent variant, ties broken by
     longer string then lexicographic order so output is deterministic.
   - **Bulk translation**: a single LLM call per run with all
-    canonicals; the system prompt is borrowed verbatim from
-    's `translator._build_bulk_system_prompt`
-    (parameterised by source / target locales). Locales the LLM did
-    not return for a given entry render as empty strings so the
-    reviewer sees a stable per-row shape and can fill them in.
+    canonicals (parameterised by source / target locales). Locales
+    the LLM did not return for a given entry render as empty strings
+    so the reviewer sees a stable per-row shape and can fill them in.
   - **Authored-glossary protection**: the default output filename is
     `glossary.suggested.json` (not `glossary.json`), and the verb
     HARD-REFUSES to write to a path whose basename is exactly
@@ -127,13 +122,10 @@
   run `check-image docs_ko/screenshots/ --target en` to surface
   images still carrying English UI text. This class of residue is
   invisible to the text-only validators (`mdpo-llm lint`, the T-16
-  LLM grader, the T-17 residue post-pass) by construction. Borrowed
-  from 's `cli_check_image.py`; the strict OCR system
-  prompt is reused verbatim so the two implementations stay
-  decision-aligned. The wire is routed through `litellm` instead of a
-  direct OpenAI client so every other `mdpo-llm` verb's model-string
-  contract (OpenRouter, Anthropic, Bedrock, …) keeps working without
-  a separate API client.
+  LLM grader, the T-17 residue post-pass) by construction. The wire
+  is routed through `litellm` so every other `mdpo-llm` verb's
+  model-string contract (OpenRouter, Anthropic, Bedrock, …) keeps
+  working without a separate API client.
   - **Default vision model**: `openrouter/openai/gpt-4o`,
     configurable via `--vision-model`. Validated through
     `litellm.supports_vision(model=…)` before any API call so a
@@ -141,11 +133,11 @@
     tokens on a model that cannot read images. An older `litellm` or
     an unrecognised model string is treated as non-vision (degrades
     safely rather than leaking the exception).
-  - **Supported extensions**: `.gif .jpeg .jpg .png .webp` — matches
-    the set  accepts on its `--input` flag minus exotic
-    formats (TIFF, BMP, HEIC) that the vision providers consistently
-    reject anyway. A single-file argument with any other extension
-    surfaces as a usage error before any LLM call.
+  - **Supported extensions**: `.gif .jpeg .jpg .png .webp` —
+    excludes exotic formats (TIFF, BMP, HEIC) that the vision
+    providers consistently reject anyway. A single-file argument with
+    any other extension surfaces as a usage error before any LLM
+    call.
   - **Output schema**: a JSON array of `{path,
     contains_target_lang, reason}` records to stdout, sorted by path
     for byte-stable output across runs and platforms.
@@ -170,8 +162,7 @@
 - **Whole-tree validation report: `mdpo-llm validate-dir` (T-21).**
   New CLI verb that walks an already-translated tree and aggregates
   every per-file signal into a single report so reviewers do not
-  have to grep per-file PO trees by hand. Borrowed from
-  's `cli_validate_dir.py`; reuses T-19's
+  have to grep per-file PO trees by hand. Reuses T-19's
   `cli_lint.lint_directory` as a library helper for the residue /
   dangling scan rather than re-implementing it.
   - **Per-file summary** — relative target path, per-document PO
@@ -234,9 +225,8 @@
     surviving source still uses that segment.
   - **Stale `path_map.json` entries** — `{src_rel: tgt_rel}` rows
     whose source no longer exists are dropped from the published
-    map. 's `filename_map.json` is deliberately NOT
-    reintroduced; `_paths.po` (T-10) + `path_map.json` remain the
-    sole filename-mapping source of truth.
+    map. `_paths.po` (T-10) + `path_map.json` remain the sole
+    filename-mapping source of truth.
   - **Unused `_paths.po` segments** — segments not referenced by any
     surviving source are pruned. Shared segments are preserved as
     long as at least one source still uses them.
@@ -281,10 +271,9 @@
   - **Dangling doc references** — backticked or angle-bracketed
     filenames whose basename is not present in either the scanned
     tree or the optional `--source-root`. Tracked extensions:
-    `.pdf .png .jpg .jpeg .gif .svg .md .csv .json .xlsx .docx`
-    (generalised from 's PDF-only scan). Matching is
-    case-insensitive and basename-only; URLs (anything containing
-    `://`) are skipped because their existence cannot be checked
+    `.pdf .png .jpg .jpeg .gif .svg .md .csv .json .xlsx .docx`.
+    Matching is case-insensitive and basename-only; URLs (anything
+    containing `://`) are skipped because their existence cannot be checked
     on disk. The known-filename set is built straight from the
     filesystem so `filename_map.json` is not reintroduced as a
     parallel data structure — `_paths.po` (T-10) / `path_map.json`

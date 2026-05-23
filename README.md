@@ -1232,11 +1232,7 @@ Exit-code contract:
 - `2` — usage error: missing path, unsupported single-file
   extension, or non-vision `--vision-model`.
 
-The strict OCR system prompt is shared with 's
-`cli_check_image.py` so the two implementations stay
-decision-aligned; the difference is purely the LLM wire (mdpo-llm
-routes through `litellm`,  calls the OpenAI SDK
-directly). Real LLM calls in tests are mocked end-to-end.
+Real LLM calls in tests are mocked end-to-end.
 
 ## Auto-glossary candidate extraction (`mdpo-llm suggest-glossary`)
 
