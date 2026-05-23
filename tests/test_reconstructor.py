@@ -189,6 +189,76 @@ class TestGetProcessCoverage:
         assert stats["fuzzy_blocks"] > 0
 
 
+class TestNoTranslateRoundTrip:
+    """`no_translate` blocks must reconstruct byte-identical to source."""
+
+    @pytest.fixture
+    def reconstructor_with_no_translate(self):
+        return DocumentReconstructor(skip_types=["hr", "no_translate"])
+
+    def _build_po(self, blocks, ctx_func):
+        po = polib.POFile()
+        po.metadata = {"Content-Type": "text/plain; charset=UTF-8"}
+        for block in blocks:
+            ctx = ctx_func(block)
+            if block["type"] in {"hr", "no_translate"}:
+                # Mirror manager.sync_po: skip-types get an empty msgstr.
+                po.append(polib.POEntry(msgctxt=ctx, msgid=block["text"], msgstr=""))
+            else:
+                po.append(
+                    polib.POEntry(
+                        msgctxt=ctx,
+                        msgid=block["text"],
+                        msgstr=f"[T] {block['text']}",
+                    )
+                )
+        return po
+
+    def test_form_a_pair_round_trip(self, reconstructor_with_no_translate):
+        text = (
+            "Intro paragraph.\n"
+            "\n"
+            "<!-- mdpo:no-translate -->\n"
+            "Verbatim body line one.\n"
+            "Verbatim body line two.\n"
+            "<!-- /mdpo:no-translate -->\n"
+            "\n"
+            "Trailing paragraph.\n"
+        )
+        lines = text.splitlines(keepends=True)
+        parser = BlockParser()
+        blocks = parser.segment_markdown([l.rstrip("\n") for l in lines])
+        po = self._build_po(blocks, parser.context_id)
+        result = reconstructor_with_no_translate.rebuild_markdown(
+            lines, blocks, po, parser.context_id
+        )
+        # The no_translate range survives verbatim, including both markers.
+        assert "<!-- mdpo:no-translate -->\nVerbatim body line one." in result
+        assert "<!-- /mdpo:no-translate -->" in result
+        # Surrounding paragraphs do get translated.
+        assert "[T] Intro paragraph." in result
+        assert "[T] Trailing paragraph." in result
+
+    def test_form_b_skip_next_round_trip(self, reconstructor_with_no_translate):
+        text = (
+            "<!-- mdpo:skip-next -->\n"
+            "Skipped paragraph.\n"
+            "\n"
+            "Translated paragraph.\n"
+        )
+        lines = text.splitlines(keepends=True)
+        parser = BlockParser()
+        blocks = parser.segment_markdown([l.rstrip("\n") for l in lines])
+        po = self._build_po(blocks, parser.context_id)
+        result = reconstructor_with_no_translate.rebuild_markdown(
+            lines, blocks, po, parser.context_id
+        )
+        assert "<!-- mdpo:skip-next -->\nSkipped paragraph." in result
+        assert "[T] Translated paragraph." in result
+        # The skipped paragraph never gets the [T] prefix.
+        assert "[T] Skipped" not in result
+
+
 class TestExportTranslationReport:
     def test_report_format(self, reconstructor, simple_doc, po_with_translations):
         _, blocks, ctx_func = simple_doc

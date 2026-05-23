@@ -252,6 +252,301 @@ class TestComplexDocument:
             seen[key].add(idx)
 
 
+class TestNoTranslateFormA:
+    """Form A — `<!-- mdpo:no-translate -->` / `<!-- /mdpo:no-translate -->` pair."""
+
+    def test_pair_around_paragraph(self, parser):
+        lines = [
+            "<!-- mdpo:no-translate -->",
+            "Verbatim paragraph.",
+            "<!-- /mdpo:no-translate -->",
+        ]
+        blocks = parser.segment_markdown(lines)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "no_translate"
+        # Block text includes both markers and the body — reconstructor
+        # writes from source_lines, but text is what reaches the PO entry.
+        assert blocks[0]["text"] == "\n".join(lines)
+        assert blocks[0]["start"] == 0
+        assert blocks[0]["end"] == 3
+
+    def test_pair_around_mixed_blocks(self, parser):
+        lines = [
+            "<!-- mdpo:no-translate -->",
+            "Paragraph that stays.",
+            "",
+            "- list item 1",
+            "- list item 2",
+            "",
+            "```python",
+            "print('hi')",
+            "```",
+            "<!-- /mdpo:no-translate -->",
+        ]
+        blocks = parser.segment_markdown(lines)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "no_translate"
+        assert blocks[0]["end"] == len(lines)
+        # Inner content reaches the PO entry verbatim — so nested code
+        # fence and list characters live inside text.
+        assert "```python" in blocks[0]["text"]
+        assert "- list item 1" in blocks[0]["text"]
+
+    def test_pair_unclosed_consumes_to_eof_and_warns(self, parser, caplog):
+        lines = [
+            "<!-- mdpo:no-translate -->",
+            "Body without closer.",
+            "Still inside.",
+        ]
+        with caplog.at_level("WARNING", logger="mdpo_llm.parser"):
+            blocks = parser.segment_markdown(lines)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "no_translate"
+        assert blocks[0]["end"] == len(lines)
+        assert any(
+            "Unclosed" in record.message and "mdpo:no-translate" in record.message
+            for record in caplog.records
+        )
+
+    def test_nested_opener_is_literal(self, parser):
+        """A second opener inside an open range is treated as content."""
+        lines = [
+            "<!-- mdpo:no-translate -->",
+            "outer body",
+            "<!-- mdpo:no-translate -->",
+            "still inside",
+            "<!-- /mdpo:no-translate -->",
+            "after",
+        ]
+        blocks = parser.segment_markdown(lines)
+        # First close marker (line 5) ends the range; "after" is its own block.
+        assert blocks[0]["type"] == "no_translate"
+        assert blocks[0]["end"] == 5
+        assert "<!-- mdpo:no-translate -->" in blocks[0]["text"].splitlines()[2]
+        assert blocks[1]["type"] == "para"
+        assert blocks[1]["text"] == "after"
+
+    def test_marker_leading_trailing_whitespace_tolerated(self, parser):
+        lines = [
+            "   <!--   mdpo:no-translate   -->   ",
+            "body",
+            "  <!-- /mdpo:no-translate -->",
+        ]
+        blocks = parser.segment_markdown(lines)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "no_translate"
+
+
+class TestNoTranslateFormB:
+    """Form B — `<!-- mdpo:skip-next -->` marks just the next block."""
+
+    def test_skip_next_with_paragraph(self, parser):
+        lines = [
+            "<!-- mdpo:skip-next -->",
+            "This paragraph is skipped.",
+            "",
+            "This paragraph is translated.",
+        ]
+        blocks = parser.segment_markdown(lines)
+        assert len(blocks) == 2
+        assert blocks[0]["type"] == "no_translate"
+        assert blocks[0]["start"] == 0
+        assert blocks[0]["end"] == 2
+        assert blocks[0]["text"] == "\n".join(lines[0:2])
+        assert blocks[1]["type"] == "para"
+        assert blocks[1]["text"] == "This paragraph is translated."
+
+    def test_skip_next_with_code_fence(self, parser):
+        lines = [
+            "<!-- mdpo:skip-next -->",
+            "```python",
+            "print('hi')",
+            "```",
+        ]
+        blocks = parser.segment_markdown(lines)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "no_translate"
+        assert blocks[0]["end"] == len(lines)
+        # Code fence content is inside the no_translate block, not a code block.
+        assert all(b["type"] != "code" for b in blocks)
+
+    def test_skip_next_at_eof_marker_only(self, parser):
+        """Marker as last non-blank line → fail-soft marker-only block."""
+        lines = ["<!-- mdpo:skip-next -->"]
+        blocks = parser.segment_markdown(lines)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "no_translate"
+        assert blocks[0]["text"] == "<!-- mdpo:skip-next -->"
+
+    def test_skip_next_at_eof_with_trailing_blank_lines(self, parser):
+        lines = ["<!-- mdpo:skip-next -->", "", ""]
+        blocks = parser.segment_markdown(lines)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "no_translate"
+
+    def test_skip_next_blank_line_between_marker_and_block(self, parser):
+        lines = [
+            "<!-- mdpo:skip-next -->",
+            "",
+            "Skipped paragraph.",
+        ]
+        blocks = parser.segment_markdown(lines)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "no_translate"
+        assert blocks[0]["end"] == 3
+
+    def test_skip_next_only_affects_next_block(self, parser):
+        lines = [
+            "<!-- mdpo:skip-next -->",
+            "Skipped.",
+            "",
+            "Translated.",
+            "",
+            "Also translated.",
+        ]
+        blocks = parser.segment_markdown(lines)
+        types = [b["type"] for b in blocks]
+        assert types == ["no_translate", "para", "para"]
+
+
+class TestNoTranslateAdjacency:
+    """Markers placed immediately after prose / lists / headings without
+    an intervening blank line must still be recognised. Regression for
+    the original cycle-1 finding where paragraph / list continuation
+    silently swallowed the marker and sent the protected content to
+    the LLM."""
+
+    def test_marker_directly_after_paragraph(self, parser):
+        lines = [
+            "Some prose without a trailing blank.",
+            "<!-- mdpo:no-translate -->",
+            "Verbatim body.",
+            "<!-- /mdpo:no-translate -->",
+        ]
+        blocks = parser.segment_markdown(lines)
+        types = [b["type"] for b in blocks]
+        assert types == ["para", "no_translate"]
+        assert blocks[0]["text"] == "Some prose without a trailing blank."
+        assert blocks[1]["end"] == len(lines)
+
+    def test_skip_next_directly_after_paragraph(self, parser):
+        lines = [
+            "Prose.",
+            "<!-- mdpo:skip-next -->",
+            "Skipped.",
+        ]
+        blocks = parser.segment_markdown(lines)
+        types = [b["type"] for b in blocks]
+        assert types == ["para", "no_translate"]
+        assert blocks[0]["text"] == "Prose."
+
+    def test_marker_directly_after_list(self, parser):
+        lines = [
+            "- item one",
+            "- item two",
+            "<!-- mdpo:no-translate -->",
+            "Verbatim.",
+            "<!-- /mdpo:no-translate -->",
+        ]
+        blocks = parser.segment_markdown(lines)
+        types = [b["type"] for b in blocks]
+        assert types == ["ulist", "no_translate"]
+        assert "Verbatim." not in blocks[0]["text"]
+
+
+class TestNoTranslateHeadingPath:
+    """A heading inside a Form A range still updates the parser's slug
+    stack so blocks after the range key under the correct section."""
+
+    def test_heading_inside_range_updates_path(self, parser):
+        lines = [
+            "# Intro",
+            "intro text",
+            "",
+            "<!-- mdpo:no-translate -->",
+            "## Protected Section",
+            "verbatim body",
+            "<!-- /mdpo:no-translate -->",
+            "",
+            "Following paragraph.",
+        ]
+        blocks = parser.segment_markdown(lines)
+        # Last block is the trailing paragraph.
+        trailing = blocks[-1]
+        assert trailing["type"] == "para"
+        assert trailing["path"] == ["intro", "protected-section"]
+
+    def test_heading_inside_nested_code_fence_does_not_update_path(self, parser):
+        """A heading-shaped line inside a nested code fence inside the
+        protected range must NOT pollute the slug stack."""
+        lines = [
+            "# Intro",
+            "",
+            "<!-- mdpo:no-translate -->",
+            "```python",
+            "# this is a comment, not a heading",
+            "```",
+            "<!-- /mdpo:no-translate -->",
+            "",
+            "Trailing.",
+        ]
+        blocks = parser.segment_markdown(lines)
+        trailing = blocks[-1]
+        assert trailing["type"] == "para"
+        # Path stays under the real heading, no spurious slug added.
+        assert trailing["path"] == ["intro"]
+
+    def test_multiple_headings_inside_range(self, parser):
+        lines = [
+            "# Top",
+            "",
+            "<!-- mdpo:no-translate -->",
+            "## A",
+            "body a",
+            "### Deep",
+            "body deep",
+            "## B",
+            "body b",
+            "<!-- /mdpo:no-translate -->",
+            "",
+            "After.",
+        ]
+        blocks = parser.segment_markdown(lines)
+        trailing = blocks[-1]
+        assert trailing["type"] == "para"
+        # Final heading inside the range is h2 "B" — h3 counter cleared.
+        assert trailing["path"] == ["top", "b"]
+
+
+class TestNoTranslateNonMatching:
+    """HTML comments outside the `mdpo:` namespace flow through unchanged."""
+
+    def test_generic_html_comment_is_paragraph(self, parser):
+        lines = ["<!-- no-translate -->", "body"]
+        blocks = parser.segment_markdown(lines)
+        # Generic comment is NOT recognised; both lines fold into one paragraph.
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "para"
+
+    def test_case_sensitive_marker(self, parser):
+        """`MDPO:no-translate` (uppercase) is NOT recognised."""
+        lines = [
+            "<!-- MDPO:no-translate -->",
+            "body",
+            "<!-- /MDPO:no-translate -->",
+        ]
+        blocks = parser.segment_markdown(lines)
+        # Uppercase prefix falls through to paragraph parser.
+        assert all(b["type"] != "no_translate" for b in blocks)
+
+    def test_close_marker_alone_is_paragraph(self, parser):
+        """A stray closer with no opener is treated as a regular paragraph."""
+        lines = ["<!-- /mdpo:no-translate -->"]
+        blocks = parser.segment_markdown(lines)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "para"
+
+
 class TestEdgeCases:
     def test_empty_document(self, parser):
         blocks = parser.segment_markdown([])

@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **`no_translate` HTML-comment fence (T-24).** Authors can now mark
+  prose, lists, tables, code, or arbitrary mixed content as "do not
+  translate, do not refine, do not LLM-touch" using HTML comments that
+  are invisible in rendered Markdown:
+  - **Form A — paired range** wraps any number of blocks:
+    ~~~markdown
+    <!-- mdpo:no-translate -->
+    First paragraph that stays as-is.
+
+    - list items also untouched
+
+    <!-- /mdpo:no-translate -->
+    ~~~
+    The first close marker after an opener ends the range, so nested
+    `<!-- mdpo:no-translate -->` inside an open range is literal
+    content (no nesting support — by design). An unclosed opener
+    consumes to EOF and logs a `WARNING` via `logging.getLogger(
+    "mdpo_llm.parser")` so the typo surfaces.
+  - **Form B — single-block skip** marks just the next block:
+    ~~~markdown
+    <!-- mdpo:skip-next -->
+    Just this paragraph is skipped.
+    ~~~
+    Blank lines between the marker and the next block are tolerated.
+    A `skip-next` marker as the last non-blank line in the document
+    fails soft to a marker-only block (no following content to wrap).
+  - Both forms produce blocks with `type == "no_translate"`, added to
+    `MarkdownProcessor.SKIP_TYPES` so every LLM stage (translate,
+    refine, residue, validator) short-circuits. The PO entry carries
+    the verbatim source in `msgid` with an empty `msgstr`, mirroring
+    the existing `hr` precedent. The reconstructor re-emits the
+    original source — markers included — byte-for-byte.
+  - **Namespace** is `mdpo:` so generic `<!-- no-translate -->`
+    comments emitted by other tooling (DeepL, Smartling, gettext)
+    flow through unchanged as paragraph content. Marker text is
+    case-sensitive: `<!-- MDPO:no-translate -->` is NOT recognised.
+  - **No new CLI flag.** Markers are inert in documents that don't
+    contain them, so existing pipelines see zero behavioural change
+    until an author opts in by adding markers to a source file.
+  - Inspired by ``'s
+    code-fence-based syntax (`` ```no_translate ``), but deliberately
+    diverged: code fences render as monospace, which would corrupt
+    the prose styling the feature exists to preserve.
+
 ## 0.5.0 — 2026-05-23
 
 ### Added

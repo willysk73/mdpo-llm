@@ -229,7 +229,12 @@ def _build_receipt(
 class MarkdownProcessor:
     """Main orchestrator for markdown process workflow."""
 
-    SKIP_TYPES = ["hr"]  # Block types to skip processing
+    # Block types skipped by every LLM stage (translate, refine, residue,
+    # LLM validation). ``no_translate`` covers the HTML-comment fence
+    # syntax in :mod:`parser`: any block emitted with that type carries
+    # its original source verbatim, and the reconstructor passes it
+    # through unchanged just like ``hr``.
+    SKIP_TYPES = ["hr", "no_translate"]
 
     def __init__(
         self,

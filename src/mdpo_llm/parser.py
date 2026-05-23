@@ -2,9 +2,25 @@
 Markdown block parser for translation workflow.
 """
 
+import logging
 import re
 import unicodedata
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
+
+# Authors can wrap a range of blocks in `<!-- mdpo:no-translate -->` /
+# `<!-- /mdpo:no-translate -->` to keep the source language verbatim
+# through the LLM pipeline (Form A — paired range). For single-block
+# opt-out, `<!-- mdpo:skip-next -->` on its own line marks just the
+# next block (Form B). Both produce blocks with ``type == "no_translate"``
+# which the processor's SKIP_TYPES list short-circuits before any
+# translate/refine/residue call. The HTML-comment form is invisible
+# in rendered Markdown (unlike a `no_translate` code fence, which
+# would force monospace styling on prose content).
+NO_TRANSLATE_OPEN_RE = re.compile(r"^\s*<!--\s*mdpo:no-translate\s*-->\s*$")
+NO_TRANSLATE_CLOSE_RE = re.compile(r"^\s*<!--\s*/mdpo:no-translate\s*-->\s*$")
+SKIP_NEXT_RE = re.compile(r"^\s*<!--\s*mdpo:skip-next\s*-->\s*$")
 
 
 # Control characters (``\x00-\x1f`` and ``\x7f``) plus characters that are
@@ -114,57 +130,201 @@ class BlockParser:
         i = 0
 
         while i < len(lines):
-            line = lines[i]
-
-            # code fences (copy as raw; don't translate)
-            if self.FENCE_RE.match(line.strip()):
-                i = self._parse_code_block(lines, i, blocks, path)
-                continue
-
-            # headings
-            heading_match = re.match(r"^(#{1,6})\s+(.*)", line)
-            if heading_match:
-                i = self._parse_heading(lines, i, blocks, path, heading_match)
-                continue
-
-            # horizontal rules
-            if re.match(r"^\s*([-*_])\s*(\1\s*){2,}$", line):
-                blocks.append(
-                    {
-                        "type": "hr",
-                        "text": line.rstrip("\n"),
-                        "start": i,
-                        "end": i + 1,
-                        "path": path.copy(),
-                    }
-                )
-                i += 1
-                continue
-
-            # blockquote
-            if line.lstrip().startswith(">"):
-                i = self._parse_blockquote(lines, i, blocks, path)
-                continue
-
-            # list (bulleted/numbered)
-            if re.match(r"^\s*([-*+]|\d+\.)\s+", line):
-                i = self._parse_list(lines, i, blocks, path)
-                continue
-
-            # table (very simple heuristic: pipes on multiple lines)
-            if "|" in line and re.match(r"^\s*\|", line):
-                i = self._parse_table(lines, i, blocks, path)
-                continue
-
-            # paragraph or blank
-            if line.strip() == "":
-                i += 1
-            else:
-                i = self._parse_paragraph(lines, i, blocks, path)
+            i = self._dispatch_one_block(lines, i, blocks, path)
 
         # add per-section indices
         self._add_section_indices(blocks)
         return blocks
+
+    def _dispatch_one_block(
+        self, lines: List[str], i: int, blocks: List[Dict], path: List[str]
+    ) -> int:
+        """Parse one block (or skip one blank line) starting at ``i``.
+
+        Returns the next line index to resume scanning from. Shared by the
+        top-level ``segment_markdown`` loop and by ``_parse_skip_next``
+        (Form B) so a single ``mdpo:skip-next`` marker can wrap whatever
+        the next block happens to be — paragraph, list, code fence, even
+        a Form A paired range.
+        """
+        line = lines[i]
+
+        # Form A — paired range. Checked first so nested code fences /
+        # lists inside the range get consumed as literal content.
+        if NO_TRANSLATE_OPEN_RE.match(line):
+            return self._parse_no_translate_pair(lines, i, blocks, path)
+
+        # Form B — single-block skip.
+        if SKIP_NEXT_RE.match(line):
+            return self._parse_skip_next(lines, i, blocks, path)
+
+        # code fences (copy as raw; don't translate)
+        if self.FENCE_RE.match(line.strip()):
+            return self._parse_code_block(lines, i, blocks, path)
+
+        # headings
+        heading_match = re.match(r"^(#{1,6})\s+(.*)", line)
+        if heading_match:
+            return self._parse_heading(lines, i, blocks, path, heading_match)
+
+        # horizontal rules
+        if re.match(r"^\s*([-*_])\s*(\1\s*){2,}$", line):
+            blocks.append(
+                {
+                    "type": "hr",
+                    "text": line.rstrip("\n"),
+                    "start": i,
+                    "end": i + 1,
+                    "path": path.copy(),
+                }
+            )
+            return i + 1
+
+        # blockquote
+        if line.lstrip().startswith(">"):
+            return self._parse_blockquote(lines, i, blocks, path)
+
+        # list (bulleted/numbered)
+        if re.match(r"^\s*([-*+]|\d+\.)\s+", line):
+            return self._parse_list(lines, i, blocks, path)
+
+        # table (very simple heuristic: pipes on multiple lines)
+        if "|" in line and re.match(r"^\s*\|", line):
+            return self._parse_table(lines, i, blocks, path)
+
+        # paragraph or blank
+        if line.strip() == "":
+            return i + 1
+        return self._parse_paragraph(lines, i, blocks, path)
+
+    def _parse_no_translate_pair(
+        self, lines: List[str], start: int, blocks: List[Dict], path: List[str]
+    ) -> int:
+        """Parse a Form A ``<!-- mdpo:no-translate -->`` paired range.
+
+        Consumes from the opener line through the first matching closer
+        line (inclusive). On EOF without a closer, consumes to EOF and
+        logs a warning so the author notices the typo — mirrors the
+        existing ``_parse_code_block`` tolerance for a missing close fence.
+
+        Nesting is intentionally unsupported: a second opener inside an
+        already-open range is treated as literal content. The block's
+        ``text`` carries the marker lines verbatim so the reconstructor
+        can emit the source unchanged.
+        """
+        i = start + 1
+        while i < len(lines) and not NO_TRANSLATE_CLOSE_RE.match(lines[i]):
+            i += 1
+        if i >= len(lines):
+            logger.warning(
+                "Unclosed <!-- mdpo:no-translate --> marker at line %d; "
+                "consuming to end of document",
+                start + 1,
+            )
+            end = len(lines)
+        else:
+            end = i + 1  # include the closer line itself
+        # Walk the inner content for headings so blocks after the
+        # protected range stay keyed under any heading that appeared
+        # inside it. Without this, the next paragraph would inherit
+        # the slug stack from BEFORE the protected range, drifting
+        # incremental PO context IDs off the rendered section.
+        self._update_path_for_inner_headings(lines, start + 1, end, path)
+        blocks.append(
+            {
+                "type": "no_translate",
+                "text": "\n".join(lines[start:end]),
+                "start": start,
+                "end": end,
+                "path": path.copy(),
+            }
+        )
+        return end
+
+    def _update_path_for_inner_headings(
+        self, lines: List[str], start: int, end: int, path: List[str]
+    ) -> None:
+        """Update ``path`` for every Markdown heading inside ``lines[start:end]``.
+
+        Skips lines inside nested code fences so a heading-shaped line in
+        a Python snippet (``# comment``) doesn't pollute the slug stack.
+        The protected range itself is emitted as a single ``no_translate``
+        block — this walk only mutates ``path`` / ``slug_counters`` as a
+        side effect so subsequent blocks track the correct section.
+        """
+        i = start
+        while i < end:
+            line = lines[i]
+            if self.FENCE_RE.match(line.strip()):
+                fence = line.strip()[:3]
+                i += 1
+                while i < end and not lines[i].strip().startswith(fence):
+                    i += 1
+                i = min(i + 1, end)
+                continue
+            heading_match = re.match(r"^(#{1,6})\s+(.*)", line)
+            if heading_match:
+                self._update_heading_path(heading_match, path)
+            i += 1
+
+    def _parse_skip_next(
+        self, lines: List[str], start: int, blocks: List[Dict], path: List[str]
+    ) -> int:
+        """Parse a Form B ``<!-- mdpo:skip-next -->`` marker + next block.
+
+        Tolerates blank lines between the marker and the target block.
+        If the marker is the last non-blank line in the document, emits
+        a marker-only ``no_translate`` block (author's typo, fail-soft).
+        Otherwise dispatches to the per-block parser to determine the
+        target block's extent, then replaces it in ``blocks`` with a
+        merged ``no_translate`` block spanning marker → block end.
+        """
+        i = start + 1
+        while i < len(lines) and lines[i].strip() == "":
+            i += 1
+
+        if i >= len(lines):
+            blocks.append(
+                {
+                    "type": "no_translate",
+                    "text": "\n".join(lines[start:len(lines)]),
+                    "start": start,
+                    "end": len(lines),
+                    "path": path.copy(),
+                }
+            )
+            return len(lines)
+
+        before_len = len(blocks)
+        next_i = self._dispatch_one_block(lines, i, blocks, path)
+
+        if len(blocks) > before_len:
+            target = blocks.pop()
+            merged_end = target["end"]
+            blocks.append(
+                {
+                    "type": "no_translate",
+                    "text": "\n".join(lines[start:merged_end]),
+                    "start": start,
+                    "end": merged_end,
+                    "path": path.copy(),
+                }
+            )
+            return merged_end
+
+        # Dispatch advanced ``i`` without emitting (shouldn't happen for
+        # a non-blank line — every non-blank dispatch branch emits — but
+        # fail-soft if it ever does).
+        blocks.append(
+            {
+                "type": "no_translate",
+                "text": "\n".join(lines[start:next_i]),
+                "start": start,
+                "end": next_i,
+                "path": path.copy(),
+            }
+        )
+        return next_i
 
     def _parse_code_block(
         self, lines: List[str], start: int, blocks: List[Dict], path: List[str]
@@ -191,6 +351,26 @@ class BlockParser:
         self, lines: List[str], start: int, blocks: List[Dict], path: List[str], match
     ) -> int:
         """Parse a heading and update the path."""
+        self._update_heading_path(match, path)
+        blocks.append(
+            {
+                "type": "heading",
+                "text": lines[start].rstrip("\n"),
+                "start": start,
+                "end": start + 1,
+                "path": path.copy(),
+            }
+        )
+        return start + 1
+
+    def _update_heading_path(self, match, path: List[str]) -> None:
+        """Allocate a unique slug for a heading and update ``path`` in place.
+
+        Shared by ``_parse_heading`` (which emits a heading block) and by
+        the no_translate range walker (which only needs the slug-stack
+        side-effect so blocks after a protected range stay keyed under
+        any heading that appeared inside it).
+        """
         level = len(match.group(1))
         title = match.group(2).strip()
         base_slug = self.slugify(title)
@@ -212,18 +392,7 @@ class BlockParser:
         for l in levels_to_clear:
             del self.slug_counters[l]
 
-        # Update path
         path[:] = path[: level - 1] + [unique_slug]
-        blocks.append(
-            {
-                "type": "heading",
-                "text": lines[start].rstrip("\n"),
-                "start": start,
-                "end": start + 1,
-                "path": path.copy(),
-            }
-        )
-        return start + 1
 
     def _parse_blockquote(
         self, lines: List[str], start: int, blocks: List[Dict], path: List[str]
@@ -347,6 +516,11 @@ class BlockParser:
                 line.lstrip().startswith(">"),
                 re.match(r"^\s*([-*_])\s*(\1\s*){2,}$", line),
                 ("|" in line and re.match(r"^\s*\|", line)),
+                # ``no_translate`` openers / skip-next markers break list
+                # continuation so they aren't swallowed as bullet text
+                # when no blank line separates them from the list above.
+                NO_TRANSLATE_OPEN_RE.match(line),
+                SKIP_NEXT_RE.match(line),
             ]
         )
 
@@ -387,6 +561,12 @@ class BlockParser:
                     lines[i].lstrip().startswith(">"),
                     re.match(r"^\s*([-*_])\s*(\1\s*){2,}$", lines[i]),
                     ("|" in lines[i] and re.match(r"^\s*\|", lines[i])),
+                    # ``no_translate`` openers / skip-next markers break a
+                    # paragraph even without an intervening blank line, so
+                    # protected content does NOT get folded into the prose
+                    # above and silently sent to the LLM.
+                    NO_TRANSLATE_OPEN_RE.match(lines[i]),
+                    SKIP_NEXT_RE.match(lines[i]),
                 ]
             )
         ):

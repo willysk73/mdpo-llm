@@ -9,6 +9,16 @@
 
 mdpo-llm splits your Markdown into blocks, tracks each one in a PO file, and sends only new or changed blocks to your LLM. Edit one paragraph in a 50-block document? One API call, not fifty.
 
+## What's new in v0.6
+
+- **`no_translate` HTML-comment fence** (T-24). Wrap arbitrary content
+  with `<!-- mdpo:no-translate -->` / `<!-- /mdpo:no-translate -->`
+  to pass it through every LLM stage (translate, refine, residue,
+  validator) untouched, or mark a single block with `<!-- mdpo:skip-next -->`.
+  The markers are HTML comments so they stay invisible in rendered
+  Markdown — unlike a `no_translate` code fence, prose stays prose.
+  See *Opting out of translation* below.
+
 ## What's new in v0.5
 
 - **LLM validation + bounded retry loop** (T-16). Opt in with
@@ -510,6 +520,68 @@ Default is `off` pending soak time. False-positive risk on
 edge-case docs (mixed-script identifiers, source script kept
 intentionally for branding) is low but real, so the flag is opt-in
 until a release of real-world use settles its sensitivity.
+
+## Opting out of translation (`no_translate` markers)
+
+Author-controlled escape hatches that pass selected content through
+every LLM stage (translate, refine, residue, validator) byte-for-byte.
+The markers are HTML comments so they stay invisible in rendered
+Markdown — prose remains prose, lists remain lists, code remains code.
+
+**Form A — paired range** wraps any number of blocks, including
+nested code fences, lists, and tables:
+
+~~~markdown
+<!-- mdpo:no-translate -->
+First paragraph that stays as-is.
+
+- list items also untouched
+- second item
+
+```python
+# code block inside the range is also passed through verbatim
+print("hi")
+```
+
+<!-- /mdpo:no-translate -->
+~~~
+
+Each marker must occupy its own line (leading / trailing whitespace
+inside the comment is tolerated). The first close marker after an
+opener ends the range; a second opener inside an open range is
+treated as literal content (no nesting support — by design). An
+unclosed opener consumes to end-of-document and logs a `WARNING` so
+the typo surfaces.
+
+**Form B — single-block skip** marks just the next block:
+
+```markdown
+<!-- mdpo:skip-next -->
+Just this paragraph is skipped.
+
+This paragraph is translated normally.
+```
+
+Blank lines between the marker and the next block are tolerated.
+A `skip-next` as the last non-blank line in the document fails
+soft to a marker-only block.
+
+**Behaviour notes.**
+
+- Both forms produce parser blocks with `type == "no_translate"`,
+  added to `MarkdownProcessor.SKIP_TYPES` so every LLM stage
+  short-circuits before any wire call.
+- The PO entry carries the verbatim source in `msgid` with an
+  empty `msgstr`, matching how `hr` blocks are stored. The
+  reconstructor re-emits the source — markers included — from
+  the original lines.
+- Marker text is **case-sensitive**: `<!-- MDPO:no-translate -->`
+  is NOT recognised (falls through to paragraph). The `mdpo:`
+  namespace prefix is mandatory so generic `<!-- no-translate -->`
+  comments emitted by other tooling flow through unchanged.
+- **No new CLI flag.** Markers are inert in documents that don't
+  contain them, so existing pipelines see zero behavioural change
+  until an author opts in by adding markers to a source file.
 
 ## LLM validation + bounded retry loop (T-16)
 

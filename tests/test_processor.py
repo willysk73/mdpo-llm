@@ -2528,3 +2528,130 @@ class TestContextInjection:
         assert "EXTRA-INSTRUCTION-MARKER" in sys
         assert "CONTEXT-MARKER" in sys
         assert self.HEADER in sys
+
+
+class TestNoTranslateBlocks:
+    """Pipeline-level checks for the `no_translate` HTML-comment fence.
+
+    ``SKIP_TYPES`` membership means the translate, refine, residue, and
+    validator stages never see these blocks. The LLM mock would otherwise
+    prefix every msgstr with ``[TRANSLATED] ``; absence of that prefix
+    inside the no_translate region proves the short-circuit is wired up.
+    """
+
+    NO_TRANSLATE_INCLUDED = "no_translate" in MarkdownProcessor.SKIP_TYPES
+
+    def test_skip_types_constant(self):
+        assert self.NO_TRANSLATE_INCLUDED, (
+            "MarkdownProcessor.SKIP_TYPES must include 'no_translate' so the "
+            "translate / refine / residue / validate stages skip it."
+        )
+
+    def test_form_a_block_round_trips_verbatim(self, tmp_path, mock_completion):
+        """End-to-end translate: a `<!-- mdpo:no-translate -->` range is
+        copied unchanged into the target file, and its PO entry has empty
+        ``msgstr`` (matching the hr precedent in manager.sync_po)."""
+        md = (
+            "# Title\n"
+            "\n"
+            "Intro paragraph.\n"
+            "\n"
+            "<!-- mdpo:no-translate -->\n"
+            "Verbatim body.\n"
+            "Stays in source language.\n"
+            "<!-- /mdpo:no-translate -->\n"
+            "\n"
+            "Trailing paragraph.\n"
+        )
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        target = tmp_path / "target.md"
+        po_path = tmp_path / "m.po"
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        processor.process_document(source, target, po_path)
+
+        produced = target.read_text(encoding="utf-8")
+        # The no_translate range survives verbatim, markers and all.
+        assert "<!-- mdpo:no-translate -->\nVerbatim body." in produced
+        assert "Stays in source language." in produced
+        assert "<!-- /mdpo:no-translate -->" in produced
+        # The LLM mock prefixes every translated string with [TRANSLATED];
+        # that prefix must NOT appear inside the protected body.
+        assert "[TRANSLATED] Verbatim body" not in produced
+        assert "[TRANSLATED] Stays in source" not in produced
+        # Surrounding paragraphs DID go through the translator.
+        assert "[TRANSLATED] Intro paragraph." in produced
+        assert "[TRANSLATED] Trailing paragraph." in produced
+
+        # PO entry for the no_translate block exists with empty msgstr.
+        po = processor.po_manager.load_or_create_po(po_path)
+        no_translate_entries = [e for e in po if "no_translate" in (e.msgctxt or "")]
+        assert no_translate_entries, "Expected a PO entry for the no_translate block."
+        assert all(e.msgstr == "" for e in no_translate_entries)
+
+    def test_form_b_skip_next_round_trips_verbatim(self, tmp_path, mock_completion):
+        md = (
+            "<!-- mdpo:skip-next -->\n"
+            "Skipped paragraph.\n"
+            "\n"
+            "Translated paragraph.\n"
+        )
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        target = tmp_path / "target.md"
+        po_path = tmp_path / "m.po"
+
+        processor = MarkdownProcessor(
+            model="test-model", target_lang="ko", batch_size=0
+        )
+        processor.process_document(source, target, po_path)
+
+        produced = target.read_text(encoding="utf-8")
+        assert "<!-- mdpo:skip-next -->\nSkipped paragraph." in produced
+        assert "[TRANSLATED] Skipped paragraph" not in produced
+        assert "[TRANSLATED] Translated paragraph." in produced
+
+    def test_refine_mode_leaves_no_translate_untouched(self, tmp_path, mock_completion):
+        """Refine mode also short-circuits on SKIP_TYPES — the protected
+        body must never reach the LLM."""
+        md = (
+            "Intro.\n"
+            "\n"
+            "<!-- mdpo:no-translate -->\n"
+            "PROTECTED-MARKER body.\n"
+            "<!-- /mdpo:no-translate -->\n"
+            "\n"
+            "Outro.\n"
+        )
+        source = tmp_path / "source.md"
+        source.write_text(md, encoding="utf-8")
+        refined = tmp_path / "refined.md"
+
+        processor = MarkdownProcessor(
+            model="test-model",
+            target_lang="ko",
+            mode="refine",
+            batch_size=0,
+        )
+        processor.process_document(
+            source,
+            tmp_path / "target.md",
+            tmp_path / "m.po",
+            refined_path=refined,
+        )
+
+        produced = refined.read_text(encoding="utf-8")
+        assert "PROTECTED-MARKER body." in produced
+        # No translator prefix on the protected body — refine never saw it.
+        assert "[TRANSLATED] PROTECTED-MARKER" not in produced
+        # And the LLM never received the protected content as input.
+        user_contents = [
+            msg["content"]
+            for call in mock_completion.completion.call_args_list
+            for msg in call.kwargs["messages"]
+            if msg["role"] == "user"
+        ]
+        assert not any("PROTECTED-MARKER" in c for c in user_contents)
